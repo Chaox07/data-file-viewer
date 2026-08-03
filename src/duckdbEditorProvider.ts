@@ -1,8 +1,15 @@
 import * as vscode from 'vscode';
-import { DuckDbFile } from './duckdbConnection';
+import { basename } from 'node:path';
+import { DuckDbFile, QueryDiff } from './duckdbConnection';
+import { isDestructiveStatement } from './sqlSafety';
 
 class DuckDBDocument implements vscode.CustomDocument {
   private tablesCache: string[] | undefined;
+
+  safeMode = true;
+  backupBeforeWrite = true;
+  checkForChanges = true;
+  hasBackup = false;
 
   constructor(readonly uri: vscode.Uri, readonly file: DuckDbFile) {}
 
@@ -14,7 +21,35 @@ class DuckDBDocument implements vscode.CustomDocument {
   }
 
   dispose(): void {
-    this.file.dispose();
+    if (this.hasBackup && this.checkForChanges) {
+      // Fire-and-forget: the webview is already gone by the time dispose()
+      // runs, so a VS Code notification is the only place left to report
+      // this. Connection is closed either way once the comparison settles.
+      this.file
+        .compareToBackup()
+        .then((status) => {
+          const entries = Object.entries(status);
+          const changed = entries.filter(([, s]) => s !== 'unchanged');
+          const fileName = basename(this.uri.fsPath);
+          if (changed.length > 0) {
+            vscode.window.showInformationMessage(
+              `${fileName}: ${changed.length} of ${entries.length} table(s) changed since backup (${changed
+                .map(([table]) => table)
+                .join(', ')}).`
+            );
+          } else if (entries.length > 0) {
+            vscode.window.showInformationMessage(`${fileName}: no changes since backup.`);
+          }
+        })
+        .catch(() => {
+          // Best-effort notification only — never block closing the file over this.
+        })
+        .finally(() => {
+          this.file.dispose();
+        });
+    } else {
+      this.file.dispose();
+    }
   }
 }
 
@@ -74,7 +109,12 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
     // single-connection model would just queue a second query behind the first.
     let running = false;
 
-    const messageSub = webview.onDidReceiveMessage(async (message: { command: string; sql?: string }) => {
+    type IncomingMessage =
+      | { command: 'ready' }
+      | { command: 'runQuery'; sql: string }
+      | { command: 'toggleSafeMode'; safeMode: boolean; backupBeforeWrite: boolean; checkForChanges: boolean };
+
+    const messageSub = webview.onDidReceiveMessage(async (message: IncomingMessage) => {
       if (message.command === 'ready') {
         try {
           const tables = await document.getTables();
@@ -85,12 +125,78 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
         return;
       }
 
+      if (message.command === 'toggleSafeMode') {
+        const wasSafeMode = document.safeMode;
+        document.backupBeforeWrite = message.backupBeforeWrite;
+        document.checkForChanges = message.checkForChanges;
+
+        if (wasSafeMode && !message.safeMode) {
+          // Turning Safe Mode OFF.
+          if (document.backupBeforeWrite) {
+            try {
+              const backupPath = await document.file.createBackup();
+              document.hasBackup = true;
+              document.safeMode = false;
+              webview.postMessage({ command: 'backupStatus', message: `Backup created: ${basename(backupPath)}` });
+              // A fresh backup makes any previous comparison labels stale.
+              webview.postMessage({ command: 'tableChangeStatus', status: {} });
+            } catch (err) {
+              webview.postMessage({
+                command: 'backupStatus',
+                message: `Could not create backup — Safe Mode stays on: ${(err as Error).message}`,
+              });
+            }
+          } else {
+            document.safeMode = false;
+            webview.postMessage({ command: 'backupStatus', message: 'Safe Mode off — no backup was made.' });
+            webview.postMessage({ command: 'tableChangeStatus', status: {} });
+          }
+        } else if (!wasSafeMode && message.safeMode) {
+          // Turning Safe Mode back ON (re-lock).
+          document.safeMode = true;
+          if (document.checkForChanges && document.hasBackup) {
+            try {
+              const status = await document.file.compareToBackup();
+              webview.postMessage({ command: 'tableChangeStatus', status });
+            } catch (err) {
+              webview.postMessage({ command: 'error', message: (err as Error).message });
+            }
+          } else {
+            webview.postMessage({ command: 'tableChangeStatus', status: {} });
+          }
+        }
+
+        webview.postMessage({ command: 'safeModeState', safeMode: document.safeMode });
+        return;
+      }
+
       if (message.command === 'runQuery' && typeof message.sql === 'string') {
         if (running) return;
         running = true;
         try {
+          const destructive = isDestructiveStatement(message.sql);
+          if (document.safeMode && destructive) {
+            const firstWord = message.sql.trim().match(/^[a-zA-Z]+/)?.[0] ?? 'this statement';
+            webview.postMessage({
+              command: 'error',
+              message: `Blocked by Safe Mode: this looks like a write statement ("${firstWord}"). Uncheck Safe Mode to allow it.`,
+            });
+            return;
+          }
+
           const result = await document.file.runQuery(message.sql);
-          webview.postMessage({ command: 'queryResult', ...result });
+
+          let diffFields: Partial<QueryDiff> = {};
+          if (!destructive && document.checkForChanges && document.hasBackup) {
+            try {
+              const diff = await document.file.diffQueryAgainstBackup(message.sql, result.columns, result.rows);
+              if (diff) diffFields = diff;
+            } catch {
+              // Diff highlighting is a nice-to-have; never let it block showing the result.
+            }
+          }
+
+          webview.postMessage({ command: 'queryResult', ...result, ...diffFields });
         } catch (err) {
           webview.postMessage({ command: 'error', message: (err as Error).message });
         } finally {

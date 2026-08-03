@@ -8,10 +8,22 @@ interface VsCodeApi {
 }
 declare function acquireVsCodeApi(): VsCodeApi;
 
+type TableStatus = 'unchanged' | 'changed' | 'new';
+
 type ExtensionMessage =
   | { command: 'tables'; tables: string[] }
-  | { command: 'queryResult'; columns: string[]; rows: unknown[][] }
-  | { command: 'error'; message: string };
+  | {
+      command: 'queryResult';
+      columns: string[];
+      rows: unknown[][];
+      cellChanged?: boolean[][];
+      rowIsNew?: boolean[];
+      renamedColumns?: Record<string, string>;
+    }
+  | { command: 'error'; message: string }
+  | { command: 'backupStatus'; message: string }
+  | { command: 'tableChangeStatus'; status: Record<string, TableStatus> }
+  | { command: 'safeModeState'; safeMode: boolean };
 
 const vscode = acquireVsCodeApi();
 
@@ -27,6 +39,17 @@ root.innerHTML = `
     <div class="main">
       <div class="editor-toolbar">
         <button id="run-btn" title="Run (Ctrl/Cmd+Enter)">Run &#9654;</button>
+        <label class="toolbar-check" title="Blocks write/destructive statements until unchecked">
+          <input type="checkbox" id="safe-mode-check" checked /> Safe Mode
+        </label>
+        <span id="unlock-options" class="unlock-options" hidden>
+          <label class="toolbar-check" title="Back up the file the moment Safe Mode is turned off">
+            <input type="checkbox" id="backup-check" checked /> Backup on unlock
+          </label>
+          <label class="toolbar-check" title="Compare against the backup and highlight what changed">
+            <input type="checkbox" id="check-changes-check" checked /> Check for changes
+          </label>
+        </span>
         <span id="status" class="status"></span>
       </div>
       <div id="editor" class="editor"></div>
@@ -39,6 +62,10 @@ const tableListEl = document.getElementById('table-list') as HTMLDivElement;
 const resultsEl = document.getElementById('results') as HTMLDivElement;
 const statusEl = document.getElementById('status') as HTMLSpanElement;
 const runBtn = document.getElementById('run-btn') as HTMLButtonElement;
+const safeModeCheck = document.getElementById('safe-mode-check') as HTMLInputElement;
+const backupCheck = document.getElementById('backup-check') as HTMLInputElement;
+const checkChangesCheck = document.getElementById('check-changes-check') as HTMLInputElement;
+const unlockOptionsEl = document.getElementById('unlock-options') as HTMLSpanElement;
 
 let running = false;
 
@@ -85,12 +112,27 @@ function runQuery(sqlText: string): void {
 
 runBtn.addEventListener('click', () => runQuery(editor.state.doc.toString()));
 
+function sendToggleSafeMode(): void {
+  unlockOptionsEl.hidden = safeModeCheck.checked;
+  vscode.postMessage({
+    command: 'toggleSafeMode',
+    safeMode: safeModeCheck.checked,
+    backupBeforeWrite: backupCheck.checked,
+    checkForChanges: checkChangesCheck.checked,
+  });
+}
+
+safeModeCheck.addEventListener('change', sendToggleSafeMode);
+backupCheck.addEventListener('change', sendToggleSafeMode);
+checkChangesCheck.addEventListener('change', sendToggleSafeMode);
+
 function renderTables(tables: string[]): void {
   tableListEl.innerHTML = '';
   for (const name of tables) {
     const item = document.createElement('div');
     item.className = 'table-item';
     item.textContent = name;
+    item.dataset.table = name;
     item.addEventListener('click', () => {
       const sqlText = `SELECT * FROM "${name}" LIMIT 100;`;
       setEditorText(sqlText);
@@ -103,7 +145,26 @@ function renderTables(tables: string[]): void {
   }
 }
 
-function renderResults(columns: string[], rows: unknown[][]): void {
+function applyTableChangeStatus(status: Record<string, TableStatus>): void {
+  const items = tableListEl.querySelectorAll<HTMLDivElement>('.table-item');
+  items.forEach((item) => {
+    const name = item.dataset.table;
+    if (!name) return;
+    const s = status[name];
+    if (s === 'unchanged') item.textContent = `${name} (unchanged)`;
+    else if (s === 'changed') item.textContent = `${name} (changed)`;
+    else if (s === 'new') item.textContent = `${name} (new since backup)`;
+    else item.textContent = name;
+  });
+}
+
+function renderResults(
+  columns: string[],
+  rows: unknown[][],
+  cellChanged?: boolean[][],
+  rowIsNew?: boolean[],
+  renamedColumns?: Record<string, string>
+): void {
   resultsEl.innerHTML = '';
 
   if (columns.length === 0) {
@@ -118,6 +179,11 @@ function renderResults(columns: string[], rows: unknown[][]): void {
   for (const col of columns) {
     const th = document.createElement('th');
     th.textContent = col;
+    const renamedFrom = renamedColumns?.[col];
+    if (renamedFrom) {
+      th.title = `renamed from "${renamedFrom}"`;
+      th.classList.add('col-renamed');
+    }
     headRow.appendChild(th);
   }
   thead.appendChild(headRow);
@@ -127,11 +193,16 @@ function renderResults(columns: string[], rows: unknown[][]): void {
   rows.forEach((row, i) => {
     const tr = document.createElement('tr');
     tr.className = i % 2 === 0 ? 'even' : 'odd';
-    for (const value of row) {
+    const isNewRow = rowIsNew?.[i] === true;
+    if (isNewRow) tr.classList.add('row-new');
+    row.forEach((value, j) => {
       const td = document.createElement('td');
       td.textContent = formatValue(value);
+      if (!isNewRow && cellChanged?.[i]?.[j]) {
+        td.classList.add('cell-changed');
+      }
       tr.appendChild(td);
-    }
+    });
     tbody.appendChild(tr);
   });
   table.appendChild(tbody);
@@ -167,13 +238,23 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
       running = false;
       runBtn.disabled = false;
       statusEl.textContent = '';
-      renderResults(message.columns, message.rows);
+      renderResults(message.columns, message.rows, message.cellChanged, message.rowIsNew, message.renamedColumns);
       break;
     case 'error':
       running = false;
       runBtn.disabled = false;
       statusEl.textContent = '';
       showError(message.message);
+      break;
+    case 'backupStatus':
+      statusEl.textContent = message.message;
+      break;
+    case 'tableChangeStatus':
+      applyTableChangeStatus(message.status);
+      break;
+    case 'safeModeState':
+      safeModeCheck.checked = message.safeMode;
+      unlockOptionsEl.hidden = message.safeMode;
       break;
   }
 });

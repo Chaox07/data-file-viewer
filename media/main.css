@@ -97,6 +97,36 @@ html, body {
   font-size: 12px;
 }
 
+.toolbar-check {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: #abb2bf;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.toolbar-check input {
+  cursor: pointer;
+}
+
+/* Safe Mode unchecked = write access is live: make that state visually loud. */
+.toolbar-check:has(#safe-mode-check:not(:checked)) {
+  color: #e06c75;
+  font-weight: 600;
+}
+
+#unlock-options {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  background: rgba(224, 108, 117, 0.12);
+}
+
 .editor {
   flex-shrink: 0;
   max-height: 35vh;
@@ -146,6 +176,20 @@ html, body {
 
 .results tr:hover {
   background: #2c313c;
+}
+
+/* Change highlighting, relative to the last backup — see "Check for changes". */
+.results td.cell-changed {
+  background: rgba(229, 192, 123, 0.35);
+}
+
+.results tr.row-new td {
+  background: rgba(152, 195, 121, 0.22);
+}
+
+.results th.col-renamed {
+  text-decoration: underline dotted #7d8493;
+  cursor: help;
 }
 
 .results-footer {
