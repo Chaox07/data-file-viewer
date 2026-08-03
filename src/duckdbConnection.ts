@@ -52,15 +52,15 @@ export class DuckDbFile {
 
   static async open(path: string): Promise<DuckDbFile> {
     const isParquet = path.toLowerCase().endsWith('.parquet');
-    const isSqlite = path.toLowerCase().endsWith('.db');
+    const isSqlite = path.toLowerCase().endsWith('.db') || path.toLowerCase().endsWith('.sqlite');
     const useMemory = isParquet || isSqlite;
     const kind: FileKind = isParquet ? 'parquet' : isSqlite ? 'sqlite' : 'duckdb';
 
     let instance: DuckDBInstance;
     try {
-      // Neither a .parquet nor a .db (SQLite) file is itself a DuckDB
-      // database — open an in-memory instance and expose the file's data
-      // through it instead (view / ATTACH, below).
+      // Neither a .parquet nor a .db/.sqlite (SQLite) file is itself a
+      // DuckDB database — open an in-memory instance and expose the file's
+      // data through it instead (view / ATTACH, below).
       instance = await DuckDBInstance.create(useMemory ? ':memory:' : path);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

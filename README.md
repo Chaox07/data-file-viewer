@@ -1,18 +1,18 @@
 # Data File Viewer
 
-A VS Code extension that opens `.duckdb`, `.parquet`, and `.db` (SQLite)
-files with a table list ("sheets") in the sidebar, an editable SQL query box,
-and a results grid — modeled on
+A VS Code extension that opens `.duckdb`, `.parquet`, and `.db`/`.sqlite`
+(SQLite) files with a table list ("sheets") in the sidebar, an editable SQL
+query box, and a results grid — modeled on
 [caioricciuti/vs-duckdb-viewer](https://github.com/caioricciuti/vs-duckdb-viewer).
-DuckDB is the engine reading all three formats under the hood.
+DuckDB is the engine reading all these formats under the hood.
 
-`.duckdb` and `.parquet` files open automatically on double-click. `.db` is
-**not** automatic (it's a generic extension used by many unrelated file
-formats) — right-click a `.db` file and choose "Open With..." → "Data File
-Viewer (SQLite)", or use the Command Palette's "Reopen Editor With..." on an
-already-open `.db` file. Opening a `.db` file also requires DuckDB to load its
-`sqlite` extension, which needs an internet connection the *first* time it's
-used on a given machine (cached locally after that).
+`.duckdb` and `.parquet` files open automatically on double-click. `.db`/
+`.sqlite` are **not** automatic (they're generic extensions used by many
+unrelated file formats) — right-click such a file and choose "Open With..."
+→ "Data File Viewer (SQLite)", or use the Command Palette's "Reopen Editor
+With..." on an already-open one. Opening a `.db`/`.sqlite` file also requires
+DuckDB to load its `sqlite` extension, which needs an internet connection the
+*first* time it's used on a given machine (cached locally after that).
 
 `.parquet` files aren't databases with multiple tables, so they're exposed as
 a single view named after the file — the sidebar will show just that one
@@ -27,7 +27,7 @@ npm run watch       # rebuild on file changes
 ```
 
 Press `F5` in VS Code (with this folder open) to launch an Extension Development
-Host, then open any `.duckdb`/`.parquet`/`.db` file in that window.
+Host, then open any `.duckdb`/`.parquet`/`.db`/`.sqlite` file in that window.
 
 ## Packaging
 
@@ -71,5 +71,6 @@ this automatically:
   open this file type".
 
 Once set, double-clicking either file type anywhere launches VS Code directly
-into this custom editor. `.db` files are opened manually via right-click, as
-described above — no OS file-association step needed (or wanted) for those.
+into this custom editor. `.db`/`.sqlite` files are opened manually via
+right-click, as described above — no OS file-association step needed (or
+wanted) for those.

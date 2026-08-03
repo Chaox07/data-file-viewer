@@ -1,7 +1,7 @@
 {
   "name": "data-file-viewer",
   "displayName": "Data File Viewer",
-  "description": "Open .duckdb, .parquet, and .db (SQLite) files with a table sidebar, SQL editor, and results grid.",
+  "description": "Open .duckdb, .parquet, and .db/.sqlite (SQLite) files with a table sidebar, SQL editor, and results grid.",
   "publisher": "kemal-local",
   "version": "0.0.1",
   "private": true,
@@ -38,6 +38,9 @@
         "selector": [
           {
             "filenamePattern": "*.db"
+          },
+          {
+            "filenamePattern": "*.sqlite"
           }
         ],
         "priority": "option"
