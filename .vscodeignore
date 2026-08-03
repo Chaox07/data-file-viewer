@@ -1,0 +1,16 @@
+src/**
+esbuild.js
+tsconfig.json
+.github/**
+.gitignore
+**/*.ts
+**/*.map
+
+# Bundled into dist/webview.js already — not needed at runtime in node_modules.
+node_modules/@codemirror/**
+node_modules/@lezer/**
+node_modules/@marijn/**
+node_modules/codemirror/**
+node_modules/crelt/**
+node_modules/style-mod/**
+node_modules/w3c-keyname/**

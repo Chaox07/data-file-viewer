@@ -1,0 +1,60 @@
+{
+  "name": "data-file-viewer",
+  "displayName": "Data File Viewer",
+  "description": "Open .duckdb, .parquet, and .db (SQLite) files with a table sidebar, SQL editor, and results grid.",
+  "publisher": "kemal-local",
+  "version": "0.0.1",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "dataFileViewer.editor",
+        "displayName": "Data File Viewer",
+        "selector": [
+          {
+            "filenamePattern": "*.duckdb"
+          },
+          {
+            "filenamePattern": "*.parquet"
+          }
+        ],
+        "priority": "default"
+      },
+      {
+        "viewType": "dataFileViewer.sqliteEditor",
+        "displayName": "Data File Viewer (SQLite)",
+        "selector": [
+          {
+            "filenamePattern": "*.db"
+          }
+        ],
+        "priority": "option"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "npm run build && npx vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.29.0",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "@codemirror/lang-sql": "^6.7.0",
+    "@codemirror/theme-one-dark": "^6.1.3",
+    "@duckdb/node-api": "1.5.5-r.3",
+    "codemirror": "^6.0.1"
+  }
+}

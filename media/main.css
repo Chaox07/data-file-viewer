@@ -1,0 +1,167 @@
+/* Fixed dark palette (matches the CodeMirror "One Dark" theme used for the
+   SQL editor) instead of VS Code theme variables — keeps contrast reliable
+   and consistent regardless of the user's active VS Code color theme. */
+
+html, body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  color: #abb2bf;
+  background: #282c34;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 13px;
+}
+
+#root {
+  height: 100%;
+}
+
+.layout {
+  display: flex;
+  height: 100vh;
+}
+
+/* Sidebar: top-left table ("sheets") list */
+.sidebar {
+  width: 220px;
+  flex-shrink: 0;
+  border-right: 1px solid #181a1f;
+  overflow-y: auto;
+  background: #21252b;
+}
+
+.sidebar-title {
+  padding: 8px 12px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #7d8493;
+}
+
+.table-list .table-item {
+  padding: 4px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #abb2bf;
+}
+
+.table-list .table-item:hover {
+  background: #2c313c;
+}
+
+.table-list .empty {
+  padding: 8px 12px;
+  color: #7d8493;
+}
+
+/* Main column: SQL editor (mid-top) + results (below) */
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.editor-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: #21252b;
+  border-bottom: 1px solid #181a1f;
+}
+
+#run-btn {
+  background: #528bff;
+  color: #fff;
+  border: none;
+  border-radius: 3px;
+  padding: 4px 12px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+#run-btn:hover:not(:disabled) {
+  background: #6c9bff;
+}
+
+#run-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.status {
+  color: #7d8493;
+  font-size: 12px;
+}
+
+.editor {
+  flex-shrink: 0;
+  max-height: 35vh;
+  overflow: auto;
+  border-bottom: 1px solid #181a1f;
+}
+
+.editor .cm-editor {
+  height: 100%;
+}
+
+.results {
+  flex: 1;
+  overflow: auto;
+  padding: 0 0 24px 0;
+  background: #282c34;
+}
+
+.results table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+  color: #abb2bf;
+}
+
+.results th, .results td {
+  text-align: left;
+  padding: 3px 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+  border-bottom: 1px solid #181a1f;
+}
+
+.results th {
+  position: sticky;
+  top: 0;
+  background: #21252b;
+  color: #abb2bf;
+  font-weight: 600;
+}
+
+.results tr.odd {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.results tr:hover {
+  background: #2c313c;
+}
+
+.results-footer {
+  padding: 6px 10px;
+  color: #7d8493;
+  font-size: 12px;
+}
+
+.results .empty {
+  padding: 12px;
+  color: #7d8493;
+}
+
+.results .error {
+  padding: 10px;
+  color: #e06c75;
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
