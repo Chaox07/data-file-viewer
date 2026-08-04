@@ -258,12 +258,6 @@ function computeDisplayOrder(): number[] {
   return order;
 }
 
-function formatStatValue(value: unknown): string {
-  if (value === null || value === undefined) return 'NULL';
-  if (typeof value === 'object') return JSON.stringify(value);
-  return String(value);
-}
-
 function renderStatsPopoverContent(container: HTMLElement, message: Extract<ExtensionMessage, { command: 'columnStatsResult' }>): void {
   container.innerHTML = '';
   const title = document.createElement('div');
@@ -304,7 +298,7 @@ function renderStatsPopoverContent(container: HTMLElement, message: Extract<Exte
       row.className = 'stats-top-value-row';
       const val = document.createElement('span');
       val.className = 'stats-top-value';
-      val.textContent = formatStatValue(value);
+      val.textContent = formatValue(value, message.statsKind);
       const freq = document.createElement('span');
       freq.className = 'stats-top-freq';
       freq.textContent = String(frequency);
@@ -332,7 +326,7 @@ function renderStatsPopoverContent(container: HTMLElement, message: Extract<Exte
       l.textContent = label;
       const v = document.createElement('span');
       v.className = 'stats-descriptive-value';
-      v.textContent = formatStatValue(value);
+      v.textContent = formatValue(value, message.statsKind);
       row.appendChild(l);
       row.appendChild(v);
       table.appendChild(row);
@@ -591,7 +585,7 @@ function renderResults(): void {
     if (isNewRow) tr.classList.add('row-new');
     row.forEach((value, j) => {
       const td = document.createElement('td');
-      td.textContent = formatValue(value);
+      td.textContent = formatValue(value, columnStatsKind[j]);
       if (!isNewRow && cellChanged?.[i]?.[j]) {
         td.classList.add('cell-changed');
       }
@@ -628,9 +622,27 @@ function renderResults(): void {
   resultsEl.appendChild(footer);
 }
 
-function formatValue(value: unknown): string {
+function addThousandsSeparators(digits: string): string {
+  return digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+// DuckDB's node-api serializes BIGINT/HUGEINT/DECIMAL/TIMESTAMP/DATE all as
+// plain strings over the wire (only the small int types and float/double
+// come through as JS numbers) -- so a string alone can't tell numeric values
+// apart from dates. `kind` (from columnStatsKind, computed server-side from
+// the actual DuckDB type) is what disambiguates. Formatting is done by
+// string manipulation, not toLocaleString(), so it never rounds/truncates
+// the value's original precision.
+function formatValue(value: unknown, kind?: StatsKind): string {
   if (value === null || value === undefined) return 'NULL';
   if (typeof value === 'object') return JSON.stringify(value);
+  if (kind === 'numeric' && (typeof value === 'number' || typeof value === 'bigint' || typeof value === 'string')) {
+    const match = String(value).match(/^(-?)(\d+)(\.\d+)?$/);
+    if (match) {
+      const [, sign, intPart, fracPart = ''] = match;
+      return `${sign}${addThousandsSeparators(intPart)}${fracPart}`;
+    }
+  }
   return String(value);
 }
 
