@@ -37,9 +37,8 @@ export interface DescriptiveStats {
   min: unknown;
   max: unknown;
   mean: unknown;
-  p25: unknown;
-  median: unknown;
-  p75: unknown;
+  p5: unknown;
+  p95: unknown;
 }
 
 export type FileKind = 'duckdb' | 'parquet' | 'sqlite' | 'csv';
@@ -655,11 +654,11 @@ export class DuckDbFile {
     const reader = await this.connection.runAndReadAll(
       `select count(*) as total_rows, count(${col}) as non_null_rows, count(*) - count(${col}) as null_count,
               min(${col}) as min_value, max(${col}) as max_value, ${meanExpr} as mean_value,
-              approx_quantile(${col}, 0.25) as p25, approx_quantile(${col}, 0.5) as median, approx_quantile(${col}, 0.75) as p75
+              approx_quantile(${col}, 0.05) as p5, approx_quantile(${col}, 0.95) as p95
        from ${wrapped} as _stats_source`
     );
     const row = reader.getRowsJson()[0] as unknown[];
-    const [totalRows, nonNullRows, nullCount, min, max, mean, p25, median, p75] = row;
+    const [totalRows, nonNullRows, nullCount, min, max, mean, p5, p95] = row;
     return {
       totalRows: Number(totalRows),
       nonNullRows: Number(nonNullRows),
@@ -667,9 +666,8 @@ export class DuckDbFile {
       min,
       max,
       mean,
-      p25,
-      median,
-      p75,
+      p5,
+      p95,
     };
   }
 

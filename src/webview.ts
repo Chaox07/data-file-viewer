@@ -42,9 +42,8 @@ type ExtensionMessage =
       min?: unknown;
       max?: unknown;
       mean?: unknown;
-      p25?: unknown;
-      median?: unknown;
-      p75?: unknown;
+      p5?: unknown;
+      p95?: unknown;
     }
   | { command: 'columnStatsError'; column: string; message: string }
   | { command: 'cellUpdated'; column: string; newValue: unknown; rowValues: Record<string, unknown>; rowsMatched: number }
@@ -311,10 +310,9 @@ function renderStatsPopoverContent(container: HTMLElement, message: Extract<Exte
     const rows: [string, unknown][] = [
       ['min', message.min],
       ['max', message.max],
-      ['mean', message.mean],
-      ['p25 (approx.)', message.p25],
-      ['median (approx.)', message.median],
-      ['p75 (approx.)', message.p75],
+      ['avg', message.mean],
+      ['p5 (approx.)', message.p5],
+      ['p95 (approx.)', message.p95],
     ];
     const table = document.createElement('div');
     table.className = 'stats-descriptive';
@@ -337,11 +335,38 @@ function renderStatsPopoverContent(container: HTMLElement, message: Extract<Exte
 
 let statsPopoverEl: HTMLDivElement | null = null;
 let pendingStatsColumn: string | null = null;
+let pendingStatsAnchor: HTMLElement | null = null;
 
 function closeStatsPopover(): void {
   statsPopoverEl?.remove();
   statsPopoverEl = null;
   pendingStatsColumn = null;
+  pendingStatsAnchor = null;
+}
+
+// The popover's size changes once real content replaces the "Loading…"
+// placeholder, so this is called both right after opening (rough initial
+// placement) and again once the final content is rendered (correct
+// placement) -- a single up-front clamp using the small placeholder's size
+// would let a wide/tall result overflow again after it loads.
+function positionPopover(popover: HTMLElement, anchor: HTMLElement): void {
+  const anchorRect = anchor.getBoundingClientRect();
+  const popRect = popover.getBoundingClientRect();
+
+  let left = anchorRect.left;
+  if (left + popRect.width > window.innerWidth) {
+    left = anchorRect.right - popRect.width;
+  }
+  left = Math.max(0, left);
+
+  let top = anchorRect.bottom + 4;
+  if (top + popRect.height > window.innerHeight) {
+    top = anchorRect.top - popRect.height - 4;
+  }
+  top = Math.max(0, top);
+
+  popover.style.left = `${left}px`;
+  popover.style.top = `${top}px`;
 }
 
 function openStatsPopover(anchor: HTMLElement, column: string, statsKind: StatsKind): void {
@@ -351,13 +376,12 @@ function openStatsPopover(anchor: HTMLElement, column: string, statsKind: StatsK
 
   const popover = document.createElement('div');
   popover.className = 'stats-popover';
-  const rect = anchor.getBoundingClientRect();
-  popover.style.top = `${rect.bottom + 4}px`;
-  popover.style.left = `${rect.left}px`;
   popover.innerHTML = '<div class="stats-loading">Loading…</div>';
   document.body.appendChild(popover);
+  positionPopover(popover, anchor);
   statsPopoverEl = popover;
   pendingStatsColumn = column;
+  pendingStatsAnchor = anchor;
 
   const closeOnOutsideClick = (e: MouseEvent) => {
     if (statsPopoverEl && !statsPopoverEl.contains(e.target as Node)) {
@@ -533,39 +557,33 @@ function renderResults(): void {
     const controls = document.createElement('span');
     controls.className = 'th-controls';
 
-    const ascBtn = document.createElement('button');
-    ascBtn.className = 'th-sort-btn';
-    ascBtn.textContent = '▲';
-    ascBtn.title = 'Sort ascending';
-    ascBtn.addEventListener('click', (e) => {
+    const isActiveSort = sortState?.columnIndex === colIdx;
+    const sortBtn = document.createElement('button');
+    sortBtn.className = 'th-sort-btn';
+    sortBtn.classList.toggle('th-sort-btn-active', isActiveSort);
+    sortBtn.textContent = isActiveSort ? (sortState!.direction === 'asc' ? '▲' : '▼') : '⇅';
+    sortBtn.title = isActiveSort
+      ? `Sorted ${sortState!.direction === 'asc' ? 'ascending' : 'descending'} — click to reverse`
+      : 'Sort ascending';
+    sortBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       if (running) return;
-      sortState = { columnIndex: colIdx, direction: 'asc' };
-      renderResults();
-    });
-
-    const descBtn = document.createElement('button');
-    descBtn.className = 'th-sort-btn';
-    descBtn.textContent = '▼';
-    descBtn.title = 'Sort descending';
-    descBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      if (running) return;
-      sortState = { columnIndex: colIdx, direction: 'desc' };
+      sortState = isActiveSort
+        ? { columnIndex: colIdx, direction: sortState!.direction === 'asc' ? 'desc' : 'asc' }
+        : { columnIndex: colIdx, direction: 'asc' };
       renderResults();
     });
 
     const statsBtn = document.createElement('button');
     statsBtn.className = 'th-stats-btn';
-    statsBtn.textContent = columnStatsKind[colIdx] === 'other' ? '≡' : '∑';
+    statsBtn.textContent = '≡';
     statsBtn.title = columnStatsKind[colIdx] === 'other' ? 'Top values' : 'Descriptive stats';
     statsBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       openStatsPopover(statsBtn, col, columnStatsKind[colIdx]);
     });
 
-    controls.appendChild(ascBtn);
-    controls.appendChild(descBtn);
+    controls.appendChild(sortBtn);
     controls.appendChild(statsBtn);
     inner.appendChild(controls);
     th.appendChild(inner);
@@ -696,6 +714,7 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
     case 'columnStatsResult':
       if (statsPopoverEl && pendingStatsColumn === message.column) {
         renderStatsPopoverContent(statsPopoverEl, message);
+        if (pendingStatsAnchor) positionPopover(statsPopoverEl, pendingStatsAnchor);
       }
       break;
     case 'columnStatsError':
@@ -705,6 +724,7 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
         el.className = 'stats-empty';
         el.textContent = message.message;
         statsPopoverEl.appendChild(el);
+        if (pendingStatsAnchor) positionPopover(statsPopoverEl, pendingStatsAnchor);
       }
       break;
     case 'cellUpdated':
