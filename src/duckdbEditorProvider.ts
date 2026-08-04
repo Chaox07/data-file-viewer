@@ -76,6 +76,11 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
   async openCustomDocument(uri: vscode.Uri): Promise<DuckDBDocument> {
     try {
       const file = await DuckDbFile.open(uri.fsPath);
+      if (file.isReadOnly()) {
+        vscode.window.showWarningMessage(
+          `${basename(uri.fsPath)}: opened read-only — this file is already open elsewhere. Edits will fail until the other handle is released.`
+        );
+      }
       return new DuckDBDocument(uri, file);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

@@ -190,6 +190,7 @@ function renderResults(
   table.appendChild(thead);
 
   const tbody = document.createElement('tbody');
+  const rowsFragment = document.createDocumentFragment();
   rows.forEach((row, i) => {
     const tr = document.createElement('tr');
     tr.className = i % 2 === 0 ? 'even' : 'odd';
@@ -203,8 +204,9 @@ function renderResults(
       }
       tr.appendChild(td);
     });
-    tbody.appendChild(tr);
+    rowsFragment.appendChild(tr);
   });
+  tbody.appendChild(rowsFragment);
   table.appendChild(tbody);
   resultsEl.appendChild(table);
 
