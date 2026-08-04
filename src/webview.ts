@@ -522,6 +522,10 @@ function renderResults(): void {
   const headRow = document.createElement('tr');
   columns.forEach((col, colIdx) => {
     const th = document.createElement('th');
+    // display:flex has to live on this inner wrapper, not on <th> itself --
+    // see the .th-inner comment in main.css for why.
+    const inner = document.createElement('span');
+    inner.className = 'th-inner';
     const label = document.createElement('span');
     label.className = 'th-label';
     label.textContent = col;
@@ -530,7 +534,7 @@ function renderResults(): void {
       th.title = `renamed from "${renamedFrom}"`;
       th.classList.add('col-renamed');
     }
-    th.appendChild(label);
+    inner.appendChild(label);
 
     const controls = document.createElement('span');
     controls.className = 'th-controls';
@@ -569,7 +573,8 @@ function renderResults(): void {
     controls.appendChild(ascBtn);
     controls.appendChild(descBtn);
     controls.appendChild(statsBtn);
-    th.appendChild(controls);
+    inner.appendChild(controls);
+    th.appendChild(inner);
     headRow.appendChild(th);
   });
   thead.appendChild(headRow);

@@ -180,6 +180,15 @@ html, body {
   background: #21252b;
   color: #abb2bf;
   font-weight: 600;
+}
+
+/* `display: flex` cannot go on the <th> itself -- a table cell's computed
+   display must stay `table-cell` (the default) for the browser's table
+   column-layout algorithm to treat it as a column at all; overriding it
+   pulls the cell out of table layout entirely; every header stacks as a
+   full-width block and the whole table's columns collapse. The flex layout
+   goes on this inner wrapper instead, which has no such constraint. */
+.th-inner {
   display: flex;
   align-items: center;
   justify-content: space-between;
