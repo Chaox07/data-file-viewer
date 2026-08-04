@@ -106,6 +106,23 @@ function stripTrailingSemicolon(sql: string): string {
   return sql.trim().replace(/;\s*$/, '');
 }
 
+// $-anchored so only the outermost/final LIMIT is matched -- a LIMIT nested
+// inside an inner subquery (part of the query's own logic) is left alone.
+const TRAILING_LIMIT_RE = /\s+limit\s+\d+(?:\s+offset\s+\d+)?\s*;?\s*$/i;
+
+export function hasTrailingLimit(sql: string): boolean {
+  return TRAILING_LIMIT_RE.test(sql);
+}
+
+function extractTrailingLimit(sql: string): { withoutLimit: string; limitClause: string } | null {
+  const match = sql.match(TRAILING_LIMIT_RE);
+  if (!match) return null;
+  return {
+    withoutLimit: sql.slice(0, match.index),
+    limitClause: match[0].trim().replace(/;\s*$/, ''),
+  };
+}
+
 function classifyForStats(typeId: DuckDBTypeId): StatsKind {
   switch (typeId) {
     case DuckDBTypeId.TINYINT:
@@ -280,6 +297,27 @@ export class DuckDbFile {
     const rows = reader.getRowsJson() as unknown[][];
     const columnStatsKind = reader.columnTypes().map((t) => classifyForStats(t.typeId));
     return { columns, rows, columnStatsKind };
+  }
+
+  /**
+   * Sorting on the client only re-orders whatever rows a LIMIT already
+   * fetched -- if the base query has a trailing LIMIT (with no matching
+   * ORDER BY of its own), DuckDB's row selection for that is
+   * implementation-defined, so a client-side sort can't recover the true
+   * top/bottom N by a column from a set that was never guaranteed to
+   * contain them. This strips that trailing LIMIT, sorts the *full*
+   * underlying result, then re-applies the original LIMIT/OFFSET on the
+   * outside, so "sorted" always means sorted across the whole matching
+   * data set, not just whatever happened to already be in memory.
+   */
+  async runSortedQuery(baseSql: string, column: string, direction: 'asc' | 'desc'): Promise<QueryResult> {
+    const stripped = stripTrailingSemicolon(baseSql);
+    const extracted = extractTrailingLimit(stripped);
+    const inner = extracted ? extracted.withoutLimit : stripped;
+    const col = quoteIdent(column);
+    const limitSuffix = extracted ? ` ${extracted.limitClause}` : '';
+    const sortedSql = `select * from (${inner}) as _sorted order by ${col} ${direction} nulls last${limitSuffix}`;
+    return this.runQuery(sortedSql);
   }
 
   /** Flushes pending writes to disk, then copies the file. Returns the backup path. */

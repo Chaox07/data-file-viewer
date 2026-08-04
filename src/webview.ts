@@ -12,20 +12,23 @@ declare function acquireVsCodeApi(): VsCodeApi;
 type TableStatus = 'unchanged' | 'changed' | 'new';
 type StatsKind = 'numeric' | 'datetime' | 'other';
 
+interface QueryResultFields {
+  columns: string[];
+  rows: unknown[][];
+  columnStatsKind: StatsKind[];
+  cellChanged?: boolean[][];
+  rowIsNew?: boolean[];
+  renamedColumns?: Record<string, string>;
+  diffSkipped: boolean;
+  hasLimit: boolean;
+  editable: boolean;
+  editableTable?: string;
+}
+
 type ExtensionMessage =
   | { command: 'tables'; tables: string[] }
-  | {
-      command: 'queryResult';
-      columns: string[];
-      rows: unknown[][];
-      columnStatsKind: StatsKind[];
-      cellChanged?: boolean[][];
-      rowIsNew?: boolean[];
-      renamedColumns?: Record<string, string>;
-      diffSkipped: boolean;
-      editable: boolean;
-      editableTable?: string;
-    }
+  | ({ command: 'queryResult' } & QueryResultFields)
+  | ({ command: 'sortQueryResult' } & QueryResultFields)
   | { command: 'error'; message: string }
   | { command: 'backupStatus'; message: string }
   | { command: 'tableChangeStatus'; status: Record<string, TableStatus> }
@@ -49,17 +52,7 @@ type ExtensionMessage =
   | { command: 'cellUpdated'; column: string; newValue: unknown; rowValues: Record<string, unknown>; rowsMatched: number }
   | { command: 'cellUpdateError'; column: string; message: string };
 
-interface LastResult {
-  columns: string[];
-  rows: unknown[][];
-  columnStatsKind: StatsKind[];
-  cellChanged?: boolean[][];
-  rowIsNew?: boolean[];
-  renamedColumns?: Record<string, string>;
-  diffSkipped: boolean;
-  editable: boolean;
-  editableTable?: string;
-}
+type LastResult = QueryResultFields;
 
 const vscode = acquireVsCodeApi();
 
@@ -568,10 +561,18 @@ function renderResults(): void {
     sortBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       if (running) return;
-      sortState = isActiveSort
-        ? { columnIndex: colIdx, direction: sortState!.direction === 'asc' ? 'desc' : 'asc' }
-        : { columnIndex: colIdx, direction: 'asc' };
-      renderResults();
+      const direction = isActiveSort && sortState!.direction === 'asc' ? 'desc' : 'asc';
+      sortState = { columnIndex: colIdx, direction };
+      if (lastResult?.hasLimit) {
+        // A LIMIT-ed result can't be correctly re-sorted from just the rows
+        // already in memory (see hasLimit's origin in duckdbConnection.ts) --
+        // ask the host to re-run the query sorted against the full data.
+        setRunning(true);
+        statusEl.textContent = 'Sorting…';
+        vscode.postMessage({ command: 'sortQuery', column: col, direction });
+      } else {
+        renderResults();
+      }
     });
 
     const statsBtn = document.createElement('button');
@@ -690,10 +691,31 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
         rowIsNew: message.rowIsNew,
         renamedColumns: message.renamedColumns,
         diffSkipped: message.diffSkipped,
+        hasLimit: message.hasLimit,
         editable: message.editable,
         editableTable: message.editableTable,
       };
       sortState = undefined;
+      renderResults();
+      break;
+    case 'sortQueryResult':
+      setRunning(false);
+      statusEl.textContent = '';
+      lastResult = {
+        columns: message.columns,
+        rows: message.rows,
+        columnStatsKind: message.columnStatsKind,
+        cellChanged: message.cellChanged,
+        rowIsNew: message.rowIsNew,
+        renamedColumns: message.renamedColumns,
+        diffSkipped: message.diffSkipped,
+        hasLimit: message.hasLimit,
+        editable: message.editable,
+        editableTable: message.editableTable,
+      };
+      // sortState is intentionally left as-is -- this response IS the
+      // result of the sort that was just clicked, so the arrow icon must
+      // keep showing it (unlike a fresh runQuery, which clears it above).
       renderResults();
       break;
     case 'error':

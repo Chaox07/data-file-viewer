@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { basename } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { open as fsOpen, readFile, unlink } from 'node:fs/promises';
-import { DescriptiveStats, DuckDbFile, QueryDiff, TopValuesStats } from './duckdbConnection';
+import { DescriptiveStats, DuckDbFile, QueryDiff, TopValuesStats, hasTrailingLimit } from './duckdbConnection';
 import { isDestructiveStatement } from './sqlSafety';
 
 // Above this many rows, the automatic post-query diff against the backup
@@ -235,6 +235,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
       | { command: 'runQuery'; sql: string }
       | { command: 'cancelQuery' }
       | { command: 'diffQuery' }
+      | { command: 'sortQuery'; column: string; direction: 'asc' | 'desc' }
       | { command: 'toggleSafeMode'; safeMode: boolean; backupBeforeWrite: boolean; checkForChanges: boolean }
       | { command: 'columnStats'; column: string; statsKind: 'numeric' | 'datetime' | 'other'; limit?: number }
       | { command: 'updateCell'; column: string; newValue: unknown; rowValues: Record<string, unknown> };
@@ -348,6 +349,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             ...result,
             ...diffFields,
             diffSkipped,
+            hasLimit: hasTrailingLimit(message.sql),
             editable: editability.editable,
             editableTable: editability.editable ? editability.table : undefined,
           });
@@ -377,8 +379,56 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             ...result,
             ...(diff ?? {}),
             diffSkipped: false,
+            hasLimit: hasTrailingLimit(document.lastSql),
             // Editability is unchanged from the original run — this is the
             // same query re-executed only to compute the diff, not a new one.
+            editable: !!document.lastEditableTable,
+            editableTable: document.lastEditableTable,
+          });
+        } catch (err) {
+          webview.postMessage({ command: 'error', message: (err as Error).message });
+        } finally {
+          running = false;
+        }
+        return;
+      }
+
+      if (message.command === 'sortQuery') {
+        // Only reachable when the base query has a trailing LIMIT (the
+        // webview only sends this then — see hasLimit in queryResult) — a
+        // client-side re-sort of already-fetched rows can't recover the
+        // true top/bottom N from a LIMIT-ed, unordered result, so this
+        // re-runs the query with the LIMIT stripped, sorted, then
+        // re-applied. document.lastSql is deliberately left untouched:
+        // editability/stats continue to reflect the user's real query.
+        if (running || !document.lastSql) return;
+        running = true;
+        try {
+          const result = await document.file.runSortedQuery(document.lastSql, message.column, message.direction);
+
+          let diffFields: Partial<QueryDiff> = {};
+          let diffSkipped = false;
+          if (document.checkForChanges && document.hasBackup) {
+            if (result.rows.length > DIFF_ROW_THRESHOLD) {
+              diffSkipped = true;
+            } else {
+              try {
+                const diff = await document.file.diffQueryAgainstBackup(document.lastSql, result.columns, result.rows);
+                if (diff) diffFields = diff;
+              } catch {
+                // Diff highlighting is a nice-to-have; never let it block showing the result.
+              }
+            }
+          }
+
+          webview.postMessage({
+            command: 'sortQueryResult',
+            ...result,
+            ...diffFields,
+            diffSkipped,
+            hasLimit: true,
+            // Editability is unchanged from the original run — sorting
+            // doesn't change the query's shape, only row order.
             editable: !!document.lastEditableTable,
             editableTable: document.lastEditableTable,
           });
