@@ -1,7 +1,72 @@
 import * as vscode from 'vscode';
 import { basename } from 'node:path';
-import { DuckDbFile, QueryDiff } from './duckdbConnection';
+import { randomBytes } from 'node:crypto';
+import { open as fsOpen, readFile, unlink } from 'node:fs/promises';
+import { DescriptiveStats, DuckDbFile, QueryDiff, TopValuesStats } from './duckdbConnection';
 import { isDestructiveStatement } from './sqlSafety';
+
+// Above this many rows, the automatic post-query diff against the backup
+// (an O(rows) comparison) is skipped by default — see the runQuery and
+// diffQuery handlers below.
+const DIFF_ROW_THRESHOLD = 50_000;
+
+/**
+ * Cross-process (specifically cross-VS-Code-window) file lock for kinds
+ * that DuckDB itself doesn't natively lock (.csv/.parquet — see
+ * openFlatFilePaths below for the same-window guard this backstops).
+ * PID-aware rather than purely presence-based, so a lock file left behind
+ * by a crashed VS Code window self-heals on the next open instead of
+ * requiring a manual force-clear.
+ */
+function releaseFileLockSync(lockPath: string): void {
+  unlink(lockPath).catch(() => {});
+}
+
+async function acquireFileLock(path: string): Promise<() => void> {
+  const lockPath = `${path}.dfv.lock`;
+
+  const tryAcquire = async (): Promise<void> => {
+    const handle = await fsOpen(lockPath, 'wx'); // atomically fails if it already exists
+    await handle.writeFile(String(process.pid));
+    await handle.close();
+  };
+
+  try {
+    await tryAcquire();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+
+    let stale = false;
+    try {
+      const pid = Number((await readFile(lockPath, 'utf8')).trim());
+      if (!Number.isInteger(pid)) {
+        stale = true;
+      } else {
+        try {
+          process.kill(pid, 0); // sends no signal, just tests whether the process exists
+        } catch {
+          stale = true;
+        }
+      }
+    } catch {
+      // Lock file vanished between the EEXIST and reading it (raced with
+      // another process releasing it) — safe to just retry acquiring.
+      stale = true;
+    }
+
+    if (!stale) {
+      throw new Error(
+        `${basename(
+          path
+        )} is already open in another VS Code window — this file type has no native lock, so a second window could silently overwrite edits from the first. Close the other window first.`
+      );
+    }
+    releaseFileLockSync(lockPath);
+    await tryAcquire();
+  }
+
+  return () => releaseFileLockSync(lockPath);
+}
 
 class DuckDBDocument implements vscode.CustomDocument {
   private tablesCache: string[] | undefined;
@@ -17,6 +82,10 @@ class DuckDBDocument implements vscode.CustomDocument {
   lastSql: string | undefined;
   lastEditableTable: string | undefined;
   lastEditableColumns: string[] | undefined;
+
+  // Keyed by `${statsKind}:${column}` — cleared whenever a new query runs,
+  // since stats are scoped to the current base query.
+  readonly statsCache = new Map<string, TopValuesStats | DescriptiveStats>();
 
   constructor(readonly uri: vscode.Uri, readonly file: DuckDbFile, private readonly onDispose?: () => void) {}
 
@@ -103,7 +172,14 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
       throw new Error(message);
     }
 
+    let releaseLock: (() => void) | undefined;
     try {
+      // In-memory openFlatFilePaths above catches same-window double-opens
+      // fast, without touching the filesystem; this lock is the backstop
+      // for a second VS Code *window*, which gets its own process and
+      // wouldn't see that in-memory guard at all.
+      if (isFlatFile) releaseLock = await acquireFileLock(uri.fsPath);
+
       const file = await DuckDbFile.open(uri.fsPath);
       if (file.isReadOnly()) {
         vscode.window.showWarningMessage(
@@ -111,8 +187,18 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
         );
       }
       if (isFlatFile) this.openFlatFilePaths.add(uri.fsPath);
-      return new DuckDBDocument(uri, file, isFlatFile ? () => this.openFlatFilePaths.delete(uri.fsPath) : undefined);
+      return new DuckDBDocument(
+        uri,
+        file,
+        isFlatFile
+          ? () => {
+              this.openFlatFilePaths.delete(uri.fsPath);
+              releaseLock?.();
+            }
+          : undefined
+      );
     } catch (err) {
+      releaseLock?.();
       const message = err instanceof Error ? err.message : String(err);
       vscode.window.showErrorMessage(message);
       throw err;
@@ -147,6 +233,8 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
     type IncomingMessage =
       | { command: 'ready' }
       | { command: 'runQuery'; sql: string }
+      | { command: 'cancelQuery' }
+      | { command: 'diffQuery' }
       | { command: 'toggleSafeMode'; safeMode: boolean; backupBeforeWrite: boolean; checkForChanges: boolean }
       | { command: 'columnStats'; column: string; statsKind: 'numeric' | 'datetime' | 'other'; limit?: number }
       | { command: 'updateCell'; column: string; newValue: unknown; rowValues: Record<string, unknown> };
@@ -159,6 +247,14 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
         } catch (err) {
           webview.postMessage({ command: 'error', message: (err as Error).message });
         }
+        return;
+      }
+
+      if (message.command === 'cancelQuery') {
+        // Deliberately not gated by `running` — cancelling only makes sense
+        // while something is in flight, and interrupting an idle connection
+        // is harmless (DuckDB just has nothing to stop).
+        document.file.interruptCurrentQuery();
         return;
       }
 
@@ -223,14 +319,23 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
 
           const result = await document.file.runQuery(message.sql);
           document.lastSql = message.sql;
+          document.statsCache.clear();
 
           let diffFields: Partial<QueryDiff> = {};
+          let diffSkipped = false;
           if (!destructive && document.checkForChanges && document.hasBackup) {
-            try {
-              const diff = await document.file.diffQueryAgainstBackup(message.sql, result.columns, result.rows);
-              if (diff) diffFields = diff;
-            } catch {
-              // Diff highlighting is a nice-to-have; never let it block showing the result.
+            if (result.rows.length > DIFF_ROW_THRESHOLD) {
+              // An O(rows) comparison nobody explicitly asked for isn't worth
+              // paying for automatically on a huge result — offer it as an
+              // on-demand action instead (see the diffQuery handler below).
+              diffSkipped = true;
+            } else {
+              try {
+                const diff = await document.file.diffQueryAgainstBackup(message.sql, result.columns, result.rows);
+                if (diff) diffFields = diff;
+              } catch {
+                // Diff highlighting is a nice-to-have; never let it block showing the result.
+              }
             }
           }
 
@@ -242,8 +347,40 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             command: 'queryResult',
             ...result,
             ...diffFields,
+            diffSkipped,
             editable: editability.editable,
             editableTable: editability.editable ? editability.table : undefined,
+          });
+        } catch (err) {
+          const message2 = (err as Error).message;
+          webview.postMessage({
+            command: 'error',
+            message: /interrupt/i.test(message2) ? 'Query cancelled.' : message2,
+          });
+        } finally {
+          running = false;
+        }
+        return;
+      }
+
+      if (message.command === 'diffQuery') {
+        // On-demand counterpart to runQuery's automatic diff, for results
+        // large enough that diffSkipped was set — explicit opt-in, since the
+        // comparison itself is the expensive part being deferred here.
+        if (running || !document.lastSql || !document.hasBackup) return;
+        running = true;
+        try {
+          const result = await document.file.runQuery(document.lastSql);
+          const diff = await document.file.diffQueryAgainstBackup(document.lastSql, result.columns, result.rows);
+          webview.postMessage({
+            command: 'queryResult',
+            ...result,
+            ...(diff ?? {}),
+            diffSkipped: false,
+            // Editability is unchanged from the original run — this is the
+            // same query re-executed only to compute the diff, not a new one.
+            editable: !!document.lastEditableTable,
+            editableTable: document.lastEditableTable,
           });
         } catch (err) {
           webview.postMessage({ command: 'error', message: (err as Error).message });
@@ -255,13 +392,22 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
 
       if (message.command === 'columnStats') {
         if (running || !document.lastSql) return;
+        const limit = Number.isInteger(message.limit) && message.limit! > 0 && message.limit! <= 200 ? message.limit! : 20;
+        const cacheKey = `${message.statsKind}:${message.column}`;
+        const cached = document.statsCache.get(cacheKey);
+        if (cached) {
+          webview.postMessage({ command: 'columnStatsResult', column: message.column, statsKind: message.statsKind, ...cached });
+          return;
+        }
         running = true;
         try {
           if (message.statsKind === 'other') {
-            const stats = await document.file.getColumnTopValues(document.lastSql, message.column, message.limit);
+            const stats = await document.file.getColumnTopValues(document.lastSql, message.column, limit);
+            document.statsCache.set(cacheKey, stats);
             webview.postMessage({ command: 'columnStatsResult', column: message.column, statsKind: 'other', ...stats });
           } else {
             const stats = await document.file.getColumnDescriptiveStats(document.lastSql, message.column, message.statsKind);
+            document.statsCache.set(cacheKey, stats);
             webview.postMessage({
               command: 'columnStatsResult',
               column: message.column,
@@ -361,10 +507,8 @@ function getHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vscod
 }
 
 function getNonce(): string {
-  let text = '';
-  const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  for (let i = 0; i < 32; i++) {
-    text += possible.charAt(Math.floor(Math.random() * possible.length));
-  }
-  return text;
+  // A CSP nonce must be unguessable — Math.random() isn't a CSPRNG and its
+  // output is statistically predictable given enough samples, which defeats
+  // the point of using a nonce at all.
+  return randomBytes(16).toString('hex');
 }

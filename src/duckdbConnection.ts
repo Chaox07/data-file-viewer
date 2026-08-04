@@ -1,6 +1,6 @@
 import { DuckDBConnection, DuckDBInstance, DuckDBTypeId, DuckDBValue, StatementType } from '@duckdb/node-api';
 import { basename, dirname, extname, join } from 'node:path';
-import { copyFile } from 'node:fs/promises';
+import { chmod, copyFile, stat } from 'node:fs/promises';
 
 export type StatsKind = 'numeric' | 'datetime' | 'other';
 
@@ -301,6 +301,19 @@ export class DuckDbFile {
     const dir = dirname(this.path);
     const backupPath = join(dir, `${base}.backup-${formatTimestamp(new Date())}${ext}`);
     await copyFile(this.path, backupPath);
+
+    // copyFile creates the destination under the process's umask, not the
+    // source's own mode bits — mirror them so a backup of a file someone
+    // deliberately locked down (e.g. chmod 600) doesn't end up more
+    // permissive than the original. Best-effort: never let this block the
+    // backup itself. Meaningful mainly on POSIX; Windows ACLs don't map onto
+    // mode bits the same way.
+    try {
+      const { mode } = await stat(this.path);
+      await chmod(backupPath, mode);
+    } catch {
+      // Backup already succeeded above; permission mirroring is a nice-to-have.
+    }
 
     // A repeat createBackup() (Safe Mode toggled off more than once) must
     // swap the attached catalog, not stack a second backup_cmp — DuckDB
@@ -603,6 +616,12 @@ export class DuckDbFile {
 
   /** On-demand top-N most frequent values for a string/"other"-kind column. */
   async getColumnTopValues(baseSql: string, column: string, limit = 20): Promise<TopValuesStats> {
+    // limit ends up interpolated directly into a LIMIT clause (integers
+    // can't be bound as query parameters the way values/identifiers can) —
+    // clamp it here as a second line of defense even though the caller
+    // (duckdbEditorProvider.ts) already validates it, so this method stays
+    // safe regardless of what calls it in the future.
+    const safeLimit = Number.isInteger(limit) && limit > 0 && limit <= 200 ? limit : 20;
     const wrapped = `(${stripTrailingSemicolon(baseSql)})`;
     const col = quoteIdent(column);
 
@@ -613,7 +632,7 @@ export class DuckDbFile {
     const [totalRows, nonNullRows, nullCount, distinctCount] = summaryRow.map(Number);
 
     const topReader = await this.connection.runAndReadAll(
-      `select ${col} as value, count(*) as frequency from ${wrapped} as _stats_source where ${col} is not null group by ${col} order by frequency desc, value limit ${limit}`
+      `select ${col} as value, count(*) as frequency from ${wrapped} as _stats_source where ${col} is not null group by ${col} order by frequency desc, value limit ${safeLimit}`
     );
     const topValues = topReader.getRowsJson().map((row) => {
       const [value, frequency] = row as unknown[];
@@ -652,6 +671,18 @@ export class DuckDbFile {
       median,
       p75,
     };
+  }
+
+  /**
+   * Stops whatever query is currently in flight on this connection.
+   * Verified empirically (not just from the type signature) that this
+   * unblocks a pending streamAndReadAll()/streamAndReadUntil() call almost
+   * immediately, and that the connection is fully reusable for a fresh
+   * query right afterward — DuckDB's own type definitions don't document
+   * either guarantee.
+   */
+  interruptCurrentQuery(): void {
+    this.connection.interrupt();
   }
 
   dispose(): void {

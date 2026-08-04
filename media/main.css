@@ -92,6 +92,14 @@ html, body {
   cursor: default;
 }
 
+#run-btn.run-btn-cancel {
+  background: #e06c75;
+}
+
+#run-btn.run-btn-cancel:hover {
+  background: #e88089;
+}
+
 .status {
   color: #7d8493;
   font-size: 12px;
@@ -248,6 +256,25 @@ html, body {
   padding: 6px 10px;
   color: #7d8493;
   font-size: 12px;
+}
+
+.diff-skipped-note {
+  color: #7d8493;
+}
+
+.diff-anyway-btn {
+  margin-left: 6px;
+  background: #3a3f4b;
+  color: #abb2bf;
+  border: none;
+  border-radius: 3px;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.diff-anyway-btn:hover {
+  background: #464c5a;
 }
 
 .results .empty {

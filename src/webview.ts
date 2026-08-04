@@ -22,6 +22,7 @@ type ExtensionMessage =
       cellChanged?: boolean[][];
       rowIsNew?: boolean[];
       renamedColumns?: Record<string, string>;
+      diffSkipped: boolean;
       editable: boolean;
       editableTable?: string;
     }
@@ -56,6 +57,7 @@ interface LastResult {
   cellChanged?: boolean[][];
   rowIsNew?: boolean[];
   renamedColumns?: Record<string, string>;
+  diffSkipped: boolean;
   editable: boolean;
   editableTable?: string;
 }
@@ -108,7 +110,11 @@ let sortState: { columnIndex: number; direction: 'asc' | 'desc' } | undefined;
 
 function setRunning(value: boolean): void {
   running = value;
-  runBtn.disabled = value;
+  // Stays enabled and turns into a Cancel button while running, rather than
+  // being disabled — a runaway query otherwise has no escape hatch short of
+  // closing the tab.
+  runBtn.textContent = value ? 'Cancel ■' : 'Run ▶';
+  runBtn.classList.toggle('run-btn-cancel', value);
   // Disables sort/stats/cell-edit affordances too (via pointer-events),
   // rather than letting a click sent mid-query silently no-op on the host
   // side and leave e.g. a stats popover stuck on "Loading…" forever.
@@ -155,7 +161,13 @@ function runQuery(sqlText: string): void {
   vscode.postMessage({ command: 'runQuery', sql: trimmed });
 }
 
-runBtn.addEventListener('click', () => runQuery(editor.state.doc.toString()));
+runBtn.addEventListener('click', () => {
+  if (running) {
+    vscode.postMessage({ command: 'cancelQuery' });
+  } else {
+    runQuery(editor.state.doc.toString());
+  }
+});
 
 function sendToggleSafeMode(): void {
   unlockOptionsEl.hidden = safeModeCheck.checked;
@@ -590,6 +602,24 @@ function renderResults(): void {
   const footer = document.createElement('div');
   footer.className = 'results-footer';
   footer.textContent = `${rows.length} row${rows.length === 1 ? '' : 's'} shown`;
+
+  if (lastResult.diffSkipped) {
+    const note = document.createElement('span');
+    note.className = 'diff-skipped-note';
+    note.textContent = ' — result too large to auto-diff against the backup.';
+    const diffBtn = document.createElement('button');
+    diffBtn.className = 'diff-anyway-btn';
+    diffBtn.textContent = 'Diff anyway';
+    diffBtn.addEventListener('click', () => {
+      if (running) return;
+      setRunning(true);
+      statusEl.textContent = 'Diffing…';
+      vscode.postMessage({ command: 'diffQuery' });
+    });
+    note.appendChild(diffBtn);
+    footer.appendChild(note);
+  }
+
   resultsEl.appendChild(footer);
 }
 
@@ -624,6 +654,7 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
         cellChanged: message.cellChanged,
         rowIsNew: message.rowIsNew,
         renamedColumns: message.renamedColumns,
+        diffSkipped: message.diffSkipped,
         editable: message.editable,
         editableTable: message.editableTable,
       };
