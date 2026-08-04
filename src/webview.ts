@@ -50,7 +50,8 @@ type ExtensionMessage =
     }
   | { command: 'columnStatsError'; column: string; message: string }
   | { command: 'cellUpdated'; column: string; newValue: unknown; rowValues: Record<string, unknown>; rowsMatched: number }
-  | { command: 'cellUpdateError'; column: string; message: string };
+  | { command: 'cellUpdateError'; column: string; message: string }
+  | { command: 'editStatus'; message: string };
 
 type LastResult = QueryResultFields;
 
@@ -776,6 +777,11 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
       break;
     case 'cellUpdateError':
       if (pendingCellEdit && pendingCellEdit.column === message.column) {
+        pendingCellEdit.statusEl.textContent = message.message;
+      }
+      break;
+    case 'editStatus':
+      if (pendingCellEdit) {
         pendingCellEdit.statusEl.textContent = message.message;
       }
       break;

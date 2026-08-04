@@ -106,6 +106,13 @@ function stripTrailingSemicolon(sql: string): string {
   return sql.trim().replace(/;\s*$/, '');
 }
 
+function wrapAsSubquery(sql: string): string {
+  // The newlines are load-bearing: if `sql`'s last line ends in a `--`
+  // comment, a closing `)` on the same line would become part of the
+  // comment and break the query.
+  return `(\n${sql}\n)`;
+}
+
 // $-anchored so only the outermost/final LIMIT is matched -- a LIMIT nested
 // inside an inner subquery (part of the query's own logic) is left alone.
 const TRAILING_LIMIT_RE = /\s+limit\s+\d+(?:\s+offset\s+\d+)?\s*;?\s*$/i;
@@ -316,7 +323,7 @@ export class DuckDbFile {
     const inner = extracted ? extracted.withoutLimit : stripped;
     const col = quoteIdent(column);
     const limitSuffix = extracted ? ` ${extracted.limitClause}` : '';
-    const sortedSql = `select * from (${inner}) as _sorted order by ${col} ${direction} nulls last${limitSuffix}`;
+    const sortedSql = `select * from ${wrapAsSubquery(inner)} as _sorted order by ${col} ${direction} nulls last${limitSuffix}`;
     return this.runQuery(sortedSql);
   }
 
@@ -605,8 +612,12 @@ export class DuckDbFile {
     table: string,
     column: string,
     newValue: unknown,
-    rowValues: Record<string, unknown>
+    rowValues: Record<string, unknown>,
+    onStatus?: (message: string) => void
   ): Promise<number> {
+    if (!this.materialized && this.isFlatFileKind()) {
+      onStatus?.('Preparing file for editing…');
+    }
     await this.materializeIfNeeded();
 
     const whereCols = Object.keys(rowValues);
@@ -627,6 +638,7 @@ export class DuckDbFile {
     const rowsChanged = result.rowsChanged;
 
     if (rowsChanged > 0 && this.isFlatFileKind()) {
+      onStatus?.('Saving…');
       await this.writeBackFlatFile();
     }
     return rowsChanged;
@@ -659,7 +671,7 @@ export class DuckDbFile {
     // (duckdbEditorProvider.ts) already validates it, so this method stays
     // safe regardless of what calls it in the future.
     const safeLimit = Number.isInteger(limit) && limit > 0 && limit <= 200 ? limit : 20;
-    const wrapped = `(${stripTrailingSemicolon(baseSql)})`;
+    const wrapped = wrapAsSubquery(stripTrailingSemicolon(baseSql));
     const col = quoteIdent(column);
 
     const summaryReader = await this.connection.runAndReadAll(
@@ -685,7 +697,7 @@ export class DuckDbFile {
     column: string,
     statsKind: 'numeric' | 'datetime'
   ): Promise<DescriptiveStats> {
-    const wrapped = `(${stripTrailingSemicolon(baseSql)})`;
+    const wrapped = wrapAsSubquery(stripTrailingSemicolon(baseSql));
     const col = quoteIdent(column);
     const meanExpr = statsKind === 'numeric' ? `avg(${col})` : `to_timestamp(avg(epoch(${col})))`;
 

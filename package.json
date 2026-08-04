@@ -48,7 +48,18 @@
         ],
         "priority": "option"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Data File Viewer",
+      "properties": {
+        "dataFileViewer.diffRowThreshold": {
+          "type": "number",
+          "default": 50000,
+          "minimum": 1,
+          "description": "Above this many rows, automatic diff-against-backup highlighting is skipped after a query — use \"Diff anyway\" to run it on demand instead."
+        }
+      }
+    }
   },
   "scripts": {
     "build": "node esbuild.js",

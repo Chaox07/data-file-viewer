@@ -7,8 +7,13 @@ import { isDestructiveStatement } from './sqlSafety';
 
 // Above this many rows, the automatic post-query diff against the backup
 // (an O(rows) comparison) is skipped by default — see the runQuery and
-// diffQuery handlers below.
-const DIFF_ROW_THRESHOLD = 50_000;
+// sortQuery handlers below. User-configurable via
+// dataFileViewer.diffRowThreshold; read live (not cached) so a settings
+// change takes effect immediately without a window reload.
+function getDiffRowThreshold(): number {
+  const value = vscode.workspace.getConfiguration('dataFileViewer').get<number>('diffRowThreshold', 50_000);
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 50_000;
+}
 
 /**
  * Cross-process (specifically cross-VS-Code-window) file lock for kinds
@@ -86,8 +91,19 @@ class DuckDBDocument implements vscode.CustomDocument {
   // Keyed by `${statsKind}:${column}` — cleared whenever a new query runs,
   // since stats are scoped to the current base query.
   readonly statsCache = new Map<string, TopValuesStats | DescriptiveStats>();
+  private static readonly MAX_STATS_CACHE_ENTRIES = 50;
 
   constructor(readonly uri: vscode.Uri, readonly file: DuckDbFile, private readonly onDispose?: () => void) {}
+
+  // Capped insert — cheap insurance against unbounded growth if caching
+  // ever extends beyond "cleared on every new query" in the future.
+  setStatsCache(key: string, value: TopValuesStats | DescriptiveStats): void {
+    if (this.statsCache.size >= DuckDBDocument.MAX_STATS_CACHE_ENTRIES && !this.statsCache.has(key)) {
+      const oldestKey = this.statsCache.keys().next().value; // Map preserves insertion order
+      if (oldestKey !== undefined) this.statsCache.delete(oldestKey);
+    }
+    this.statsCache.set(key, value);
+  }
 
   async getTables(): Promise<string[]> {
     if (!this.tablesCache) {
@@ -325,7 +341,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
           let diffFields: Partial<QueryDiff> = {};
           let diffSkipped = false;
           if (!destructive && document.checkForChanges && document.hasBackup) {
-            if (result.rows.length > DIFF_ROW_THRESHOLD) {
+            if (result.rows.length > getDiffRowThreshold()) {
               // An O(rows) comparison nobody explicitly asked for isn't worth
               // paying for automatically on a huge result — offer it as an
               // on-demand action instead (see the diffQuery handler below).
@@ -409,7 +425,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
           let diffFields: Partial<QueryDiff> = {};
           let diffSkipped = false;
           if (document.checkForChanges && document.hasBackup) {
-            if (result.rows.length > DIFF_ROW_THRESHOLD) {
+            if (result.rows.length > getDiffRowThreshold()) {
               diffSkipped = true;
             } else {
               try {
@@ -453,11 +469,11 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
         try {
           if (message.statsKind === 'other') {
             const stats = await document.file.getColumnTopValues(document.lastSql, message.column, limit);
-            document.statsCache.set(cacheKey, stats);
+            document.setStatsCache(cacheKey, stats);
             webview.postMessage({ command: 'columnStatsResult', column: message.column, statsKind: 'other', ...stats });
           } else {
             const stats = await document.file.getColumnDescriptiveStats(document.lastSql, message.column, message.statsKind);
-            document.statsCache.set(cacheKey, stats);
+            document.setStatsCache(cacheKey, stats);
             webview.postMessage({
               command: 'columnStatsResult',
               column: message.column,
@@ -508,7 +524,8 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             document.lastEditableTable,
             message.column,
             message.newValue,
-            message.rowValues
+            message.rowValues,
+            (statusMessage) => webview.postMessage({ command: 'editStatus', message: statusMessage })
           );
           if (rowsMatched === 0) {
             webview.postMessage({
