@@ -47,17 +47,21 @@ GitHub Actions workflow below to get both automatically.
 push, using GitHub-hosted runners — no local Node/npm/vsce needed on a machine
 that only needs to *install* the extension.
 
-After pushing to GitHub: open the repo's **Actions** tab, pick the latest run,
-and download the `vsix-macos-latest` / `vsix-windows-latest` artifact for
-whichever machine you're on. Then:
+Every push to `main` also publishes both `.vsix` files to a rolling
+[**`latest` release**](https://github.com/Chaox07/data-file-viewer/releases/tag/latest)
+— one permanent URL that's always overwritten with the newest build, so you
+don't have to dig through the Actions tab or worry about the 90-day artifact
+expiry below. Download the platform-tagged `.vsix` (`...-macos-latest.vsix` /
+`...-windows-latest.vsix`) for your machine, then:
 
 ```sh
 code --install-extension <downloaded-file>.vsix
 ```
 
-Artifacts expire after 90 days by default; re-download from the latest run if
-needed, or tag a release (`git tag v0.1 && git push --tags`) and add a release
-job if you want a persistent download link instead.
+If you need a specific run's build instead of always-latest: open the repo's
+**Actions** tab, pick that run, and download its `vsix-macos-latest` /
+`vsix-windows-latest` artifact. Unlike the `latest` release above, these
+per-run artifacts expire after 90 days by default.
 
 ## Making `.duckdb`/`.parquet` files open in VS Code on double-click
 
