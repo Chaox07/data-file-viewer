@@ -606,6 +606,9 @@ function renderResults(): void {
     row.forEach((value, j) => {
       const td = document.createElement('td');
       td.textContent = formatValue(value, columnStatsKind[j]);
+      if (value === null || value === undefined) {
+        td.classList.add('cell-null');
+      }
       if (!isNewRow && cellChanged?.[i]?.[j]) {
         td.classList.add('cell-changed');
       }

@@ -251,6 +251,11 @@ html, body {
   background: #2c313c;
 }
 
+.results td.cell-null {
+  color: #7d8493;
+  font-style: italic;
+}
+
 /* Change highlighting, relative to the last backup — see "Check for changes". */
 .results td.cell-changed {
   background: rgba(229, 192, 123, 0.35);
