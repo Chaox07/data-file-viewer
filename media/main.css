@@ -118,7 +118,11 @@ html, body {
   font-weight: 600;
 }
 
-#unlock-options {
+/* :not([hidden]) is required -- an author-stylesheet display rule always
+   overrides the browser's built-in `[hidden] { display: none }` UA rule
+   regardless of selector specificity, so a bare `#unlock-options { display:
+   flex }` would silently defeat `unlockOptionsEl.hidden = true` in webview.ts. */
+#unlock-options:not([hidden]) {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -168,6 +172,54 @@ html, body {
   background: #21252b;
   color: #abb2bf;
   font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.th-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.th-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.th-sort-btn, .th-stats-btn {
+  background: none;
+  border: none;
+  color: #7d8493;
+  cursor: pointer;
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 3px;
+  border-radius: 2px;
+}
+
+.th-sort-btn:hover, .th-stats-btn:hover {
+  background: #3a3f4b;
+  color: #abb2bf;
+}
+
+.th-stats-btn {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* Disables sort/stats/cell-edit affordances while a query is in flight, so a
+   click sent mid-run can't silently no-op on the host side and leave e.g. a
+   stats popover stuck on "Loading…" forever. */
+.results.busy {
+  pointer-events: none;
+  opacity: 0.7;
 }
 
 .results tr.odd {
@@ -208,4 +260,159 @@ html, body {
   color: #e06c75;
   white-space: pre-wrap;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Column statistics popover, anchored under the header's stats button. */
+.stats-popover {
+  position: fixed;
+  z-index: 20;
+  min-width: 200px;
+  max-width: 320px;
+  max-height: 340px;
+  overflow-y: auto;
+  background: #21252b;
+  border: 1px solid #181a1f;
+  border-radius: 4px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  padding: 10px;
+  font-size: 12px;
+  color: #abb2bf;
+}
+
+.stats-loading, .stats-empty {
+  color: #7d8493;
+}
+
+.stats-title {
+  font-weight: 600;
+  margin-bottom: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stats-summary {
+  color: #7d8493;
+  margin-bottom: 4px;
+}
+
+.stats-top-values, .stats-descriptive {
+  margin-top: 6px;
+}
+
+.stats-top-value-row, .stats-descriptive-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 0;
+  border-bottom: 1px solid #181a1f;
+}
+
+.stats-top-value, .stats-descriptive-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.stats-top-freq, .stats-descriptive-value {
+  flex-shrink: 0;
+  color: #7d8493;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Cell inspector: double-click a cell to view its full value; editable in
+   place of the same panel when the result is a plain single-table SELECT
+   and Safe Mode is off. */
+.cell-inspector-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cell-inspector-panel {
+  width: min(640px, 90vw);
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  background: #282c34;
+  border: 1px solid #181a1f;
+  border-radius: 6px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+
+.cell-inspector-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: #21252b;
+  border-bottom: 1px solid #181a1f;
+  font-weight: 600;
+  color: #abb2bf;
+}
+
+.cell-inspector-close {
+  background: none;
+  border: none;
+  color: #7d8493;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.cell-inspector-close:hover {
+  color: #e06c75;
+}
+
+.cell-inspector-body {
+  flex: 1;
+  overflow: auto;
+  min-height: 120px;
+  max-height: 50vh;
+}
+
+.cell-inspector-body .cm-editor {
+  height: 100%;
+}
+
+.cell-inspector-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid #181a1f;
+}
+
+.cell-inspector-footer button {
+  background: #528bff;
+  color: #fff;
+  border: none;
+  border-radius: 3px;
+  padding: 4px 12px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.cell-inspector-footer button:hover {
+  background: #6c9bff;
+}
+
+.cell-inspector-secondary {
+  background: #3a3f4b !important;
+}
+
+.cell-inspector-secondary:hover {
+  background: #464c5a !important;
+}
+
+.cell-inspector-status, .cell-inspector-note {
+  color: #7d8493;
+  font-size: 12px;
 }

@@ -1,6 +1,7 @@
 import { EditorView, basicSetup } from 'codemirror';
 import { keymap } from '@codemirror/view';
 import { sql } from '@codemirror/lang-sql';
+import { json } from '@codemirror/lang-json';
 import { oneDark } from '@codemirror/theme-one-dark';
 
 interface VsCodeApi {
@@ -9,6 +10,7 @@ interface VsCodeApi {
 declare function acquireVsCodeApi(): VsCodeApi;
 
 type TableStatus = 'unchanged' | 'changed' | 'new';
+type StatsKind = 'numeric' | 'datetime' | 'other';
 
 type ExtensionMessage =
   | { command: 'tables'; tables: string[] }
@@ -16,14 +18,47 @@ type ExtensionMessage =
       command: 'queryResult';
       columns: string[];
       rows: unknown[][];
+      columnStatsKind: StatsKind[];
       cellChanged?: boolean[][];
       rowIsNew?: boolean[];
       renamedColumns?: Record<string, string>;
+      editable: boolean;
+      editableTable?: string;
     }
   | { command: 'error'; message: string }
   | { command: 'backupStatus'; message: string }
   | { command: 'tableChangeStatus'; status: Record<string, TableStatus> }
-  | { command: 'safeModeState'; safeMode: boolean };
+  | { command: 'safeModeState'; safeMode: boolean }
+  | {
+      command: 'columnStatsResult';
+      column: string;
+      statsKind: StatsKind;
+      totalRows: number;
+      nonNullRows: number;
+      nullCount: number;
+      distinctCount?: number;
+      topValues?: { value: unknown; frequency: number }[];
+      min?: unknown;
+      max?: unknown;
+      mean?: unknown;
+      p25?: unknown;
+      median?: unknown;
+      p75?: unknown;
+    }
+  | { command: 'columnStatsError'; column: string; message: string }
+  | { command: 'cellUpdated'; column: string; newValue: unknown; rowValues: Record<string, unknown>; rowsMatched: number }
+  | { command: 'cellUpdateError'; column: string; message: string };
+
+interface LastResult {
+  columns: string[];
+  rows: unknown[][];
+  columnStatsKind: StatsKind[];
+  cellChanged?: boolean[][];
+  rowIsNew?: boolean[];
+  renamedColumns?: Record<string, string>;
+  editable: boolean;
+  editableTable?: string;
+}
 
 const vscode = acquireVsCodeApi();
 
@@ -68,6 +103,17 @@ const checkChangesCheck = document.getElementById('check-changes-check') as HTML
 const unlockOptionsEl = document.getElementById('unlock-options') as HTMLSpanElement;
 
 let running = false;
+let lastResult: LastResult | undefined;
+let sortState: { columnIndex: number; direction: 'asc' | 'desc' } | undefined;
+
+function setRunning(value: boolean): void {
+  running = value;
+  runBtn.disabled = value;
+  // Disables sort/stats/cell-edit affordances too (via pointer-events),
+  // rather than letting a click sent mid-query silently no-op on the host
+  // side and leave e.g. a stats popover stuck on "Loading…" forever.
+  resultsEl.classList.toggle('busy', value);
+}
 
 // One Dark's default selection color is a muted gray-blue; override with a
 // more classic, clearly-blue selection highlight. Applied after oneDark in
@@ -104,8 +150,7 @@ function runQuery(sqlText: string): void {
   if (running) return;
   const trimmed = sqlText.trim();
   if (!trimmed) return;
-  running = true;
-  runBtn.disabled = true;
+  setRunning(true);
   statusEl.textContent = 'Running…';
   vscode.postMessage({ command: 'runQuery', sql: trimmed });
 }
@@ -158,14 +203,301 @@ function applyTableChangeStatus(status: Record<string, TableStatus>): void {
   });
 }
 
-function renderResults(
-  columns: string[],
-  rows: unknown[][],
-  cellChanged?: boolean[][],
-  rowIsNew?: boolean[],
-  renamedColumns?: Record<string, string>
-): void {
+/** Value-to-string used for the sort fallback and JSON-detection — distinct
+ *  from formatValue (display) since it needs to be collision-resistant for
+ *  ordering (JSON.stringify for objects, not the raw "[object Object]"
+ *  String() would produce). */
+function sortableString(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
+
+/** Permutation of original row indices — never physically reorders
+ *  rows/cellChanged/rowIsNew, so every array stays indexed by the same
+ *  original row index and diff-highlighting alignment is structural, not
+ *  something that has to be hand-maintained across a sort. */
+function computeDisplayOrder(): number[] {
+  const n = lastResult!.rows.length;
+  const order = Array.from({ length: n }, (_, i) => i);
+  if (!sortState) return order;
+  const { columnIndex, direction } = sortState;
+  const rows = lastResult!.rows;
+  order.sort((a, b) => {
+    const va = rows[a][columnIndex];
+    const vb = rows[b][columnIndex];
+    const aNull = va === null || va === undefined;
+    const bNull = vb === null || vb === undefined;
+    if (aNull && bNull) return 0;
+    if (aNull) return 1; // nulls always last, regardless of direction
+    if (bNull) return -1;
+    let cmp: number;
+    if (typeof va === 'bigint' && typeof vb === 'bigint') {
+      cmp = va < vb ? -1 : va > vb ? 1 : 0;
+    } else if (typeof va === 'number' && typeof vb === 'number') {
+      cmp = Number.isNaN(va) && Number.isNaN(vb) ? 0 : Number.isNaN(va) ? 1 : Number.isNaN(vb) ? -1 : va - vb;
+    } else {
+      const sa = sortableString(va);
+      const sb = sortableString(vb);
+      cmp = sa < sb ? -1 : sa > sb ? 1 : 0;
+    }
+    return direction === 'asc' ? cmp : -cmp;
+  });
+  return order;
+}
+
+function formatStatValue(value: unknown): string {
+  if (value === null || value === undefined) return 'NULL';
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
+
+function renderStatsPopoverContent(container: HTMLElement, message: Extract<ExtensionMessage, { command: 'columnStatsResult' }>): void {
+  container.innerHTML = '';
+  const title = document.createElement('div');
+  title.className = 'stats-title';
+  title.textContent = message.column;
+  container.appendChild(title);
+
+  if (message.totalRows === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'stats-empty';
+    empty.textContent = 'No data.';
+    container.appendChild(empty);
+    return;
+  }
+  if (message.nonNullRows === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'stats-empty';
+    empty.textContent = `All ${message.totalRows} value${message.totalRows === 1 ? '' : 's'} are NULL.`;
+    container.appendChild(empty);
+    return;
+  }
+
+  const summary = document.createElement('div');
+  summary.className = 'stats-summary';
+  summary.textContent = `${message.nonNullRows} of ${message.totalRows} rows non-null (${message.nullCount} null)`;
+  container.appendChild(summary);
+
+  if (message.statsKind === 'other') {
+    const distinct = document.createElement('div');
+    distinct.className = 'stats-summary';
+    distinct.textContent = `${message.distinctCount ?? 0} distinct value${message.distinctCount === 1 ? '' : 's'}`;
+    container.appendChild(distinct);
+
+    const list = document.createElement('div');
+    list.className = 'stats-top-values';
+    for (const { value, frequency } of message.topValues ?? []) {
+      const row = document.createElement('div');
+      row.className = 'stats-top-value-row';
+      const val = document.createElement('span');
+      val.className = 'stats-top-value';
+      val.textContent = formatStatValue(value);
+      const freq = document.createElement('span');
+      freq.className = 'stats-top-freq';
+      freq.textContent = String(frequency);
+      row.appendChild(val);
+      row.appendChild(freq);
+      list.appendChild(row);
+    }
+    container.appendChild(list);
+  } else {
+    const rows: [string, unknown][] = [
+      ['min', message.min],
+      ['max', message.max],
+      ['mean', message.mean],
+      ['p25 (approx.)', message.p25],
+      ['median (approx.)', message.median],
+      ['p75 (approx.)', message.p75],
+    ];
+    const table = document.createElement('div');
+    table.className = 'stats-descriptive';
+    for (const [label, value] of rows) {
+      const row = document.createElement('div');
+      row.className = 'stats-descriptive-row';
+      const l = document.createElement('span');
+      l.className = 'stats-descriptive-label';
+      l.textContent = label;
+      const v = document.createElement('span');
+      v.className = 'stats-descriptive-value';
+      v.textContent = formatStatValue(value);
+      row.appendChild(l);
+      row.appendChild(v);
+      table.appendChild(row);
+    }
+    container.appendChild(table);
+  }
+}
+
+let statsPopoverEl: HTMLDivElement | null = null;
+let pendingStatsColumn: string | null = null;
+
+function closeStatsPopover(): void {
+  statsPopoverEl?.remove();
+  statsPopoverEl = null;
+  pendingStatsColumn = null;
+}
+
+function openStatsPopover(anchor: HTMLElement, column: string, statsKind: StatsKind): void {
+  if (running) return;
+  closeStatsPopover();
+  closeCellInspector();
+
+  const popover = document.createElement('div');
+  popover.className = 'stats-popover';
+  const rect = anchor.getBoundingClientRect();
+  popover.style.top = `${rect.bottom + 4}px`;
+  popover.style.left = `${rect.left}px`;
+  popover.innerHTML = '<div class="stats-loading">Loading…</div>';
+  document.body.appendChild(popover);
+  statsPopoverEl = popover;
+  pendingStatsColumn = column;
+
+  const closeOnOutsideClick = (e: MouseEvent) => {
+    if (statsPopoverEl && !statsPopoverEl.contains(e.target as Node)) {
+      closeStatsPopover();
+      document.removeEventListener('click', closeOnOutsideClick, true);
+    }
+  };
+  setTimeout(() => document.addEventListener('click', closeOnOutsideClick, true), 0);
+
+  vscode.postMessage({ command: 'columnStats', column, statsKind, limit: 20 });
+}
+
+let inspectorCleanup: (() => void) | null = null;
+let pendingCellEdit: { rowIdx: number; colIdx: number; column: string; statusEl: HTMLSpanElement } | null = null;
+
+function closeCellInspector(): void {
+  inspectorCleanup?.();
+  inspectorCleanup = null;
+  pendingCellEdit = null;
+}
+
+function openCellInspector(rowIdx: number, colIdx: number): void {
+  if (!lastResult || running) return;
+  closeStatsPopover();
+  closeCellInspector();
+
+  const column = lastResult.columns[colIdx];
+  const value = lastResult.rows[rowIdx][colIdx];
+  const canEdit = lastResult.editable && !safeModeCheck.checked;
+
+  const isObjectValue = typeof value === 'object' && value !== null;
+  let jsonParsed: unknown;
+  let looksLikeJson = false;
+  if (!isObjectValue && typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        jsonParsed = JSON.parse(trimmed);
+        looksLikeJson = true;
+      } catch {
+        // Not actually JSON — fall through to plain text display.
+      }
+    }
+  }
+  const isNullValue = value === null || value === undefined;
+  const displayText = isNullValue
+    ? ''
+    : isObjectValue
+      ? JSON.stringify(value, null, 2)
+      : looksLikeJson
+        ? JSON.stringify(jsonParsed, null, 2)
+        : String(value);
+  const useJsonLang = isObjectValue || looksLikeJson;
+
+  const backdrop = document.createElement('div');
+  backdrop.className = 'cell-inspector-backdrop';
+  const panel = document.createElement('div');
+  panel.className = 'cell-inspector-panel';
+
+  const header = document.createElement('div');
+  header.className = 'cell-inspector-header';
+  const title = document.createElement('span');
+  title.textContent = column;
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'cell-inspector-close';
+  closeBtn.textContent = '×';
+  closeBtn.title = 'Close';
+  closeBtn.addEventListener('click', closeCellInspector);
+  header.appendChild(title);
+  header.appendChild(closeBtn);
+  panel.appendChild(header);
+
+  const body = document.createElement('div');
+  body.className = 'cell-inspector-body';
+  panel.appendChild(body);
+
+  const editorExtensions = [basicSetup, oneDark, EditorView.lineWrapping];
+  if (useJsonLang) editorExtensions.push(json());
+  if (!canEdit) editorExtensions.push(EditorView.editable.of(false));
+
+  const inspectorEditor = new EditorView({
+    doc: displayText,
+    extensions: editorExtensions,
+    parent: body,
+  });
+
+  const footer = document.createElement('div');
+  footer.className = 'cell-inspector-footer';
+
+  if (canEdit) {
+    const nullBtn = document.createElement('button');
+    nullBtn.className = 'cell-inspector-secondary';
+    nullBtn.textContent = 'Set NULL';
+    nullBtn.addEventListener('click', () => {
+      inspectorEditor.dispatch({ changes: { from: 0, to: inspectorEditor.state.doc.length, insert: '' } });
+    });
+
+    const saveBtn = document.createElement('button');
+    saveBtn.textContent = 'Save';
+    const statusSpan = document.createElement('span');
+    statusSpan.className = 'cell-inspector-status';
+
+    saveBtn.addEventListener('click', () => {
+      if (running || !lastResult) return;
+      const text = inspectorEditor.state.doc.toString();
+      // Empty input means NULL, not the literal empty string — matches how
+      // NULL is already shown as literal text "NULL" elsewhere in the grid.
+      const newValue = text === '' ? null : text;
+      const rowValues: Record<string, unknown> = {};
+      lastResult.columns.forEach((c, j) => {
+        rowValues[c] = lastResult!.rows[rowIdx][j];
+      });
+      pendingCellEdit = { rowIdx, colIdx, column, statusEl: statusSpan };
+      statusSpan.textContent = 'Saving…';
+      vscode.postMessage({ command: 'updateCell', column, newValue, rowValues });
+    });
+
+    footer.appendChild(nullBtn);
+    footer.appendChild(saveBtn);
+    footer.appendChild(statusSpan);
+  } else {
+    const note = document.createElement('span');
+    note.className = 'cell-inspector-note';
+    note.textContent = !lastResult.editable
+      ? "View only — this result isn't a plain single-table SELECT, so it can't be edited."
+      : 'View only — uncheck Safe Mode to edit.';
+    footer.appendChild(note);
+  }
+  panel.appendChild(footer);
+
+  backdrop.appendChild(panel);
+  backdrop.addEventListener('mousedown', (e) => {
+    if (e.target === backdrop) closeCellInspector();
+  });
+  document.body.appendChild(backdrop);
+
+  inspectorCleanup = () => {
+    inspectorEditor.destroy();
+    backdrop.remove();
+  };
+}
+
+function renderResults(): void {
   resultsEl.innerHTML = '';
+  if (!lastResult) return;
+  const { columns, rows, cellChanged, rowIsNew, renamedColumns, columnStatsKind } = lastResult;
 
   if (columns.length === 0) {
     resultsEl.innerHTML = '<div class="empty">Query returned no columns.</div>';
@@ -176,24 +508,68 @@ function renderResults(
 
   const thead = document.createElement('thead');
   const headRow = document.createElement('tr');
-  for (const col of columns) {
+  columns.forEach((col, colIdx) => {
     const th = document.createElement('th');
-    th.textContent = col;
+    const label = document.createElement('span');
+    label.className = 'th-label';
+    label.textContent = col;
     const renamedFrom = renamedColumns?.[col];
     if (renamedFrom) {
       th.title = `renamed from "${renamedFrom}"`;
       th.classList.add('col-renamed');
     }
+    th.appendChild(label);
+
+    const controls = document.createElement('span');
+    controls.className = 'th-controls';
+
+    const ascBtn = document.createElement('button');
+    ascBtn.className = 'th-sort-btn';
+    ascBtn.textContent = '▲';
+    ascBtn.title = 'Sort ascending';
+    ascBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (running) return;
+      sortState = { columnIndex: colIdx, direction: 'asc' };
+      renderResults();
+    });
+
+    const descBtn = document.createElement('button');
+    descBtn.className = 'th-sort-btn';
+    descBtn.textContent = '▼';
+    descBtn.title = 'Sort descending';
+    descBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (running) return;
+      sortState = { columnIndex: colIdx, direction: 'desc' };
+      renderResults();
+    });
+
+    const statsBtn = document.createElement('button');
+    statsBtn.className = 'th-stats-btn';
+    statsBtn.textContent = columnStatsKind[colIdx] === 'other' ? '≡' : '∑';
+    statsBtn.title = columnStatsKind[colIdx] === 'other' ? 'Top values' : 'Descriptive stats';
+    statsBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openStatsPopover(statsBtn, col, columnStatsKind[colIdx]);
+    });
+
+    controls.appendChild(ascBtn);
+    controls.appendChild(descBtn);
+    controls.appendChild(statsBtn);
+    th.appendChild(controls);
     headRow.appendChild(th);
-  }
+  });
   thead.appendChild(headRow);
   table.appendChild(thead);
 
   const tbody = document.createElement('tbody');
   const rowsFragment = document.createDocumentFragment();
-  rows.forEach((row, i) => {
+  const order = computeDisplayOrder();
+  order.forEach((i, displayIdx) => {
+    const row = rows[i];
     const tr = document.createElement('tr');
-    tr.className = i % 2 === 0 ? 'even' : 'odd';
+    tr.className = displayIdx % 2 === 0 ? 'even' : 'odd';
     const isNewRow = rowIsNew?.[i] === true;
     if (isNewRow) tr.classList.add('row-new');
     row.forEach((value, j) => {
@@ -202,6 +578,7 @@ function renderResults(
       if (!isNewRow && cellChanged?.[i]?.[j]) {
         td.classList.add('cell-changed');
       }
+      td.addEventListener('dblclick', () => openCellInspector(i, j));
       tr.appendChild(td);
     });
     rowsFragment.appendChild(tr);
@@ -224,6 +601,7 @@ function formatValue(value: unknown): string {
 
 function showError(message: string): void {
   resultsEl.innerHTML = '';
+  lastResult = undefined;
   const el = document.createElement('div');
   el.className = 'error';
   el.textContent = message;
@@ -237,14 +615,23 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
       renderTables(message.tables);
       break;
     case 'queryResult':
-      running = false;
-      runBtn.disabled = false;
+      setRunning(false);
       statusEl.textContent = '';
-      renderResults(message.columns, message.rows, message.cellChanged, message.rowIsNew, message.renamedColumns);
+      lastResult = {
+        columns: message.columns,
+        rows: message.rows,
+        columnStatsKind: message.columnStatsKind,
+        cellChanged: message.cellChanged,
+        rowIsNew: message.rowIsNew,
+        renamedColumns: message.renamedColumns,
+        editable: message.editable,
+        editableTable: message.editableTable,
+      };
+      sortState = undefined;
+      renderResults();
       break;
     case 'error':
-      running = false;
-      runBtn.disabled = false;
+      setRunning(false);
       statusEl.textContent = '';
       showError(message.message);
       break;
@@ -257,6 +644,50 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
     case 'safeModeState':
       safeModeCheck.checked = message.safeMode;
       unlockOptionsEl.hidden = message.safeMode;
+      break;
+    case 'columnStatsResult':
+      if (statsPopoverEl && pendingStatsColumn === message.column) {
+        renderStatsPopoverContent(statsPopoverEl, message);
+      }
+      break;
+    case 'columnStatsError':
+      if (statsPopoverEl && pendingStatsColumn === message.column) {
+        statsPopoverEl.innerHTML = '';
+        const el = document.createElement('div');
+        el.className = 'stats-empty';
+        el.textContent = message.message;
+        statsPopoverEl.appendChild(el);
+      }
+      break;
+    case 'cellUpdated':
+      if (lastResult) {
+        // Re-match by full-row equality (same principle used server-side),
+        // robust to any client-side sort that happened between send and
+        // receive — display order never matches the underlying row index.
+        const colIdx = lastResult.columns.indexOf(message.column);
+        const rowIdx = lastResult.rows.findIndex((row) =>
+          lastResult!.columns.every((c, j) => {
+            const expected = message.rowValues[c];
+            return c === message.column ? true : row[j] === expected || (row[j] == null && expected == null);
+          })
+        );
+        if (colIdx !== -1 && rowIdx !== -1) {
+          lastResult.rows[rowIdx][colIdx] = message.newValue;
+          if (lastResult.cellChanged) {
+            if (!lastResult.cellChanged[rowIdx]) {
+              lastResult.cellChanged[rowIdx] = lastResult.columns.map(() => false);
+            }
+            lastResult.cellChanged[rowIdx][colIdx] = true;
+          }
+        }
+      }
+      closeCellInspector();
+      renderResults();
+      break;
+    case 'cellUpdateError':
+      if (pendingCellEdit && pendingCellEdit.column === message.column) {
+        pendingCellEdit.statusEl.textContent = message.message;
+      }
       break;
   }
 });

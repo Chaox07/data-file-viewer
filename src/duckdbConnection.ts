@@ -1,10 +1,13 @@
-import { DuckDBConnection, DuckDBInstance } from '@duckdb/node-api';
+import { DuckDBConnection, DuckDBInstance, DuckDBTypeId, DuckDBValue, StatementType } from '@duckdb/node-api';
 import { basename, dirname, extname, join } from 'node:path';
 import { copyFile } from 'node:fs/promises';
+
+export type StatsKind = 'numeric' | 'datetime' | 'other';
 
 export interface QueryResult {
   columns: string[];
   rows: unknown[][];
+  columnStatsKind: StatsKind[];
 }
 
 export interface QueryDiff {
@@ -13,7 +16,33 @@ export interface QueryDiff {
   renamedColumns: Record<string, string>;
 }
 
-export type FileKind = 'duckdb' | 'parquet' | 'sqlite';
+export interface EditabilityInfo {
+  editable: boolean;
+  table?: string;
+  columns?: string[];
+}
+
+export interface TopValuesStats {
+  totalRows: number;
+  nonNullRows: number;
+  nullCount: number;
+  distinctCount: number;
+  topValues: { value: unknown; frequency: number }[];
+}
+
+export interface DescriptiveStats {
+  totalRows: number;
+  nonNullRows: number;
+  nullCount: number;
+  min: unknown;
+  max: unknown;
+  mean: unknown;
+  p25: unknown;
+  median: unknown;
+  p75: unknown;
+}
+
+export type FileKind = 'duckdb' | 'parquet' | 'sqlite' | 'csv';
 
 function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
@@ -74,9 +103,61 @@ function isLockConflict(err: unknown): boolean {
   return /lock/i.test(message);
 }
 
+function stripTrailingSemicolon(sql: string): string {
+  return sql.trim().replace(/;\s*$/, '');
+}
+
+function classifyForStats(typeId: DuckDBTypeId): StatsKind {
+  switch (typeId) {
+    case DuckDBTypeId.TINYINT:
+    case DuckDBTypeId.SMALLINT:
+    case DuckDBTypeId.INTEGER:
+    case DuckDBTypeId.BIGINT:
+    case DuckDBTypeId.HUGEINT:
+    case DuckDBTypeId.UHUGEINT:
+    case DuckDBTypeId.UTINYINT:
+    case DuckDBTypeId.USMALLINT:
+    case DuckDBTypeId.UINTEGER:
+    case DuckDBTypeId.UBIGINT:
+    case DuckDBTypeId.FLOAT:
+    case DuckDBTypeId.DOUBLE:
+    case DuckDBTypeId.DECIMAL:
+      return 'numeric';
+    case DuckDBTypeId.DATE:
+    case DuckDBTypeId.TIME:
+    case DuckDBTypeId.TIME_TZ:
+    case DuckDBTypeId.TIMESTAMP:
+    case DuckDBTypeId.TIMESTAMP_S:
+    case DuckDBTypeId.TIMESTAMP_MS:
+    case DuckDBTypeId.TIMESTAMP_NS:
+    case DuckDBTypeId.TIMESTAMP_TZ:
+    case DuckDBTypeId.INTERVAL:
+      return 'datetime';
+    default:
+      return 'other';
+  }
+}
+
+// Structural gate for "is this SELECT * FROM <one table> [WHERE][ORDER BY]
+// [LIMIT]". Intentionally conservative: a false negative just disables the
+// edit affordance for that query, never misclassifies something dangerous
+// as safe. The real security boundary is the extractStatements()/
+// statementType check in checkEditableSelect, run before this regex.
+const EDITABLE_SELECT_RE = new RegExp(
+  '^select\\s+\\*\\s+from\\s+' +
+    '("(?:[^"]|"")+"|[a-zA-Z_][a-zA-Z0-9_]*)' +
+    '(?:\\s+where\\s+[\\s\\S]+?)?' +
+    '(?:\\s+order\\s+by\\s+[\\s\\S]+?)?' +
+    '(?:\\s+limit\\s+\\d+(?:\\s+offset\\s+\\d+)?)?' +
+    '\\s*;?\\s*$',
+  'i'
+);
+const FORBIDDEN_KEYWORDS_RE = /\b(join|group\s+by|distinct|union|intersect|except|using|window)\b/i;
+
 export class DuckDbFile {
   private lastBackupPath: string | undefined;
   private backupAttached = false;
+  private materialized = false;
 
   private constructor(
     private readonly connection: DuckDBConnection,
@@ -91,11 +172,16 @@ export class DuckDbFile {
     return this.readOnly;
   }
 
+  private isFlatFileKind(): boolean {
+    return this.kind === 'parquet' || this.kind === 'csv';
+  }
+
   static async open(path: string): Promise<DuckDbFile> {
     const isParquet = path.toLowerCase().endsWith('.parquet');
+    const isCsv = path.toLowerCase().endsWith('.csv');
     const isSqlite = path.toLowerCase().endsWith('.db') || path.toLowerCase().endsWith('.sqlite');
-    const useMemory = isParquet || isSqlite;
-    const kind: FileKind = isParquet ? 'parquet' : isSqlite ? 'sqlite' : 'duckdb';
+    const useMemory = isParquet || isCsv || isSqlite;
+    const kind: FileKind = isParquet ? 'parquet' : isCsv ? 'csv' : isSqlite ? 'sqlite' : 'duckdb';
 
     let instance: DuckDBInstance;
     let readOnly = false;
@@ -137,6 +223,13 @@ export class DuckDbFile {
       // has no concept of multiple tables, just the one dataset.
       const filePath = path.replace(/'/g, "''");
       await connection.run(`create view "${mainObjectName}" as select * from read_parquet('${filePath}')`);
+    }
+
+    if (isCsv) {
+      // Same single-view treatment as Parquet — auto-detects delimiter,
+      // header presence, and column types.
+      const filePath = path.replace(/'/g, "''");
+      await connection.run(`create view "${mainObjectName}" as select * from read_csv_auto('${filePath}')`);
     }
 
     if (isSqlite) {
@@ -186,7 +279,8 @@ export class DuckDbFile {
     const reader = await this.connection.streamAndReadAll(sql);
     const columns = reader.columnNames();
     const rows = reader.getRowsJson() as unknown[][];
-    return { columns, rows };
+    const columnStatsKind = reader.columnTypes().map((t) => classifyForStats(t.typeId));
+    return { columns, rows, columnStatsKind };
   }
 
   /** Flushes pending writes to disk, then copies the file. Returns the backup path. */
@@ -196,7 +290,11 @@ export class DuckDbFile {
     } else if (this.kind === 'duckdb') {
       await this.connection.run('checkpoint');
     }
-    // .parquet is never written to, nothing to flush.
+    // .parquet/.csv have nothing to checkpoint: edits to those go through
+    // materializeIfNeeded()/updateCell() below, which write back to disk
+    // synchronously via writeBackFlatFile() on every edit — by the time
+    // createBackup() runs, the file is already current, unlike duckdb/
+    // sqlite's WAL-based writes which need an explicit flush.
 
     const ext = extname(this.path);
     const base = basename(this.path, ext);
@@ -227,12 +325,17 @@ export class DuckDbFile {
         `attach ${quoteLiteral(this.lastBackupPath)} as backup_cmp (type sqlite, read_only)`
       );
     } else {
-      // Parquet: mirror the same view name inside a fresh in-memory catalog,
-      // so unqualified SQL resolves against it once USEd, same as the others.
+      // Parquet/CSV: mirror the same view name inside a fresh in-memory
+      // catalog, so unqualified SQL resolves against it once USEd, same as
+      // the others. (If this document's own file was already materialized
+      // into a table via an edit, the backup itself is still the original
+      // pre-edit flat file on disk — read back with the same read_* function
+      // used to open it in the first place, regardless of materialization.)
+      const readFn = this.kind === 'parquet' ? 'read_parquet' : 'read_csv_auto';
       await this.connection.run(`attach ':memory:' as backup_cmp`);
       await this.connection.run('use backup_cmp');
       await this.connection.run(
-        `create view ${quoteIdent(this.mainObjectName)} as select * from read_parquet(${quoteLiteral(
+        `create view ${quoteIdent(this.mainObjectName)} as select * from ${readFn}(${quoteLiteral(
           this.lastBackupPath
         )})`
       );
@@ -367,6 +470,188 @@ export class DuckDbFile {
     );
 
     return { cellChanged, rowIsNew, renamedColumns };
+  }
+
+  /**
+   * Server-side gate for cell editing: only a plain `SELECT * FROM
+   * "<one table>"` (optionally with WHERE/ORDER BY/LIMIT) is editable — no
+   * joins, computed columns, or aggregates, since editing needs to target a
+   * real, unambiguous row in a real table. Never trust the webview's own
+   * opinion of whether a result is editable; this is always re-derived here.
+   */
+  async checkEditableSelect(sql: string): Promise<EditabilityInfo> {
+    if (this.readOnly) return { editable: false };
+    const trimmed = sql.trim();
+
+    try {
+      const extracted = await this.connection.extractStatements(trimmed);
+      if (extracted.count !== 1) return { editable: false };
+      const prepared = await extracted.prepare(0);
+      if (prepared.statementType !== StatementType.SELECT) return { editable: false };
+    } catch {
+      return { editable: false };
+    }
+
+    const match = EDITABLE_SELECT_RE.exec(trimmed);
+    if (!match || FORBIDDEN_KEYWORDS_RE.test(trimmed)) return { editable: false };
+
+    const rawTable = match[1];
+    const tableName = rawTable.startsWith('"') ? rawTable.slice(1, -1).replace(/""/g, '"') : rawTable;
+
+    const tables = await this.listTables();
+    const found =
+      tables.find((t) => t === tableName) ?? tables.find((t) => t.toLowerCase() === tableName.toLowerCase());
+    if (!found) return { editable: false };
+
+    // Column list for the UPDATE is re-derived from the live table, not
+    // parsed out of the SELECT text.
+    const colsReader = await this.connection.runAndReadAll(
+      `select column_name from information_schema.columns where table_catalog = current_database() and table_name = ${quoteLiteral(
+        found
+      )} order by ordinal_position`
+    );
+    const columns = colsReader.getRows().map((r) => String(r[0]));
+    return { editable: true, table: found, columns };
+  }
+
+  /**
+   * CSV/Parquet load as lazy VIEWs (see open()) — views over external files
+   * aren't updatable, so the first actual edit attempt materializes into a
+   * real TABLE under the same name. Deferred until here (not done at open
+   * time) so files that are only ever browsed, never edited, keep today's
+   * fast lazy-scan behavior. Wrapped in a transaction so an interruption
+   * mid-sequence can't leave an orphaned temp table or a missing object.
+   */
+  private async materializeIfNeeded(): Promise<void> {
+    if (this.materialized || !this.isFlatFileKind()) return;
+    const tmpName = `${this.mainObjectName}__dfv_materialize`;
+    await this.connection.run('begin transaction');
+    try {
+      await this.connection.run(
+        `create table ${quoteIdent(tmpName)} as select * from ${quoteIdent(this.mainObjectName)}`
+      );
+      await this.connection.run(`drop view ${quoteIdent(this.mainObjectName)}`);
+      await this.connection.run(`alter table ${quoteIdent(tmpName)} rename to ${quoteIdent(this.mainObjectName)}`);
+      await this.connection.run('commit');
+    } catch (err) {
+      await this.connection.run('rollback');
+      throw err;
+    }
+    this.materialized = true;
+  }
+
+  /**
+   * Edits target a row via full-row equality on every column's pre-edit
+   * value (null-safe via IS NOT DISTINCT FROM) — DuckDB has no stable rowid
+   * across plain tables, attached SQLite tables, and materialized flat-file
+   * tables alike, so there's no cheaper universal row identity available.
+   * Accepted limitation: rows that are identical across every column all
+   * update together (same risk-tolerance precedent as the positional-row-
+   * diff limitation in diffQueryAgainstBackup above). Returns the number of
+   * rows actually matched/updated, so the caller can distinguish "no
+   * matching row" (0) from a successful edit.
+   */
+  async updateCell(
+    table: string,
+    column: string,
+    newValue: unknown,
+    rowValues: Record<string, unknown>
+  ): Promise<number> {
+    await this.materializeIfNeeded();
+
+    const whereCols = Object.keys(rowValues);
+    const whereClause = whereCols.map((c, i) => `${quoteIdent(c)} is not distinct from $${i + 2}`).join(' and ');
+    const sql = `update ${quoteIdent(table)} set ${quoteIdent(column)} = $1${
+      whereClause ? ` where ${whereClause}` : ''
+    }`;
+    // Values arrive as plain JSON (from getRowsJson()/postMessage), which
+    // covers every type this feature actually supports editing/matching on
+    // (scalars: string/number/boolean/null/bigint) — DuckDBValue's wrapper
+    // classes for nested types are a non-goal here (BLOB/STRUCT/LIST/MAP are
+    // excluded from the edit affordance entirely; if one still shows up in a
+    // WHERE match for an untouched column, worst case is 0 rows matched,
+    // which is already handled as a safe, surfaced error).
+    const values = [newValue, ...whereCols.map((c) => rowValues[c])] as DuckDBValue[];
+
+    const result = await this.connection.run(sql, values);
+    const rowsChanged = result.rowsChanged;
+
+    if (rowsChanged > 0 && this.isFlatFileKind()) {
+      await this.writeBackFlatFile();
+    }
+    return rowsChanged;
+  }
+
+  /**
+   * Rewrites the ENTIRE source file from the current (materialized) table
+   * contents — CSV/Parquet have no row-level update mechanism of their own,
+   * so this is the only way an edit becomes visible outside the extension.
+   * Known side effect, not a bug: this reformats every row per DuckDB's
+   * writer conventions, not just the edited one, so an untouched row can
+   * show as "changed" in a post-edit compareToBackup() purely from
+   * formatting normalization (e.g. numeric precision, quoting).
+   */
+  private async writeBackFlatFile(): Promise<void> {
+    const filePath = this.path.replace(/'/g, "''");
+    const table = quoteIdent(this.mainObjectName);
+    if (this.kind === 'csv') {
+      await this.connection.run(`copy ${table} to '${filePath}' (format csv, header true)`);
+    } else if (this.kind === 'parquet') {
+      await this.connection.run(`copy ${table} to '${filePath}' (format parquet)`);
+    }
+  }
+
+  /** On-demand top-N most frequent values for a string/"other"-kind column. */
+  async getColumnTopValues(baseSql: string, column: string, limit = 20): Promise<TopValuesStats> {
+    const wrapped = `(${stripTrailingSemicolon(baseSql)})`;
+    const col = quoteIdent(column);
+
+    const summaryReader = await this.connection.runAndReadAll(
+      `select count(*) as total_rows, count(${col}) as non_null_rows, count(*) - count(${col}) as null_count, count(distinct ${col}) as distinct_count from ${wrapped} as _stats_source`
+    );
+    const summaryRow = summaryReader.getRowsJson()[0] as unknown[];
+    const [totalRows, nonNullRows, nullCount, distinctCount] = summaryRow.map(Number);
+
+    const topReader = await this.connection.runAndReadAll(
+      `select ${col} as value, count(*) as frequency from ${wrapped} as _stats_source where ${col} is not null group by ${col} order by frequency desc, value limit ${limit}`
+    );
+    const topValues = topReader.getRowsJson().map((row) => {
+      const [value, frequency] = row as unknown[];
+      return { value, frequency: Number(frequency) };
+    });
+
+    return { totalRows, nonNullRows, nullCount, distinctCount, topValues };
+  }
+
+  /** On-demand descriptive stats for a numeric/datetime-kind column. approx_quantile is approximate by design. */
+  async getColumnDescriptiveStats(
+    baseSql: string,
+    column: string,
+    statsKind: 'numeric' | 'datetime'
+  ): Promise<DescriptiveStats> {
+    const wrapped = `(${stripTrailingSemicolon(baseSql)})`;
+    const col = quoteIdent(column);
+    const meanExpr = statsKind === 'numeric' ? `avg(${col})` : `to_timestamp(avg(epoch(${col})))`;
+
+    const reader = await this.connection.runAndReadAll(
+      `select count(*) as total_rows, count(${col}) as non_null_rows, count(*) - count(${col}) as null_count,
+              min(${col}) as min_value, max(${col}) as max_value, ${meanExpr} as mean_value,
+              approx_quantile(${col}, 0.25) as p25, approx_quantile(${col}, 0.5) as median, approx_quantile(${col}, 0.75) as p75
+       from ${wrapped} as _stats_source`
+    );
+    const row = reader.getRowsJson()[0] as unknown[];
+    const [totalRows, nonNullRows, nullCount, min, max, mean, p25, median, p75] = row;
+    return {
+      totalRows: Number(totalRows),
+      nonNullRows: Number(nonNullRows),
+      nullCount: Number(nullCount),
+      min,
+      max,
+      mean,
+      p25,
+      median,
+      p75,
+    };
   }
 
   dispose(): void {
