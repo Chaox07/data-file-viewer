@@ -60,10 +60,10 @@
         "displayName": "Data File Viewer (kdb+)",
         "selector": [
           {
-            "filenamePattern": "**/*"
+            "filenamePattern": "**/*_kdb/*"
           }
         ],
-        "priority": "option"
+        "priority": "default"
       }
     ],
     "configuration": {
