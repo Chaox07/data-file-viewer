@@ -41,12 +41,19 @@
         "selector": [
           {
             "filenamePattern": "*.db"
-          },
+          }
+        ],
+        "priority": "option"
+      },
+      {
+        "viewType": "dataFileViewer.sqliteEditorDefault",
+        "displayName": "Data File Viewer (SQLite)",
+        "selector": [
           {
             "filenamePattern": "*.sqlite"
           }
         ],
-        "priority": "option"
+        "priority": "default"
       }
     ],
     "configuration": {

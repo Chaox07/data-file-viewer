@@ -149,19 +149,24 @@ class DuckDBDocument implements vscode.CustomDocument {
 
 export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider<DuckDBDocument> {
   public static readonly viewType = 'dataFileViewer.editor';
+  // .db is a genuinely ambiguous extension (plenty of non-SQLite formats use
+  // it), so it stays "option" priority in package.json -- opt-in per file
+  // rather than silently claiming every .db on the system. .sqlite has no
+  // such ambiguity, so it gets its own viewType registered at "default"
+  // priority instead, so it opens automatically like .duckdb/.parquet/.csv.
   public static readonly sqliteViewType = 'dataFileViewer.sqliteEditor';
+  public static readonly sqliteDefaultViewType = 'dataFileViewer.sqliteEditorDefault';
 
   static register(context: vscode.ExtensionContext): vscode.Disposable {
     const provider = new DuckDBEditorProvider(context);
+    const registerOptions = {
+      webviewOptions: { retainContextWhenHidden: true },
+      supportsMultipleEditorsPerDocument: false,
+    };
     return vscode.Disposable.from(
-      vscode.window.registerCustomEditorProvider(DuckDBEditorProvider.viewType, provider, {
-        webviewOptions: { retainContextWhenHidden: true },
-        supportsMultipleEditorsPerDocument: false,
-      }),
-      vscode.window.registerCustomEditorProvider(DuckDBEditorProvider.sqliteViewType, provider, {
-        webviewOptions: { retainContextWhenHidden: true },
-        supportsMultipleEditorsPerDocument: false,
-      })
+      vscode.window.registerCustomEditorProvider(DuckDBEditorProvider.viewType, provider, registerOptions),
+      vscode.window.registerCustomEditorProvider(DuckDBEditorProvider.sqliteViewType, provider, registerOptions),
+      vscode.window.registerCustomEditorProvider(DuckDBEditorProvider.sqliteDefaultViewType, provider, registerOptions)
     );
   }
 
