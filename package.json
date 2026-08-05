@@ -54,6 +54,16 @@
           }
         ],
         "priority": "default"
+      },
+      {
+        "viewType": "dataFileViewer.kdbEditor",
+        "displayName": "Data File Viewer (kdb+)",
+        "selector": [
+          {
+            "filenamePattern": "**/*"
+          }
+        ],
+        "priority": "option"
       }
     ],
     "configuration": {
@@ -66,6 +76,21 @@
           "description": "Above this many rows, automatic diff-against-backup highlighting is skipped after a query — use \"Diff anyway\" to run it on demand instead."
         }
       }
+    },
+    "commands": [
+      {
+        "command": "dataFileViewer.openKdbFile",
+        "title": "Open in Data File Viewer"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "dataFileViewer.openKdbFile",
+          "when": "resourceExtname == '' && resourcePath =~ /_kdb\\//",
+          "group": "navigation"
+        }
+      ]
     }
   },
   "scripts": {

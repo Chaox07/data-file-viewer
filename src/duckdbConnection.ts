@@ -1,6 +1,17 @@
-import { DuckDBConnection, DuckDBInstance, DuckDBTypeId, DuckDBValue, StatementType } from '@duckdb/node-api';
+import {
+  DuckDBAppender,
+  DuckDBConnection,
+  DuckDBDateValue,
+  DuckDBInstance,
+  DuckDBTimeValue,
+  DuckDBTimestampValue,
+  DuckDBTypeId,
+  DuckDBValue,
+  StatementType,
+} from '@duckdb/node-api';
 import { basename, dirname, extname, join } from 'node:path';
 import { chmod, copyFile, stat } from 'node:fs/promises';
+import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
 
 export type StatsKind = 'numeric' | 'datetime' | 'other';
 
@@ -41,7 +52,7 @@ export interface DescriptiveStats {
   p95: unknown;
 }
 
-export type FileKind = 'duckdb' | 'parquet' | 'sqlite' | 'csv';
+export type FileKind = 'duckdb' | 'parquet' | 'sqlite' | 'csv' | 'kdb';
 
 function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
@@ -130,6 +141,119 @@ function extractTrailingLimit(sql: string): { withoutLimit: string; limitClause:
   };
 }
 
+/** kdb+ vector type code -> DuckDB SQL column type, for the CREATE TABLE that backs a loaded kdb+ table. */
+function kdbTypeToSql(qType: number): string {
+  switch (qType) {
+    case 1: // boolean
+      return 'BOOLEAN';
+    case 4: // byte
+      return 'UTINYINT';
+    case 5: // short
+      return 'SMALLINT';
+    case 6: // int
+      return 'INTEGER';
+    case 7: // long
+      return 'BIGINT';
+    case 8: // real
+      return 'REAL';
+    case 9: // float
+      return 'DOUBLE';
+    case 12: // timestamp
+    case 15: // datetime
+      return 'TIMESTAMP';
+    case 13: // month (first-of-month date)
+    case 14: // date
+      return 'DATE';
+    case 16: // timespan (raw nanosecond duration)
+      return 'BIGINT';
+    case 17: // minute
+    case 18: // second
+    case 19: // time
+      return 'TIME';
+    default: // guid(2), char(10), symbol(11), general list(0), anything else
+      return 'VARCHAR';
+  }
+}
+
+/** Appends one already-decoded kdb+ cell value (see kdbParser.ts) to the appender's current row/column. */
+function appendKdbValue(appender: DuckDBAppender, qType: number, value: unknown): void {
+  if (value === null || value === undefined) {
+    appender.appendNull();
+    return;
+  }
+  switch (qType) {
+    case 1:
+      appender.appendBoolean(value as boolean);
+      return;
+    case 4:
+      appender.appendUTinyInt(value as number);
+      return;
+    case 5:
+      appender.appendSmallInt(value as number);
+      return;
+    case 6:
+      appender.appendInteger(value as number);
+      return;
+    case 7:
+      appender.appendBigInt(value as bigint);
+      return;
+    case 8:
+      appender.appendFloat(value as number);
+      return;
+    case 9:
+      appender.appendDouble(value as number);
+      return;
+    case 12:
+    case 15:
+      appender.appendTimestamp(new DuckDBTimestampValue(value as bigint));
+      return;
+    case 13:
+    case 14:
+      appender.appendDate(new DuckDBDateValue(value as number));
+      return;
+    case 16:
+      appender.appendBigInt(value as bigint);
+      return;
+    case 17:
+    case 18:
+    case 19:
+      appender.appendTime(new DuckDBTimeValue(value as bigint));
+      return;
+    default: // guid(2), char(10), symbol(11), general list(0), anything else
+      appender.appendVarchar(typeof value === 'string' ? value : JSON.stringify(value));
+      return;
+  }
+}
+
+/**
+ * Bulk-loads a parsed kdb+ table (see kdbParser.ts) into a fresh table on
+ * this connection via the Appender API. This is purely an in-memory query
+ * engine bridge for the viewer -- the on-disk kdb+ file itself is only ever
+ * read, never rewritten or converted.
+ */
+async function loadKdbTableIntoConnection(
+  connection: DuckDBConnection,
+  tableName: string,
+  columns: KdbColumn[]
+): Promise<void> {
+  const colDefs = columns.map((c) => `${quoteIdent(c.name)} ${kdbTypeToSql(c.qType)}`).join(', ');
+  await connection.run(`create table ${quoteIdent(tableName)} (${colDefs})`);
+
+  const appender = await connection.createAppender(tableName);
+  const rowCount = columns.length > 0 ? columns[0].values.length : 0;
+  try {
+    for (let r = 0; r < rowCount; r++) {
+      for (const col of columns) {
+        appendKdbValue(appender, col.qType, col.values[r]);
+      }
+      appender.endRow();
+    }
+    appender.flushSync();
+  } finally {
+    appender.closeSync();
+  }
+}
+
 function classifyForStats(typeId: DuckDBTypeId): StatsKind {
   switch (typeId) {
     case DuckDBTypeId.TINYINT:
@@ -199,7 +323,15 @@ export class DuckDbFile {
     return this.kind === 'parquet' || this.kind === 'csv';
   }
 
-  static async open(path: string): Promise<DuckDbFile> {
+  static async open(path: string, forceKind?: FileKind): Promise<DuckDbFile> {
+    // kdb+ files are extensionless (see kdbParser.ts) so they can't be
+    // sniffed by suffix like every other kind below -- the caller (the
+    // dedicated kdb+ explorer-context command, see duckdbEditorProvider.ts)
+    // knows this from which viewType it opened through and says so directly.
+    if (forceKind === 'kdb') {
+      return DuckDbFile.openKdb(path);
+    }
+
     const isParquet = path.toLowerCase().endsWith('.parquet');
     const isCsv = path.toLowerCase().endsWith('.csv');
     const isSqlite = path.toLowerCase().endsWith('.db') || path.toLowerCase().endsWith('.sqlite');
@@ -287,6 +419,27 @@ export class DuckDbFile {
     return new DuckDbFile(connection, path, kind, catalogName, mainObjectName, readOnly);
   }
 
+  /** Reads a real kdb+ table (see kdbParser.ts) and loads it into a fresh in-memory table. */
+  private static async openKdb(path: string): Promise<DuckDbFile> {
+    let table: KdbTable;
+    try {
+      table = parseKdbFile(path);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Could not read "${path}" as a kdb+ table: ${message}`);
+    }
+
+    const instance = await DuckDBInstance.create(':memory:');
+    const connection = await instance.connect();
+    const mainObjectName = basename(path, extname(path)).replace(/"/g, '""');
+    await loadKdbTableIntoConnection(connection, mainObjectName, table.columns);
+
+    const catalogReader = await connection.runAndReadAll('select current_database()');
+    const catalogName = String(catalogReader.getRows()[0][0]);
+
+    return new DuckDbFile(connection, path, 'kdb', catalogName, mainObjectName, false);
+  }
+
   async listTables(): Promise<string[]> {
     // Scoped to the current database: once a SQLite file is ATTACHed and
     // USEd, information_schema.tables spans multiple catalogs otherwise.
@@ -329,6 +482,9 @@ export class DuckDbFile {
 
   /** Flushes pending writes to disk, then copies the file. Returns the backup path. */
   async createBackup(): Promise<string> {
+    if (this.kind === 'kdb') {
+      throw new Error("Safe Mode isn't applicable to a read-only kdb+ table.");
+    }
     if (this.kind === 'sqlite') {
       await this.connection.run(`checkpoint ${quoteIdent(this.mainObjectName)}`);
     } else if (this.kind === 'duckdb') {
@@ -537,7 +693,10 @@ export class DuckDbFile {
    * opinion of whether a result is editable; this is always re-derived here.
    */
   async checkEditableSelect(sql: string): Promise<EditabilityInfo> {
-    if (this.readOnly) return { editable: false };
+    // kdb+ tables are read from the real on-disk file (see kdbParser.ts) into
+    // an in-memory table purely so this viewer can query it -- there is no
+    // write-back path to real kdb+ format, so editing is never offered.
+    if (this.readOnly || this.kind === 'kdb') return { editable: false };
     const trimmed = sql.trim();
 
     try {

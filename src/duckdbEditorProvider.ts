@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { basename } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { open as fsOpen, readFile, unlink } from 'node:fs/promises';
-import { DescriptiveStats, DuckDbFile, QueryDiff, TopValuesStats, hasTrailingLimit } from './duckdbConnection';
+import { DescriptiveStats, DuckDbFile, FileKind, QueryDiff, TopValuesStats, hasTrailingLimit } from './duckdbConnection';
 import { isDestructiveStatement } from './sqlSafety';
 
 // Above this many rows, the automatic post-query diff against the backup
@@ -156,6 +156,14 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
   // priority instead, so it opens automatically like .duckdb/.parquet/.csv.
   public static readonly sqliteViewType = 'dataFileViewer.sqliteEditor';
   public static readonly sqliteDefaultViewType = 'dataFileViewer.sqliteEditorDefault';
+  // kdb+ table files are extensionless (see kdbParser.ts) and their names are
+  // pipeline-specific (Raw_Data, used_YieldCurve, ...), so there's no stable
+  // filename pattern to associate by default or offer in "Open With" the
+  // normal way. This viewType exists purely to be invoked programmatically —
+  // package.json gives it a harmless catch-all "option"-priority selector,
+  // and the real entry point is the dataFileViewer.openKdbFile command below
+  // (bound to the Explorer context menu, scoped to *_kdb/ folders).
+  public static readonly kdbViewType = 'dataFileViewer.kdbEditor';
 
   static register(context: vscode.ExtensionContext): vscode.Disposable {
     const provider = new DuckDBEditorProvider(context);
@@ -163,10 +171,18 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
       webviewOptions: { retainContextWhenHidden: true },
       supportsMultipleEditorsPerDocument: false,
     };
+    const kdbProvider: vscode.CustomReadonlyEditorProvider<DuckDBDocument> = {
+      openCustomDocument: (uri) => provider.openKdbDocument(uri),
+      resolveCustomEditor: (document, panel) => provider.resolveCustomEditor(document, panel),
+    };
     return vscode.Disposable.from(
       vscode.window.registerCustomEditorProvider(DuckDBEditorProvider.viewType, provider, registerOptions),
       vscode.window.registerCustomEditorProvider(DuckDBEditorProvider.sqliteViewType, provider, registerOptions),
-      vscode.window.registerCustomEditorProvider(DuckDBEditorProvider.sqliteDefaultViewType, provider, registerOptions)
+      vscode.window.registerCustomEditorProvider(DuckDBEditorProvider.sqliteDefaultViewType, provider, registerOptions),
+      vscode.window.registerCustomEditorProvider(DuckDBEditorProvider.kdbViewType, kdbProvider, registerOptions),
+      vscode.commands.registerCommand('dataFileViewer.openKdbFile', (uri: vscode.Uri) =>
+        vscode.commands.executeCommand('vscode.openWith', uri, DuckDBEditorProvider.kdbViewType)
+      )
     );
   }
 
@@ -184,7 +200,16 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
   constructor(private readonly context: vscode.ExtensionContext) {}
 
   async openCustomDocument(uri: vscode.Uri): Promise<DuckDBDocument> {
-    const isFlatFile = /\.(parquet|csv)$/i.test(uri.fsPath);
+    return this.openDocumentInternal(uri);
+  }
+
+  /** Entry point for the kdb+ viewType (see register() above) — no filename pattern to sniff a kind from. */
+  async openKdbDocument(uri: vscode.Uri): Promise<DuckDBDocument> {
+    return this.openDocumentInternal(uri, 'kdb');
+  }
+
+  private async openDocumentInternal(uri: vscode.Uri, forceKind?: FileKind): Promise<DuckDBDocument> {
+    const isFlatFile = forceKind === undefined && /\.(parquet|csv)$/i.test(uri.fsPath);
     if (isFlatFile && this.openFlatFilePaths.has(uri.fsPath)) {
       const message = `${basename(
         uri.fsPath
@@ -201,7 +226,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
       // wouldn't see that in-memory guard at all.
       if (isFlatFile) releaseLock = await acquireFileLock(uri.fsPath);
 
-      const file = await DuckDbFile.open(uri.fsPath);
+      const file = await DuckDbFile.open(uri.fsPath, forceKind);
       if (file.isReadOnly()) {
         vscode.window.showWarningMessage(
           `${basename(uri.fsPath)}: opened read-only — this file is already open elsewhere. Edits will fail until the other handle is released.`
