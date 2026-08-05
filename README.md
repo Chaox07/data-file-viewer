@@ -1,43 +1,103 @@
 # Data File Viewer
 
-A VS Code extension that opens `.duckdb`, `.parquet`, `.csv`, and
-`.db`/`.sqlite` (SQLite) files with a table list ("sheets") in the sidebar,
+A VS Code extension that opens `.duckdb`, `.parquet`, `.csv`, `.db`/`.sqlite`
+(SQLite), and kdb+ table files with a table list ("sheets") in the sidebar,
 an editable SQL query box, and a results grid — modeled on
 [caioricciuti/vs-duckdb-viewer](https://github.com/caioricciuti/vs-duckdb-viewer).
-DuckDB is the engine reading all these formats under the hood.
+DuckDB is the engine reading most of these formats under the hood; kdb+
+files are parsed directly in their own real format (see the kdb+ section
+below).
 
-`.duckdb`, `.parquet`, and `.csv` files open automatically on double-click.
-`.db`/`.sqlite` are **not** automatic (they're generic extensions used by
-many unrelated file formats) — right-click such a file and choose "Open
-With..." → "Data File Viewer (SQLite)", or use the Command Palette's "Reopen
-Editor With..." on an already-open one. Opening a `.db`/`.sqlite` file also
-requires DuckDB to load its `sqlite` extension, which needs an internet
-connection the *first* time it's used on a given machine (cached locally
-after that).
+## Opening files
+
+| Format | Opens automatically on double-click? |
+| --- | --- |
+| `.duckdb` | Yes |
+| `.parquet` | Yes |
+| `.csv` | Yes |
+| `.sqlite` | Yes |
+| `.db` | **No** — see below |
+| kdb+ table files (inside a `..._kdb/` folder) | Yes, inside VS Code — see below |
+
+`.db` is deliberately **not** automatic: it's a generic extension used by
+many unrelated file formats, so claiming it by default would risk hijacking
+files that have nothing to do with this extension. To open one, right-click
+it → "Open With..." → "Data File Viewer (SQLite)", or use the Command
+Palette's "Reopen Editor With..." on an already-open one. Opening a
+`.db`/`.sqlite` file also requires DuckDB to load its `sqlite` extension,
+which needs an internet connection the *first* time it's used on a given
+machine (cached locally after that).
 
 `.parquet`/`.csv` files aren't databases with multiple tables, so they're
 exposed as a single view named after the file — the sidebar will show just
 that one entry, and clicking it previews the file's data like any other
 table.
 
+### kdb+ tables
+
+If you export data as kdb+ (a fast, compact on-disk table format used by
+kdb+/q), this extension reads the real file directly — there's no
+conversion step, and the on-disk file is never modified. Point it at one of
+the individual table files a kdb+ export produces (for example `Raw_Data`
+or `used_YieldCurve` inside a folder like `MyData_kdb/`); double-clicking one
+of these files anywhere inside VS Code opens it straight into the viewer,
+the same as the other formats above. You can also right-click such a file
+and choose "Open in Data File Viewer" explicitly.
+
+Two things are different for kdb+ compared to every other format here:
+
+- **View-only.** You can browse, sort, run SQL queries, and check column
+  stats, but you can't edit cells or save changes — there's no way yet to
+  write a change back into kdb+'s own file format.
+- **Double-clicking from Finder/Explorer** (as opposed to double-clicking
+  inside VS Code's own sidebar) still requires a one-time step, because kdb+
+  table files have no file extension for the operating system to recognize.
+  On macOS: right-click the file in Finder → Get Info → "Open with:" →
+  choose Visual Studio Code. Since there's no extension to generalize the
+  association from, this has to be done per file (or redone whenever the
+  export is regenerated) — dragging the file onto VS Code's Dock icon works
+  just as well and needs no setup at all.
+
 ### Sorting, stats, and cell editing
 
 Every results grid — table previews and hand-written queries alike — gets:
-- **Sort**: ▲/▼ buttons in each column header, applied client-side to the
-  current result (no re-query).
-- **Column stats**: a button in each header (Σ for numeric/datetime columns,
-  ≡ for everything else) computes min/max/mean/percentiles/null-count or the
-  top 20 most frequent values, via DuckDB, on demand.
+
+- **Sort**: click a column header's sort button to sort by that column,
+  ascending; click it again to reverse to descending, and so on. If the
+  underlying query has a `LIMIT`, sorting always re-sorts the *full*
+  matching data set on the server first, not just whatever rows happened to
+  already be on screen — so "top 10 by X" is always the true top 10, not an
+  arbitrary 10 rows re-ordered.
+- **Column stats**: a button in each header computes, on demand and across
+  the *entire* column (not just the visible rows): for numeric/date columns,
+  the minimum, maximum, average, and 5th/95th percentiles; for everything
+  else, null count, distinct count, and the 20 most frequent values.
+- **NULL values** are shown dimmed and in italics in the results grid, so
+  they're easy to tell apart from a real value like an empty string or a
+  literal `0`.
 - **Cell inspector**: double-click any cell to view its full value (JSON
   syntax-highlighted when the value is an object/array or JSON-looking
   text). If the result is a plain `SELECT * FROM one_table` (no joins,
-  aggregates, or computed columns) *and* Safe Mode is off, the same panel
-  lets you edit and save the cell back to the source file/table. `.csv`/
-  `.parquet` are lazily converted from a read-only view into a real editable
-  table the first time you actually edit a cell in that session — pure
-  browsing stays as fast as before. Edits match rows by comparing every
+  aggregates, or computed columns), the format supports editing, *and*
+  Safe Mode is off, the same panel lets you edit and save the cell back to
+  the source file/table. `.csv`/`.parquet` are lazily converted from a
+  read-only view into a real editable table the first time you actually
+  edit a cell in that session — pure browsing stays as fast as before, and
+  the panel shows a short status message ("Preparing file for editing…",
+  "Saving…") while that happens. Edits match rows by comparing every
   column's value (there's no universal row-id across table kinds), so a
   table with fully duplicate rows will update all of them together.
+
+### Safe Mode and backups
+
+Safe Mode is on by default. Turning it off makes a timestamped backup copy
+of the file before letting you edit anything, and — the next time you
+re-enable Safe Mode — compares the live data against that backup so you can
+see which tables changed. After running a query, matching rows/cells
+changed since the backup are highlighted directly in the results grid, too;
+above a configurable row count (`dataFileViewer.diffRowThreshold` in
+Settings, default 50,000) this automatic highlighting is skipped for
+performance and replaced with a manual "Diff anyway" button.
 
 ## Local development
 
@@ -48,7 +108,8 @@ npm run watch       # rebuild on file changes
 ```
 
 Press `F5` in VS Code (with this folder open) to launch an Extension Development
-Host, then open any `.duckdb`/`.parquet`/`.csv`/`.db`/`.sqlite` file in that window.
+Host, then open any `.duckdb`/`.parquet`/`.csv`/`.db`/`.sqlite`/kdb+ file in
+that window.
 
 ## Packaging
 
@@ -84,18 +145,21 @@ If you need a specific run's build instead of always-latest: open the repo's
 `vsix-windows-latest` artifact. Unlike the `latest` release above, these
 per-run artifacts expire after 90 days by default.
 
-## Making `.duckdb`/`.parquet`/`.csv` files open in VS Code on double-click
+## Making files open in VS Code on double-click from Finder/Explorer
 
-This is a one-time OS setting per machine — VS Code extensions can't register
-this automatically:
+This section is about the operating system's own file association — a
+separate, one-time setting per machine, independent of anything this
+extension can configure on its own:
 
-- **macOS**: right-click a `.duckdb`/`.parquet`/`.csv` file → Get Info →
-  "Open with" → select Visual Studio Code → "Change All…".
-- **Windows**: right-click a `.duckdb`/`.parquet`/`.csv` file → "Open with" →
-  "Choose another app" → Visual Studio Code → check "Always use this app to
-  open this file type".
+- **macOS**: right-click a `.duckdb`/`.parquet`/`.csv`/`.sqlite` file → Get
+  Info → "Open with" → select Visual Studio Code → "Change All…".
+- **Windows**: right-click a `.duckdb`/`.parquet`/`.csv`/`.sqlite` file →
+  "Open with" → "Choose another app" → Visual Studio Code → check "Always
+  use this app to open this file type".
 
-Once set, double-clicking either file type anywhere launches VS Code directly
-into this custom editor. `.db`/`.sqlite` files are opened manually via
-right-click, as described above — no OS file-association step needed (or
-wanted) for those.
+Once set, double-clicking any of those file types anywhere launches VS Code
+directly into this custom editor. `.db` files are opened manually via
+right-click as described above — no OS file-association step needed (or
+wanted) for those, since `.db` is intentionally not a default association.
+kdb+ table files have no extension for the OS to associate by — see the
+kdb+ section above for the per-file equivalent.
