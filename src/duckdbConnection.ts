@@ -52,7 +52,7 @@ export interface DescriptiveStats {
   p95: unknown;
 }
 
-export type FileKind = 'duckdb' | 'parquet' | 'sqlite' | 'csv' | 'kdb';
+export type FileKind = 'duckdb' | 'parquet' | 'sqlite' | 'csv' | 'dta' | 'kdb';
 
 function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
@@ -320,7 +320,7 @@ export class DuckDbFile {
   }
 
   private isFlatFileKind(): boolean {
-    return this.kind === 'parquet' || this.kind === 'csv';
+    return this.kind === 'parquet' || this.kind === 'csv' || this.kind === 'dta';
   }
 
   static async open(path: string, forceKind?: FileKind): Promise<DuckDbFile> {
@@ -334,9 +334,10 @@ export class DuckDbFile {
 
     const isParquet = path.toLowerCase().endsWith('.parquet');
     const isCsv = path.toLowerCase().endsWith('.csv');
+    const isDta = path.toLowerCase().endsWith('.dta');
     const isSqlite = path.toLowerCase().endsWith('.db') || path.toLowerCase().endsWith('.sqlite');
-    const useMemory = isParquet || isCsv || isSqlite;
-    const kind: FileKind = isParquet ? 'parquet' : isCsv ? 'csv' : isSqlite ? 'sqlite' : 'duckdb';
+    const useMemory = isParquet || isCsv || isDta || isSqlite;
+    const kind: FileKind = isParquet ? 'parquet' : isCsv ? 'csv' : isDta ? 'dta' : isSqlite ? 'sqlite' : 'duckdb';
 
     let instance: DuckDBInstance;
     let readOnly = false;
@@ -385,6 +386,24 @@ export class DuckDbFile {
       // header presence, and column types.
       const filePath = path.replace(/'/g, "''");
       await connection.run(`create view "${mainObjectName}" as select * from read_csv_auto('${filePath}')`);
+    }
+
+    if (isDta) {
+      // Same single-view treatment as Parquet/CSV — a .dta file is one
+      // Stata dataset, not multiple tables. Uses DuckDB's community `dta`
+      // extension (codedthinking/duckdb-dta), which reads Stata formats
+      // 117-121 (Stata 13-18) via read_dta().
+      try {
+        await connection.run(`install dta from community`);
+        await connection.run(`load dta`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `Could not load DuckDB's dta extension — this requires an internet connection the first time it's used on this machine. (${message})`
+        );
+      }
+      const filePath = path.replace(/'/g, "''");
+      await connection.run(`create view "${mainObjectName}" as select * from read_dta('${filePath}')`);
     }
 
     if (isSqlite) {
@@ -544,7 +563,7 @@ export class DuckDbFile {
       // into a table via an edit, the backup itself is still the original
       // pre-edit flat file on disk — read back with the same read_* function
       // used to open it in the first place, regardless of materialization.)
-      const readFn = this.kind === 'parquet' ? 'read_parquet' : 'read_csv_auto';
+      const readFn = this.kind === 'parquet' ? 'read_parquet' : this.kind === 'dta' ? 'read_dta' : 'read_csv_auto';
       await this.connection.run(`attach ':memory:' as backup_cmp`);
       await this.connection.run('use backup_cmp');
       await this.connection.run(
@@ -819,6 +838,10 @@ export class DuckDbFile {
       await this.connection.run(`copy ${table} to '${filePath}' (format csv, header true)`);
     } else if (this.kind === 'parquet') {
       await this.connection.run(`copy ${table} to '${filePath}' (format parquet)`);
+    } else if (this.kind === 'dta') {
+      // Outputs Stata format 119 (Stata 15) — the dta extension's write
+      // format, regardless of the original file's own format version.
+      await this.connection.run(`copy ${table} to '${filePath}' (format dta)`);
     }
   }
 

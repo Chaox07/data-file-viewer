@@ -1,7 +1,7 @@
 {
   "name": "data-file-viewer",
   "displayName": "Data File Viewer",
-  "description": "Open and explore .duckdb, .parquet, .csv, .db/.sqlite (SQLite), and kdb+ data files right inside VS Code, without needing a separate database program. A sidebar lists every table in the file — click one to see its rows in a grid, or write your own SQL query to look at exactly the data you want. Click a column header to sort by it, or open the stats panel to see quick numbers for that column — minimum, maximum, average, and percentiles — worked out across the whole dataset, not just the rows on screen. For editable formats (.duckdb, .parquet, .csv, .db/.sqlite), double-click a cell to change its value and save it straight back to the file; turn on Safe Mode first to keep an automatic backup and see exactly which rows changed before you commit to the edit. kdb+ tables are read directly in their real, original format — no conversion step — though they are view-only for now, since there is no way yet to write changes back into that format.",
+  "description": "Open and explore .duckdb, .parquet, .csv, .dta (Stata), .db/.sqlite (SQLite), and kdb+ data files right inside VS Code, without needing a separate database program. A sidebar lists every table in the file — click one to see its rows in a grid, or write your own SQL query to look at exactly the data you want. Click a column header to sort by it, or open the stats panel to see quick numbers for that column — minimum, maximum, average, and percentiles — worked out across the whole dataset, not just the rows on screen. For editable formats (.duckdb, .parquet, .csv, .dta, .db/.sqlite), double-click a cell to change its value and save it straight back to the file; turn on Safe Mode first to keep an automatic backup and see exactly which rows changed before you commit to the edit. kdb+ tables are read directly in their real, original format — no conversion step — though they are view-only for now, since there is no way yet to write changes back into that format.",
   "publisher": "kemal-local",
   "version": "0.0.1",
   "private": true,
@@ -31,6 +31,9 @@
           },
           {
             "filenamePattern": "*.csv"
+          },
+          {
+            "filenamePattern": "*.dta"
           }
         ],
         "priority": "default"

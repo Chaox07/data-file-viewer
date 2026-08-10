@@ -1,7 +1,7 @@
 # Data File Viewer
 
-A VS Code extension that opens `.duckdb`, `.parquet`, `.csv`, `.db`/`.sqlite`
-(SQLite), and kdb+ table files with a table list ("sheets") in the sidebar,
+A VS Code extension that opens `.duckdb`, `.parquet`, `.csv`, `.dta` (Stata),
+`.db`/`.sqlite` (SQLite), and kdb+ table files with a table list ("sheets") in the sidebar,
 an editable SQL query box, and a results grid — modeled on
 [caioricciuti/vs-duckdb-viewer](https://github.com/caioricciuti/vs-duckdb-viewer).
 DuckDB is the engine reading most of these formats under the hood; kdb+
@@ -15,6 +15,7 @@ below).
 | `.duckdb` | Yes |
 | `.parquet` | Yes |
 | `.csv` | Yes |
+| `.dta` | Yes |
 | `.sqlite` | Yes |
 | `.db` | **No** — see below |
 | kdb+ table files (inside a `..._kdb/` folder) | Yes, inside VS Code — see below |
@@ -26,12 +27,14 @@ it → "Open With..." → "Data File Viewer (SQLite)", or use the Command
 Palette's "Reopen Editor With..." on an already-open one. Opening a
 `.db`/`.sqlite` file also requires DuckDB to load its `sqlite` extension,
 which needs an internet connection the *first* time it's used on a given
-machine (cached locally after that).
+machine (cached locally after that). Opening a `.dta` file has the same
+one-time internet-on-first-use requirement, for DuckDB's `dta` community
+extension.
 
-`.parquet`/`.csv` files aren't databases with multiple tables, so they're
-exposed as a single view named after the file — the sidebar will show just
-that one entry, and clicking it previews the file's data like any other
-table.
+`.parquet`/`.csv`/`.dta` files aren't databases with multiple tables, so
+they're exposed as a single view named after the file — the sidebar will
+show just that one entry, and clicking it previews the file's data like any
+other table.
 
 ### kdb+ tables
 
@@ -80,7 +83,7 @@ Every results grid — table previews and hand-written queries alike — gets:
   text). If the result is a plain `SELECT * FROM one_table` (no joins,
   aggregates, or computed columns), the format supports editing, *and*
   Safe Mode is off, the same panel lets you edit and save the cell back to
-  the source file/table. `.csv`/`.parquet` are lazily converted from a
+  the source file/table. `.csv`/`.parquet`/`.dta` are lazily converted from a
   read-only view into a real editable table the first time you actually
   edit a cell in that session — pure browsing stays as fast as before, and
   the panel shows a short status message ("Preparing file for editing…",
@@ -108,7 +111,7 @@ npm run watch       # rebuild on file changes
 ```
 
 Press `F5` in VS Code (with this folder open) to launch an Extension Development
-Host, then open any `.duckdb`/`.parquet`/`.csv`/`.db`/`.sqlite`/kdb+ file in
+Host, then open any `.duckdb`/`.parquet`/`.csv`/`.dta`/`.db`/`.sqlite`/kdb+ file in
 that window.
 
 ## Packaging
@@ -151,9 +154,9 @@ This section is about the operating system's own file association — a
 separate, one-time setting per machine, independent of anything this
 extension can configure on its own:
 
-- **macOS**: right-click a `.duckdb`/`.parquet`/`.csv`/`.sqlite` file → Get
-  Info → "Open with" → select Visual Studio Code → "Change All…".
-- **Windows**: right-click a `.duckdb`/`.parquet`/`.csv`/`.sqlite` file →
+- **macOS**: right-click a `.duckdb`/`.parquet`/`.csv`/`.dta`/`.sqlite` file →
+  Get Info → "Open with" → select Visual Studio Code → "Change All…".
+- **Windows**: right-click a `.duckdb`/`.parquet`/`.csv`/`.dta`/`.sqlite` file →
   "Open with" → "Choose another app" → Visual Studio Code → check "Always
   use this app to open this file type".
 

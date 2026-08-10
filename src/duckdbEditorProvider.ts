@@ -187,8 +187,8 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
   }
 
   // Unlike .duckdb (direct open) and .db/.sqlite (ATTACH), DuckDB doesn't
-  // put any file-level lock on .parquet/.csv — they're read into a :memory:
-  // instance, so nothing today stops opening the same path in two tabs, each
+  // put any file-level lock on .parquet/.csv/.dta — they're read into a
+  // :memory: instance, so nothing today stops opening the same path in two tabs, each
   // with its own independent copy and no lock-conflict warning. That's fine
   // for read-only browsing, but with cell editing now writing back to these
   // files, two tabs editing the same path would silently last-write-wins.
@@ -209,7 +209,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
   }
 
   private async openDocumentInternal(uri: vscode.Uri, forceKind?: FileKind): Promise<DuckDBDocument> {
-    const isFlatFile = forceKind === undefined && /\.(parquet|csv)$/i.test(uri.fsPath);
+    const isFlatFile = forceKind === undefined && /\.(parquet|csv|dta)$/i.test(uri.fsPath);
     if (isFlatFile && this.openFlatFilePaths.has(uri.fsPath)) {
       const message = `${basename(
         uri.fsPath
