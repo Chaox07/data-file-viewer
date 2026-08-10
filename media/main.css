@@ -457,6 +457,63 @@ html, body {
   background: #464c5a !important;
 }
 
+/* Live/Static selector: pushed to the far right of the toolbar, deliberately
+   apart from Safe Mode's controls on the left — the two are mutually
+   exclusive states, not just visually but functionally (see webview.ts). */
+.toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.toolbar-radio {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 12px;
+  color: #abb2bf;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.toolbar-radio input {
+  cursor: pointer;
+}
+
+#live-options:not([hidden]) {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: #abb2bf;
+}
+
+#live-interval-input {
+  width: 3.5em;
+  background: #1e2126;
+  color: #abb2bf;
+  border: 1px solid #3a3f4b;
+  border-radius: 3px;
+  padding: 2px 4px;
+}
+
+.live-status {
+  font-size: 12px;
+  color: #7d8493;
+  white-space: nowrap;
+}
+
+.live-status.live-status-active {
+  color: #98c379;
+}
+
+.live-status.live-status-stale {
+  color: #e5c07b;
+  font-weight: 600;
+}
+
 .cell-inspector-status, .cell-inspector-note {
   color: #7d8493;
   font-size: 12px;

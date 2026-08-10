@@ -1,9 +1,163 @@
 import * as vscode from 'vscode';
-import { basename } from 'node:path';
+import { basename, dirname, extname, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { open as fsOpen, readFile, unlink } from 'node:fs/promises';
+import { open as fsOpen, readFile, stat, unlink } from 'node:fs/promises';
+import { existsSync, realpathSync } from 'node:fs';
 import { DescriptiveStats, DuckDbFile, FileKind, QueryDiff, TopValuesStats, hasTrailingLimit } from './duckdbConnection';
 import { isDestructiveStatement } from './sqlSafety';
+import { LiveRefreshController } from './liveRefresh';
+
+// Real, permanent debug channel rather than throwaway instrumentation — this
+// feature accumulates enough internal state machinery (backoff phase,
+// watcher health, stat-gate skip/hit, coalesced-vs-separate ticks, the
+// auto-detect cache) that "why did my live view stop updating" is a
+// realistic support question. Silent unless dataFileViewer.debugLiveRefresh
+// is on.
+const liveRefreshChannel = vscode.window.createOutputChannel('Data File Viewer: Live Refresh');
+
+function isDebugLiveRefreshEnabled(): boolean {
+  return vscode.workspace.getConfiguration('dataFileViewer').get<boolean>('debugLiveRefresh', false) === true;
+}
+
+function logLive(message: string): void {
+  if (!isDebugLiveRefreshEnabled()) return;
+  liveRefreshChannel.appendLine(`[${new Date().toISOString()}] ${message}`);
+}
+
+function getGlobalLiveRefreshIntervalMs(): number {
+  const value = vscode.workspace.getConfiguration('dataFileViewer').get<number>('liveRefreshIntervalMs', 2000);
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.max(250, value) : 2000;
+}
+
+// The refresh-interval value shown/edited in the UI (and any auto-detected
+// sheet_metadata hint) is exactly as untrusted as the table/column names
+// handled elsewhere in this extension — clamp/type-check before it can ever
+// reach the tick engine, so a corrupt or crafted value can't bypass the
+// floor the rest of the design relies on to avoid tight-loop refreshing.
+function clampIntervalMs(candidateMs: unknown): number {
+  const n = typeof candidateMs === 'number' && Number.isFinite(candidateMs) ? candidateMs : NaN;
+  return Number.isFinite(n) && n > 0 ? Math.max(250, n) : getGlobalLiveRefreshIntervalMs();
+}
+
+// A UX nicety, not a security boundary: the read-only reconnect used for
+// every live tick is what actually prevents a write from executing, so this
+// only needs to catch the common case well enough to produce a clear error
+// instead of a confusing stale/backoff spiral — no need for a real SQL
+// parser here.
+function looksReadOnly(sql: string): boolean {
+  const t = sql.trim().toLowerCase();
+  return t.startsWith('select') || t.startsWith('with');
+}
+
+function getWalCandidatesFor(filePath: string): string[] {
+  const lower = filePath.toLowerCase();
+  if (lower.endsWith('.sqlite') || lower.endsWith('.db')) {
+    // WAL mode: the main file's mtime often doesn't move until a
+    // checkpoint, so the -wal file is what actually tracks freshness.
+    return [`${filePath}-wal`, `${filePath}-shm`];
+  }
+  if (lower.endsWith('.duckdb')) {
+    // DuckDB checkpoints through its own WAL file before flushing to the
+    // main file — same under-reported-freshness risk applies symmetrically
+    // here, not just on the SQLite side.
+    return [`${filePath}.wal`];
+  }
+  return [];
+}
+
+function watchPathsFor(primaryPath: string, siblingPath: string | undefined): string[] {
+  const paths = [primaryPath, ...getWalCandidatesFor(primaryPath)];
+  if (siblingPath) paths.push(siblingPath, ...getWalCandidatesFor(siblingPath));
+  return paths;
+}
+
+interface FileStat {
+  mtimeMs: number;
+  size: number;
+}
+
+async function statAll(paths: string[]): Promise<Map<string, FileStat>> {
+  const map = new Map<string, FileStat>();
+  await Promise.all(
+    paths.map(async (p) => {
+      try {
+        const s = await stat(p);
+        map.set(p, { mtimeMs: s.mtimeMs, size: s.size });
+      } catch {
+        // Doesn't exist yet (no WAL file, or no sibling) — absence is
+        // itself a valid, comparable state below.
+      }
+    })
+  );
+  return map;
+}
+
+function statsChanged(prev: Map<string, FileStat> | undefined, next: Map<string, FileStat>): boolean {
+  if (!prev) return true;
+  const keys = new Set([...prev.keys(), ...next.keys()]);
+  for (const key of keys) {
+    const a = prev.get(key);
+    const b = next.get(key);
+    if (!a || !b) return true; // appeared or disappeared
+    if (a.mtimeMs !== b.mtimeMs || a.size !== b.size) return true;
+  }
+  return false;
+}
+
+/** Cheap content signature for the "skip the repost if unchanged" check — only computed below a size threshold (see runLiveTick). */
+function hashRows(rows: unknown[][]): string {
+  const str = JSON.stringify(rows);
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16);
+}
+const HASH_ROW_THRESHOLD = 5000;
+
+/**
+ * Sibling detection for the combined hot+cold view: filename-convention
+ * based (there's no dialog step to supply a second path — VS Code's custom
+ * editor API only ever hands the extension one URI on open), trying both
+ * naming conventions this codebase's own writers use
+ * (`<base>.sqlite`/`<base>.duckdb` same-basename, or `<base>_hot.sqlite`
+ * suffix) and using whichever candidate actually exists on disk. Verifies
+ * the resolved path is still within the same directory (guards against a
+ * symlink swapped in between this check and the caller's later ATTACH)
+ * before returning it — the file itself being a valid database is verified
+ * separately, by DuckDbFile.open's own attach-and-probe fallback.
+ */
+function resolveSiblingPath(fsPath: string): string | undefined {
+  const dir = dirname(fsPath);
+  const ext = extname(fsPath);
+  const lowerExt = ext.toLowerCase();
+  const base = basename(fsPath, ext);
+  const candidates: string[] = [];
+
+  if (lowerExt === '.duckdb') {
+    candidates.push(join(dir, `${base}.sqlite`), join(dir, `${base}_hot.sqlite`));
+  } else if (lowerExt === '.sqlite' || lowerExt === '.db') {
+    candidates.push(join(dir, `${base}.duckdb`));
+    if (base.endsWith('_hot')) {
+      candidates.push(join(dir, `${base.slice(0, -'_hot'.length)}.duckdb`));
+    }
+  }
+
+  for (const candidate of candidates) {
+    if (isVerifiedSiblingPath(dir, candidate)) return candidate;
+  }
+  return undefined;
+}
+
+function isVerifiedSiblingPath(expectedDir: string, candidate: string): boolean {
+  try {
+    if (!existsSync(candidate)) return false;
+    return dirname(realpathSync(candidate)) === realpathSync(expectedDir);
+  } catch {
+    return false;
+  }
+}
 
 // Above this many rows, the automatic post-query diff against the backup
 // (an O(rows) comparison) is skipped by default — see the runQuery and
@@ -75,6 +229,8 @@ async function acquireFileLock(path: string): Promise<() => void> {
 
 class DuckDBDocument implements vscode.CustomDocument {
   private tablesCache: string[] | undefined;
+  // name (e.g. "orders_combined") -> the synthesized SQL that entry runs.
+  combinedQueryMap = new Map<string, string>();
 
   safeMode = true;
   backupBeforeWrite = true;
@@ -87,13 +243,36 @@ class DuckDBDocument implements vscode.CustomDocument {
   lastSql: string | undefined;
   lastEditableTable: string | undefined;
   lastEditableColumns: string[] | undefined;
+  // The base table behind lastSql, whether from a plain single-table SELECT
+  // or a synthesized `_combined` query — used to look up the poll-cadence
+  // auto-detect hint. Distinct from lastEditableTable since a `_combined`
+  // query is never "editable" but still has a meaningful base table.
+  lastQueriedBaseTable: string | undefined;
 
   // Keyed by `${statsKind}:${column}` — cleared whenever a new query runs,
   // since stats are scoped to the current base query.
   readonly statsCache = new Map<string, TopValuesStats | DescriptiveStats>();
   private static readonly MAX_STATS_CACHE_ENTRIES = 50;
 
-  constructor(readonly uri: vscode.Uri, readonly file: DuckDbFile, private readonly onDispose?: () => void) {}
+  // Live-refresh state.
+  liveRefreshEnabled = false;
+  liveRefreshIntervalMs = 2000;
+  liveRefreshController: LiveRefreshController | undefined;
+  lastFileStats: Map<string, FileStat> | undefined;
+  lastResultRowCount: number | undefined;
+  lastResultHash: string | undefined;
+  // Cached per base table so repeated toggle-off/toggle-on within the same
+  // session doesn't re-read sheet_metadata each time. `null` is a cached
+  // "checked, no hint found" — distinct from `undefined` ("not checked yet").
+  pollCadenceCache: number | null | undefined;
+  pollCadenceCacheTable: string | undefined;
+  disposed = false;
+
+  constructor(readonly uri: vscode.Uri, public file: DuckDbFile, private readonly onDispose?: () => void) {}
+
+  invalidateTablesCache(): void {
+    this.tablesCache = undefined;
+  }
 
   // Capped insert — cheap insurance against unbounded growth if caching
   // ever extends beyond "cleared on every new query" in the future.
@@ -106,13 +285,32 @@ class DuckDBDocument implements vscode.CustomDocument {
   }
 
   async getTables(): Promise<string[]> {
-    if (!this.tablesCache) {
-      this.tablesCache = await this.file.listTables();
+    if (this.tablesCache) return this.tablesCache;
+
+    const ownTables = await this.file.listTables();
+    this.combinedQueryMap.clear();
+    const combinable = await this.file.getCombinableTableNames().catch(() => [] as string[]);
+    const combinedNames: string[] = [];
+    for (const table of combinable) {
+      try {
+        const { sql } = await this.file.buildCombinedQuery(table);
+        const name = `${table}_combined`;
+        this.combinedQueryMap.set(sql, table);
+        combinedNames.push(name);
+      } catch {
+        // Best-effort — a table that fails to build a combined query (e.g.
+        // an introspection error) just doesn't get a synthesized entry.
+      }
     }
+
+    this.tablesCache = [...ownTables, ...combinedNames];
     return this.tablesCache;
   }
 
   dispose(): void {
+    this.disposed = true;
+    this.liveRefreshController?.dispose();
+    this.liveRefreshController = undefined;
     if (this.hasBackup && this.checkForChanges) {
       // Fire-and-forget: the webview is already gone by the time dispose()
       // runs, so a VS Code notification is the only place left to report
@@ -145,6 +343,150 @@ class DuckDBDocument implements vscode.CustomDocument {
       this.onDispose?.();
     }
   }
+}
+
+/**
+ * Reconnects a document's underlying file, swapping `document.file` to a
+ * fresh connection — used both for the initial live-tick reconnect and for
+ * restoring a normal (read-write-attempting) connection when Live turns
+ * off. DuckDB's single-connection model isn't built for observing another
+ * process's commits made after the connection opened, so this is the
+ * mechanism live mode relies on to actually see fresh writes (mirrors
+ * dashboard.py's own `_read_cold_with_retry`/`_cold_connection` pattern in
+ * trading_project, which reconnects fresh on every read for the same
+ * reason).
+ */
+async function reconnectDocument(document: DuckDBDocument, forceReadOnly: boolean): Promise<void> {
+  const siblingPath = resolveSiblingPath(document.uri.fsPath);
+  const newFile = await DuckDbFile.open(document.uri.fsPath, undefined, { forceReadOnly, siblingPath });
+  if (document.disposed) {
+    // dispose() fired while this reconnect was in flight — don't swap a
+    // fresh connection into a now-dead document (a connection leak, and a
+    // route to querying something nobody will ever close). Just close what
+    // was just opened instead of assigning it.
+    newFile.dispose();
+    return;
+  }
+  const oldFile = document.file;
+  document.file = newFile;
+  document.invalidateTablesCache();
+  oldFile.dispose();
+}
+
+async function runLiveTick(document: DuckDBDocument, webview: vscode.Webview): Promise<void> {
+  const label = basename(document.uri.fsPath);
+  const siblingPath = resolveSiblingPath(document.uri.fsPath);
+  const paths = watchPathsFor(document.uri.fsPath, siblingPath);
+  const stats = await statAll(paths);
+
+  if (!statsChanged(document.lastFileStats, stats)) {
+    logLive(`[${label}] skipped (stat-gate: no change on disk)`);
+    document.lastFileStats = stats;
+    webview.postMessage({
+      command: 'liveTick',
+      lastUpdatedMs: Date.now(),
+      stale: document.liveRefreshController?.isStale() ?? false,
+      unchanged: true,
+    });
+    return;
+  }
+  document.lastFileStats = stats;
+
+  await reconnectDocument(document, true);
+
+  if (!document.lastSql) return;
+  const result = await document.file.runQuery(document.lastSql);
+
+  const rowCount = result.rows.length;
+  const shouldHash = rowCount <= HASH_ROW_THRESHOLD;
+  const newHash = shouldHash ? hashRows(result.rows) : undefined;
+  const unchanged = shouldHash && document.lastResultRowCount === rowCount && newHash === document.lastResultHash;
+  document.lastResultRowCount = rowCount;
+  document.lastResultHash = newHash;
+
+  logLive(
+    `[${label}] tick ok — ${rowCount} row(s)${unchanged ? ', unchanged (not reposted)' : ', reposted'}${
+      shouldHash ? '' : ' (hash skipped, over size threshold)'
+    }`
+  );
+
+  if (unchanged) {
+    webview.postMessage({ command: 'liveTick', lastUpdatedMs: Date.now(), stale: false, unchanged: true });
+    return;
+  }
+
+  webview.postMessage({
+    command: 'liveTick',
+    lastUpdatedMs: Date.now(),
+    stale: false,
+    unchanged: false,
+    result: {
+      ...result,
+      diffSkipped: false,
+      hasLimit: hasTrailingLimit(document.lastSql),
+      editable: false,
+      editableTable: undefined,
+    },
+  });
+}
+
+async function startLiveRefresh(
+  document: DuckDBDocument,
+  webview: vscode.Webview,
+  requestedIntervalMs: number | undefined
+): Promise<void> {
+  const label = basename(document.uri.fsPath);
+
+  let suggestedSeconds: number | null = null;
+  if (document.lastQueriedBaseTable) {
+    if (document.pollCadenceCacheTable !== document.lastQueriedBaseTable) {
+      document.pollCadenceCache = await document.file.getPollCadenceSeconds(document.lastQueriedBaseTable).catch(() => null);
+      document.pollCadenceCacheTable = document.lastQueriedBaseTable;
+    }
+    suggestedSeconds = document.pollCadenceCache ?? null;
+  }
+
+  const intervalMs = clampIntervalMs(requestedIntervalMs ?? (suggestedSeconds ? suggestedSeconds * 1000 : undefined));
+  document.liveRefreshEnabled = true;
+  document.liveRefreshIntervalMs = intervalMs;
+  document.lastFileStats = undefined;
+  document.lastResultRowCount = undefined;
+  document.lastResultHash = undefined;
+
+  // Reconnect immediately, read-only — this is also what locks out cell
+  // editing the moment Live turns on (checkEditableSelect already refuses
+  // to edit a read-only connection), rather than deferring the read-only
+  // switch until the first tick.
+  await reconnectDocument(document, true);
+  if (document.disposed) return;
+
+  document.liveRefreshController?.dispose();
+  document.liveRefreshController = new LiveRefreshController(intervalMs, {
+    onTick: () => runLiveTick(document, webview),
+    onLog: (msg) => logLive(`[${label}] ${msg}`),
+  });
+  document.liveRefreshController.start(watchPathsFor(document.uri.fsPath, resolveSiblingPath(document.uri.fsPath)));
+
+  webview.postMessage({
+    command: 'liveRefreshStarted',
+    intervalMs,
+    suggestedIntervalSeconds: suggestedSeconds,
+  });
+  logLive(`[${label}] live refresh started, interval ${intervalMs}ms${suggestedSeconds ? ` (auto-detected ${suggestedSeconds}s)` : ''}`);
+
+  await runLiveTick(document, webview).catch((err) => {
+    webview.postMessage({ command: 'error', message: (err as Error).message });
+  });
+}
+
+async function stopLiveRefresh(document: DuckDBDocument, webview: vscode.Webview): Promise<void> {
+  document.liveRefreshEnabled = false;
+  document.liveRefreshController?.dispose();
+  document.liveRefreshController = undefined;
+  await reconnectDocument(document, false);
+  if (document.disposed) return;
+  webview.postMessage({ command: 'liveRefreshStopped' });
+  logLive(`[${basename(document.uri.fsPath)}] live refresh stopped`);
 }
 
 export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider<DuckDBDocument> {
@@ -226,7 +568,8 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
       // wouldn't see that in-memory guard at all.
       if (isFlatFile) releaseLock = await acquireFileLock(uri.fsPath);
 
-      const file = await DuckDbFile.open(uri.fsPath, forceKind);
+      const siblingPath = forceKind ? undefined : resolveSiblingPath(uri.fsPath);
+      const file = await DuckDbFile.open(uri.fsPath, forceKind, { siblingPath });
       if (file.isReadOnly()) {
         vscode.window.showWarningMessage(
           `${basename(uri.fsPath)}: opened read-only — this file is already open elsewhere. Edits will fail until the other handle is released.`
@@ -284,13 +627,20 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
       | { command: 'sortQuery'; column: string; direction: 'asc' | 'desc' }
       | { command: 'toggleSafeMode'; safeMode: boolean; backupBeforeWrite: boolean; checkForChanges: boolean }
       | { command: 'columnStats'; column: string; statsKind: 'numeric' | 'datetime' | 'other'; limit?: number }
-      | { command: 'updateCell'; column: string; newValue: unknown; rowValues: Record<string, unknown> };
+      | { command: 'updateCell'; column: string; newValue: unknown; rowValues: Record<string, unknown> }
+      | { command: 'toggleLiveRefresh'; enabled: boolean; intervalMs?: number }
+      | { command: 'setLiveRefreshInterval'; intervalMs: number }
+      | { command: 'runCombinedQuery'; table: string };
 
     const messageSub = webview.onDidReceiveMessage(async (message: IncomingMessage) => {
       if (message.command === 'ready') {
         try {
           const tables = await document.getTables();
-          webview.postMessage({ command: 'tables', tables });
+          webview.postMessage({
+            command: 'tables',
+            tables,
+            combinedTableNames: [...document.combinedQueryMap.values()].map((table) => `${table}_combined`),
+          });
         } catch (err) {
           webview.postMessage({ command: 'error', message: (err as Error).message });
         }
@@ -302,6 +652,77 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
         // while something is in flight, and interrupting an idle connection
         // is harmless (DuckDB just has nothing to stop).
         document.file.interruptCurrentQuery();
+        return;
+      }
+
+      if (message.command === 'toggleLiveRefresh') {
+        if (message.enabled) {
+          if (!document.lastSql || !looksReadOnly(document.lastSql)) {
+            webview.postMessage({
+              command: 'liveRefreshRejected',
+              reason: 'Live requires a read-only query — run a SELECT first.',
+            });
+            return;
+          }
+          try {
+            await startLiveRefresh(document, webview, message.intervalMs);
+          } catch (err) {
+            webview.postMessage({ command: 'error', message: (err as Error).message });
+          }
+        } else {
+          try {
+            await stopLiveRefresh(document, webview);
+          } catch (err) {
+            webview.postMessage({ command: 'error', message: (err as Error).message });
+          }
+        }
+        return;
+      }
+
+      if (message.command === 'setLiveRefreshInterval') {
+        if (!document.liveRefreshEnabled || !document.liveRefreshController) return;
+        const intervalMs = clampIntervalMs(message.intervalMs);
+        document.liveRefreshIntervalMs = intervalMs;
+        document.liveRefreshController.setIntervalMs(intervalMs);
+        webview.postMessage({ command: 'liveRefreshIntervalSet', intervalMs });
+        return;
+      }
+
+      if (message.command === 'runCombinedQuery') {
+        if (running) return;
+        running = true;
+        try {
+          const { sql, timeColumn } = await document.file.buildCombinedQuery(message.table);
+          document.lastSql = sql;
+          document.lastQueriedBaseTable = message.table;
+          document.combinedQueryMap.set(sql, message.table);
+          document.statsCache.clear();
+
+          const result = await document.file.runQuery(sql);
+          // Never editable — a UNION/subquery, not a plain single-table
+          // SELECT, independent of Live state (checkEditableSelect's own
+          // structural gate already excludes it; this just avoids the
+          // round-trip to re-derive that for a query the extension itself
+          // built and already knows the shape of).
+          document.lastEditableTable = undefined;
+          document.lastEditableColumns = undefined;
+
+          webview.postMessage({
+            command: 'queryResult',
+            ...result,
+            diffSkipped: true,
+            hasLimit: false,
+            editable: false,
+            editableTable: undefined,
+            timeColumnWarning: timeColumn
+              ? undefined
+              : 'No shared time column found between hot and cold — showing an unbounded union instead of a tail window.',
+          });
+        } catch (err) {
+          webview.postMessage({ command: 'error', message: (err as Error).message });
+        } finally {
+          running = false;
+        }
         return;
       }
 
@@ -354,6 +775,20 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
         if (running) return;
         running = true;
         try {
+          // Re-validated on every manual Run while Live stays engaged, not
+          // just at the moment the toggle was flipped on — a new query can
+          // replace lastSql mid-session. The read-only reconnect used for
+          // live ticks is what actually prevents a write from executing;
+          // this just turns "runs forever, fails every tick, spins into
+          // backoff" into a clear, immediate message.
+          if (document.liveRefreshEnabled && !looksReadOnly(message.sql)) {
+            webview.postMessage({
+              command: 'error',
+              message: 'Live is on, so this file is open read-only — turn off Live to run write statements.',
+            });
+            return;
+          }
+
           const destructive = isDestructiveStatement(message.sql);
           if (document.safeMode && destructive) {
             const firstWord = message.sql.trim().match(/^[a-zA-Z]+/)?.[0] ?? 'this statement';
@@ -389,6 +824,8 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
           const editability = destructive ? { editable: false } : await document.file.checkEditableSelect(message.sql);
           document.lastEditableTable = editability.editable ? editability.table : undefined;
           document.lastEditableColumns = editability.editable ? editability.columns : undefined;
+          document.lastQueriedBaseTable =
+            document.combinedQueryMap.get(message.sql) ?? (editability.editable ? editability.table : undefined);
 
           webview.postMessage({
             command: 'queryResult',

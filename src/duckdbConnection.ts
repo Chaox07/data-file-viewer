@@ -54,6 +54,18 @@ export interface DescriptiveStats {
 
 export type FileKind = 'duckdb' | 'parquet' | 'sqlite' | 'csv' | 'dta' | 'kdb';
 
+export interface DuckDbFileOpenOptions {
+  /** Request read-only up front (live-refresh reconnects) instead of trying read-write first. */
+  forceReadOnly?: boolean;
+  /** Absolute path to the other half of a hot/cold pair, if one was found — see duckdbEditorProvider.ts's sibling detection. */
+  siblingPath?: string;
+}
+
+/** A poll-cadence hint published by a writer into `sheet_metadata.extra_json` (see alpaca_extractor.py's `_sheet_metadata_extra_json`). */
+export interface PollCadenceHint {
+  livePollSeconds: number;
+}
+
 function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
 }
@@ -312,18 +324,24 @@ export class DuckDbFile {
     private readonly kind: FileKind,
     private readonly catalogName: string,
     private readonly mainObjectName: string,
-    private readonly readOnly: boolean
+    private readonly readOnly: boolean,
+    private readonly siblingCatalogName: string | undefined,
+    private readonly siblingIsSqlite: boolean = false
   ) {}
 
   isReadOnly(): boolean {
     return this.readOnly;
   }
 
+  hasSibling(): boolean {
+    return this.siblingCatalogName !== undefined;
+  }
+
   private isFlatFileKind(): boolean {
     return this.kind === 'parquet' || this.kind === 'csv' || this.kind === 'dta';
   }
 
-  static async open(path: string, forceKind?: FileKind): Promise<DuckDbFile> {
+  static async open(path: string, forceKind?: FileKind, options?: DuckDbFileOpenOptions): Promise<DuckDbFile> {
     // kdb+ files are extensionless (see kdbParser.ts) so they can't be
     // sniffed by suffix like every other kind below -- the caller (the
     // dedicated kdb+ explorer-context command, see duckdbEditorProvider.ts)
@@ -338,35 +356,51 @@ export class DuckDbFile {
     const isSqlite = path.toLowerCase().endsWith('.db') || path.toLowerCase().endsWith('.sqlite');
     const useMemory = isParquet || isCsv || isDta || isSqlite;
     const kind: FileKind = isParquet ? 'parquet' : isCsv ? 'csv' : isDta ? 'dta' : isSqlite ? 'sqlite' : 'duckdb';
+    // Live-refresh reconnects request read-only up front rather than trying
+    // read-write first and falling back on a lock conflict — there's never a
+    // reason for a live tick to want read-write, and going through the
+    // fallback path could momentarily grab the write lock and stall the
+    // actual writer process (the scraper/extractor) before falling back.
+    const forceReadOnly = options?.forceReadOnly === true;
 
     let instance: DuckDBInstance;
     let readOnly = false;
-    try {
-      // Neither a .parquet nor a .db/.sqlite (SQLite) file is itself a
-      // DuckDB database — open an in-memory instance and expose the file's
-      // data through it instead (view / ATTACH, below).
-      instance = await DuckDBInstance.create(useMemory ? ':memory:' : path);
-    } catch (err) {
-      // A lock conflict on the direct (non-memory) path means another
-      // process already has this exact file open — most commonly, this
-      // extension's own backup_cmp attachment elsewhere (see createBackup)
-      // holding it read-only. Since DuckDB itself suggests read-only mode
-      // is available in that case, fall back to it instead of failing
-      // outright — better to show the data than nothing.
-      if (!useMemory && isLockConflict(err)) {
-        try {
-          instance = await DuckDBInstance.create(path, { access_mode: 'READ_ONLY' });
-          readOnly = true;
-        } catch (roErr) {
-          throw new Error(
-            `This file is already open elsewhere and could not be opened read-only either: ${
-              roErr instanceof Error ? roErr.message : String(roErr)
-            }`
-          );
-        }
-      } else {
+    if (!useMemory && forceReadOnly) {
+      try {
+        instance = await DuckDBInstance.create(path, { access_mode: 'READ_ONLY' });
+        readOnly = true;
+      } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        throw new Error(`Could not open "${path}": ${message}`);
+        throw new Error(`Could not open "${path}" read-only: ${message}`);
+      }
+    } else {
+      try {
+        // Neither a .parquet nor a .db/.sqlite (SQLite) file is itself a
+        // DuckDB database — open an in-memory instance and expose the file's
+        // data through it instead (view / ATTACH, below).
+        instance = await DuckDBInstance.create(useMemory ? ':memory:' : path);
+      } catch (err) {
+        // A lock conflict on the direct (non-memory) path means another
+        // process already has this exact file open — most commonly, this
+        // extension's own backup_cmp attachment elsewhere (see createBackup)
+        // holding it read-only. Since DuckDB itself suggests read-only mode
+        // is available in that case, fall back to it instead of failing
+        // outright — better to show the data than nothing.
+        if (!useMemory && isLockConflict(err)) {
+          try {
+            instance = await DuckDBInstance.create(path, { access_mode: 'READ_ONLY' });
+            readOnly = true;
+          } catch (roErr) {
+            throw new Error(
+              `This file is already open elsewhere and could not be opened read-only either: ${
+                roErr instanceof Error ? roErr.message : String(roErr)
+              }`
+            );
+          }
+        } else {
+          const message = err instanceof Error ? err.message : String(err);
+          throw new Error(`Could not open "${path}": ${message}`);
+        }
       }
     }
     const connection = await instance.connect();
@@ -417,16 +451,21 @@ export class DuckDbFile {
         );
       }
       const filePath = path.replace(/'/g, "''");
-      try {
-        await connection.run(`attach '${filePath}' as "${mainObjectName}" (type sqlite)`);
-      } catch (err) {
-        // Same fallback as the direct .duckdb path above, for attached
-        // SQLite files (a .db/.sqlite backup file attached elsewhere).
-        if (isLockConflict(err)) {
-          await connection.run(`attach '${filePath}' as "${mainObjectName}" (type sqlite, read_only)`);
-          readOnly = true;
-        } else {
-          throw err;
+      if (forceReadOnly) {
+        await connection.run(`attach '${filePath}' as "${mainObjectName}" (type sqlite, read_only)`);
+        readOnly = true;
+      } else {
+        try {
+          await connection.run(`attach '${filePath}' as "${mainObjectName}" (type sqlite)`);
+        } catch (err) {
+          // Same fallback as the direct .duckdb path above, for attached
+          // SQLite files (a .db/.sqlite backup file attached elsewhere).
+          if (isLockConflict(err)) {
+            await connection.run(`attach '${filePath}' as "${mainObjectName}" (type sqlite, read_only)`);
+            readOnly = true;
+          } else {
+            throw err;
+          }
         }
       }
       await connection.run(`use "${mainObjectName}"`);
@@ -435,7 +474,57 @@ export class DuckDbFile {
     const catalogReader = await connection.runAndReadAll('select current_database()');
     const catalogName = String(catalogReader.getRows()[0][0]);
 
-    return new DuckDbFile(connection, path, kind, catalogName, mainObjectName, readOnly);
+    // Combined hot+cold view support: a sibling file (the other half of a
+    // hot/cold pair — see duckdbEditorProvider.ts's sibling detection) gets
+    // ATTACHed under its own alias, always read-only regardless of whether
+    // the primary connection is, so a live tick can never end up holding a
+    // write lock on the sibling file via a connection whose primary handle
+    // is read-only but whose attached catalog isn't. Best-effort: if the
+    // sibling has vanished or isn't actually a valid database file, skip it
+    // silently rather than failing the whole open — the primary file is
+    // still perfectly usable without it.
+    let siblingCatalogName: string | undefined;
+    let siblingIsSqlite = false;
+    if (options?.siblingPath) {
+      const attached = await DuckDbFile.tryAttachSibling(connection, options.siblingPath);
+      siblingCatalogName = attached?.alias;
+      siblingIsSqlite = attached?.isSqlite ?? false;
+    }
+
+    return new DuckDbFile(connection, path, kind, catalogName, mainObjectName, readOnly, siblingCatalogName, siblingIsSqlite);
+  }
+
+  private static async tryAttachSibling(
+    connection: DuckDBConnection,
+    siblingPath: string
+  ): Promise<{ alias: string; isSqlite: boolean } | undefined> {
+    const isSiblingSqlite = siblingPath.toLowerCase().endsWith('.db') || siblingPath.toLowerCase().endsWith('.sqlite');
+    const alias = 'sibling';
+    try {
+      const filePath = siblingPath.replace(/'/g, "''");
+      if (isSiblingSqlite) {
+        await connection.run(`install sqlite`);
+        await connection.run(`load sqlite`);
+        await connection.run(`attach '${filePath}' as ${quoteIdent(alias)} (type sqlite, read_only)`);
+      } else {
+        await connection.run(`attach '${filePath}' as ${quoteIdent(alias)} (read_only)`);
+      }
+      // Confirms the attach actually mounted a readable database (and not,
+      // say, an empty/corrupt file that ATTACH accepted but nothing else
+      // can query) before this file is trusted as a real combined-view
+      // source — a cheap probe now avoids a confusing failure on first use.
+      await connection.runAndReadAll(
+        `select table_name from information_schema.tables where table_catalog = ${quoteLiteral(alias)} limit 1`
+      );
+      return { alias, isSqlite: isSiblingSqlite };
+    } catch {
+      try {
+        await connection.run(`detach ${quoteIdent(alias)}`);
+      } catch {
+        // Attach itself never succeeded — nothing to detach.
+      }
+      return undefined;
+    }
   }
 
   /** Reads a real kdb+ table (see kdbParser.ts) and loads it into a fresh in-memory table. */
@@ -456,7 +545,7 @@ export class DuckDbFile {
     const catalogReader = await connection.runAndReadAll('select current_database()');
     const catalogName = String(catalogReader.getRows()[0][0]);
 
-    return new DuckDbFile(connection, path, 'kdb', catalogName, mainObjectName, false);
+    return new DuckDbFile(connection, path, 'kdb', catalogName, mainObjectName, false, undefined);
   }
 
   async listTables(): Promise<string[]> {
@@ -466,6 +555,136 @@ export class DuckDbFile {
       `select table_name from information_schema.tables where table_catalog = current_database() order by table_name`
     );
     return reader.getRows().map((row) => String(row[0]));
+  }
+
+  async listSiblingTables(): Promise<string[]> {
+    if (!this.siblingCatalogName) return [];
+    const reader = await this.connection.runAndReadAll(
+      `select table_name from information_schema.tables where table_catalog = ${quoteLiteral(
+        this.siblingCatalogName
+      )} order by table_name`
+    );
+    return reader.getRows().map((row) => String(row[0]));
+  }
+
+  /** Table names present on both sides of an attached hot/cold pair -- the set eligible for a synthesized `<table>_combined` entry. */
+  async getCombinableTableNames(): Promise<string[]> {
+    if (!this.siblingCatalogName) return [];
+    const mainTables = new Set(await this.listTables());
+    const siblingTables = await this.listSiblingTables();
+    return siblingTables.filter((t) => mainTables.has(t));
+  }
+
+  private async getColumnNames(table: string, catalog: string): Promise<string[]> {
+    const reader = await this.connection.runAndReadAll(
+      `select column_name from information_schema.columns where table_catalog = ${quoteLiteral(
+        catalog
+      )} and table_name = ${quoteLiteral(table)} order by ordinal_position`
+    );
+    return reader.getRows().map((r) => String(r[0]));
+  }
+
+  // Both writers this format targets (alpaca_extractor.py, and any future
+  // one following the same convention) use one of these column names for
+  // their time axis -- not stored anywhere in sheet_metadata as a distinct
+  // "this is the time column" field, so this is a fixed allow-list rather
+  // than something pulled from untrusted file content. Intentionally
+  // conservative: a table using a differently-named time column just means
+  // the combined view falls back to unbounded (see buildCombinedQuery).
+  private static readonly TIME_COLUMN_CANDIDATES = ['Datetime', 'Date', 'scraped_at'];
+  private static readonly DEFAULT_COMBINED_LIMIT = 500;
+
+  /** Resolves the time column shared by both sides of a combined pair. Returns null if hot/cold don't share any of the conventional candidates. */
+  private async resolveTimeColumn(table: string): Promise<string | null> {
+    if (!this.siblingCatalogName) return null;
+    const [mainCols, siblingCols] = await Promise.all([
+      this.getColumnNames(table, this.catalogName),
+      this.getColumnNames(table, this.siblingCatalogName),
+    ]);
+    const shared = new Set(mainCols.filter((c) => siblingCols.includes(c)));
+    for (const candidate of DuckDbFile.TIME_COLUMN_CANDIDATES) {
+      if (shared.has(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  /**
+   * Builds the synthesized `<table>_combined` query: a tail window (the N
+   * most recent rows across both sides, re-sorted back into chronological
+   * order for display — see the design notes on why a flat `DESC LIMIT N`
+   * alone would show the tail backwards) when a shared time column can be
+   * resolved, or an unbounded union when it can't. Both the table name and
+   * the resolved time column are identifiers backed by `quoteIdent`
+   * (standard `"` doubling) since both ultimately come from a file's own
+   * catalog, not typed user input.
+   */
+  async buildCombinedQuery(
+    table: string,
+    limitN: number = DuckDbFile.DEFAULT_COMBINED_LIMIT
+  ): Promise<{ sql: string; timeColumn: string | null }> {
+    if (!this.siblingCatalogName) throw new Error('No sibling attached — buildCombinedQuery requires one.');
+    const mainRef = `${quoteIdent(this.catalogName)}.main.${quoteIdent(table)}`;
+    const siblingRef = `${quoteIdent(this.siblingCatalogName)}.main.${quoteIdent(table)}`;
+    const union = `select *, false as is_hot from ${mainRef}\n  union all by name\n  select *, true as is_hot from ${siblingRef}`;
+
+    const timeColumn = await this.resolveTimeColumn(table);
+    if (!timeColumn) {
+      return { sql: `select *\nfrom (\n  ${union}\n) as _combined`, timeColumn: null };
+    }
+    const col = quoteIdent(timeColumn);
+    const safeLimit = Number.isInteger(limitN) && limitN > 0 ? limitN : DuckDbFile.DEFAULT_COMBINED_LIMIT;
+    const sql = `select * from (\n  select *\n  from (\n    ${union}\n  ) as _union\n  order by ${col} desc\n  limit ${safeLimit}\n) as _combined\norder by ${col} asc`;
+    return { sql, timeColumn };
+  }
+
+  private isMainHot(): boolean {
+    return this.kind === 'sqlite';
+  }
+
+  /**
+   * Best-effort read of a writer-published poll-cadence hint (see
+   * alpaca_extractor.py's `_sheet_metadata_extra_json` `live_poll_seconds`
+   * key) — checked on the hot side first regardless of whether that's the
+   * primary file or the attached sibling, since it's the side actually
+   * setting the meaningful cadence. Returns null (not a thrown error) for
+   * any failure: no sheet_metadata table, no row for this table, invalid
+   * JSON, or a non-numeric/non-positive value — this value comes from a
+   * file's own JSON blob, exactly as untrusted as anything else pulled from
+   * file content elsewhere in this class, so a corrupt or crafted value
+   * must never propagate past this method as anything other than "no hint".
+   */
+  async getPollCadenceSeconds(table: string): Promise<number | null> {
+    const candidates: string[] = [];
+    // Hot side first.
+    if (this.isMainHot()) candidates.push(this.catalogName);
+    if (this.siblingCatalogName && this.siblingIsSqlite) candidates.push(this.siblingCatalogName);
+    // Then whatever's left, in case the "hot" convention doesn't hold for a
+    // future writer this wasn't designed against.
+    if (!this.isMainHot()) candidates.push(this.catalogName);
+    if (this.siblingCatalogName && !this.siblingIsSqlite) candidates.push(this.siblingCatalogName);
+
+    for (const catalog of candidates) {
+      const value = await this.readPollCadenceFromCatalog(table, catalog);
+      if (value !== null) return value;
+    }
+    return null;
+  }
+
+  private async readPollCadenceFromCatalog(table: string, catalog: string): Promise<number | null> {
+    try {
+      const reader = await this.connection.runAndReadAll(
+        `select extra_json from ${quoteIdent(catalog)}.main.sheet_metadata where table_name = ${quoteLiteral(table)}`
+      );
+      const rows = reader.getRows();
+      if (rows.length === 0) return null;
+      const raw = rows[0][0];
+      if (typeof raw !== 'string') return null;
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const value = parsed.live_poll_seconds;
+      return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+    } catch {
+      return null;
+    }
   }
 
   async runQuery(sql: string): Promise<QueryResult> {

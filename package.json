@@ -77,6 +77,17 @@
           "default": 50000,
           "minimum": 1,
           "description": "Above this many rows, automatic diff-against-backup highlighting is skipped after a query — use \"Diff anyway\" to run it on demand instead."
+        },
+        "dataFileViewer.liveRefreshIntervalMs": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 250,
+          "description": "Default Live refresh interval (milliseconds) used when a document has no auto-detected sheet_metadata poll-cadence hint. Also acts as a minimum spacing floor between live ticks."
+        },
+        "dataFileViewer.debugLiveRefresh": {
+          "type": "boolean",
+          "default": false,
+          "description": "Log Live refresh internals (stat-gate skips, watcher/timer triggers, backoff, auto-detect cache hits) to the \"Data File Viewer: Live Refresh\" output channel."
         }
       }
     },

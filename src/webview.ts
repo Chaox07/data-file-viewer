@@ -23,16 +23,22 @@ interface QueryResultFields {
   hasLimit: boolean;
   editable: boolean;
   editableTable?: string;
+  timeColumnWarning?: string;
 }
 
 type ExtensionMessage =
-  | { command: 'tables'; tables: string[] }
+  | { command: 'tables'; tables: string[]; combinedTableNames: string[] }
   | ({ command: 'queryResult' } & QueryResultFields)
   | ({ command: 'sortQueryResult' } & QueryResultFields)
   | { command: 'error'; message: string }
   | { command: 'backupStatus'; message: string }
   | { command: 'tableChangeStatus'; status: Record<string, TableStatus> }
   | { command: 'safeModeState'; safeMode: boolean }
+  | { command: 'liveRefreshStarted'; intervalMs: number; suggestedIntervalSeconds: number | null }
+  | { command: 'liveRefreshStopped' }
+  | { command: 'liveRefreshRejected'; reason: string }
+  | { command: 'liveRefreshIntervalSet'; intervalMs: number }
+  | ({ command: 'liveTick'; lastUpdatedMs: number; stale: boolean; unchanged: boolean } & { result?: QueryResultFields })
   | {
       command: 'columnStatsResult';
       column: string;
@@ -69,7 +75,7 @@ root.innerHTML = `
     <div class="main">
       <div class="editor-toolbar">
         <button id="run-btn" title="Run (Ctrl/Cmd+Enter)">Run &#9654;</button>
-        <label class="toolbar-check" title="Blocks write/destructive statements until unchecked">
+        <label id="safe-mode-label" class="toolbar-check" title="Blocks write/destructive statements until unchecked">
           <input type="checkbox" id="safe-mode-check" checked /> Safe Mode
         </label>
         <span id="unlock-options" class="unlock-options" hidden>
@@ -81,6 +87,18 @@ root.innerHTML = `
           </label>
         </span>
         <span id="status" class="status"></span>
+        <span class="toolbar-right">
+          <label class="toolbar-radio" title="Static snapshot — re-run manually">
+            <input type="radio" name="live-mode" id="mode-static-radio" checked /> Static
+          </label>
+          <label class="toolbar-radio" title="Re-run the current query automatically as the file changes">
+            <input type="radio" name="live-mode" id="mode-live-radio" /> Live
+          </label>
+          <span id="live-options" hidden>
+            every <input type="number" id="live-interval-input" min="0.25" step="0.25" value="2" title="Refresh interval, seconds" />s
+          </span>
+          <span id="live-status" class="live-status"></span>
+        </span>
       </div>
       <div id="editor" class="editor"></div>
       <div id="results" class="results"></div>
@@ -93,13 +111,29 @@ const resultsEl = document.getElementById('results') as HTMLDivElement;
 const statusEl = document.getElementById('status') as HTMLSpanElement;
 const runBtn = document.getElementById('run-btn') as HTMLButtonElement;
 const safeModeCheck = document.getElementById('safe-mode-check') as HTMLInputElement;
+const safeModeLabel = document.getElementById('safe-mode-label') as HTMLLabelElement;
 const backupCheck = document.getElementById('backup-check') as HTMLInputElement;
 const checkChangesCheck = document.getElementById('check-changes-check') as HTMLInputElement;
 const unlockOptionsEl = document.getElementById('unlock-options') as HTMLSpanElement;
+const modeStaticRadio = document.getElementById('mode-static-radio') as HTMLInputElement;
+const modeLiveRadio = document.getElementById('mode-live-radio') as HTMLInputElement;
+const liveOptionsEl = document.getElementById('live-options') as HTMLSpanElement;
+const liveIntervalInput = document.getElementById('live-interval-input') as HTMLInputElement;
+const liveStatusEl = document.getElementById('live-status') as HTMLSpanElement;
 
 let running = false;
 let lastResult: LastResult | undefined;
 let sortState: { columnIndex: number; direction: 'asc' | 'desc' } | undefined;
+let combinedTableNames = new Set<string>();
+let liveEnabled = false;
+let liveLastUpdatedMs: number | undefined;
+let liveStale = false;
+let liveStatusTicker: number | undefined;
+// Sliding-tail scroll behavior for live combined views: only auto-follow
+// new rows in (log-tail style) when the user was already at the bottom —
+// otherwise a live tick would repeatedly yank someone inspecting history
+// back down to the newest row.
+let pinnedToBottom = true;
 
 function setRunning(value: boolean): void {
   running = value;
@@ -154,6 +188,14 @@ function runQuery(sqlText: string): void {
   vscode.postMessage({ command: 'runQuery', sql: trimmed });
 }
 
+function runCombinedQuery(baseTable: string): void {
+  if (running) return;
+  setRunning(true);
+  statusEl.textContent = 'Running…';
+  setEditorText(`-- combined hot+cold view of "${baseTable}" (synthesized, read-only)`);
+  vscode.postMessage({ command: 'runCombinedQuery', table: baseTable });
+}
+
 runBtn.addEventListener('click', () => {
   if (running) {
     vscode.postMessage({ command: 'cancelQuery' });
@@ -176,7 +218,77 @@ safeModeCheck.addEventListener('change', sendToggleSafeMode);
 backupCheck.addEventListener('change', sendToggleSafeMode);
 checkChangesCheck.addEventListener('change', sendToggleSafeMode);
 
-function renderTables(tables: string[]): void {
+function setLiveUiEnabled(enabled: boolean): void {
+  liveEnabled = enabled;
+  modeLiveRadio.checked = enabled;
+  modeStaticRadio.checked = !enabled;
+  liveOptionsEl.hidden = !enabled;
+  // Mutually exclusive with Safe Mode in the UI, not just logically — a
+  // live-refreshing view of a file another process is actively writing
+  // isn't a sensible place to also be toggling backup/diff semantics, and
+  // cell editing is locked out server-side regardless while live.
+  safeModeLabel.hidden = enabled;
+  unlockOptionsEl.hidden = enabled || safeModeCheck.checked;
+  if (!enabled) {
+    liveStatusEl.textContent = '';
+    liveStatusEl.className = 'live-status';
+    stopLiveStatusTicker();
+  }
+}
+
+function stopLiveStatusTicker(): void {
+  if (liveStatusTicker !== undefined) {
+    window.clearInterval(liveStatusTicker);
+    liveStatusTicker = undefined;
+  }
+}
+
+function formatAgo(ms: number): string {
+  const seconds = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${seconds % 60}s ago`;
+}
+
+function updateLiveStatusText(): void {
+  if (!liveEnabled) return;
+  const agoText = liveLastUpdatedMs !== undefined ? `updated ${formatAgo(liveLastUpdatedMs)}` : 'waiting for first update…';
+  liveStatusEl.textContent = liveStale ? `Live · stale, last ${agoText}` : `Live · ${agoText}`;
+  liveStatusEl.className = `live-status ${liveStale ? 'live-status-stale' : 'live-status-active'}`;
+}
+
+function startLiveStatusTicker(): void {
+  stopLiveStatusTicker();
+  updateLiveStatusText();
+  // Purely a local display refresh for "updated Xs ago" — the actual data
+  // refresh cadence is driven entirely by the extension host, independent
+  // of this.
+  liveStatusTicker = window.setInterval(updateLiveStatusText, 1000);
+}
+
+function sendToggleLiveRefresh(enabled: boolean): void {
+  const intervalMs = Math.round(Number(liveIntervalInput.value || '2') * 1000);
+  vscode.postMessage({ command: 'toggleLiveRefresh', enabled, intervalMs: enabled ? intervalMs : undefined });
+}
+
+modeLiveRadio.addEventListener('change', () => {
+  if (modeLiveRadio.checked) sendToggleLiveRefresh(true);
+});
+modeStaticRadio.addEventListener('change', () => {
+  if (modeStaticRadio.checked) {
+    setLiveUiEnabled(false);
+    sendToggleLiveRefresh(false);
+  }
+});
+
+liveIntervalInput.addEventListener('change', () => {
+  if (!liveEnabled) return;
+  const intervalMs = Math.round(Number(liveIntervalInput.value || '2') * 1000);
+  vscode.postMessage({ command: 'setLiveRefreshInterval', intervalMs });
+});
+
+function renderTables(tables: string[], combined: string[]): void {
+  combinedTableNames = new Set(combined);
   tableListEl.innerHTML = '';
   for (const name of tables) {
     const item = document.createElement('div');
@@ -184,6 +296,15 @@ function renderTables(tables: string[]): void {
     item.textContent = name;
     item.dataset.table = name;
     item.addEventListener('click', () => {
+      if (combinedTableNames.has(name)) {
+        // Not a real table — a synthesized hot+cold union built server-side
+        // (see duckdbConnection.ts's buildCombinedQuery); the extension
+        // rebuilds and runs it directly rather than the usual
+        // `SELECT * FROM "<name>"`, which wouldn't resolve to anything.
+        const baseTable = name.slice(0, -'_combined'.length);
+        runCombinedQuery(baseTable);
+        return;
+      }
       const sqlText = `SELECT * FROM "${name}" LIMIT 100;`;
       setEditorText(sqlText);
       runQuery(sqlText);
@@ -518,8 +639,102 @@ function openCellInspector(rowIdx: number, colIdx: number): void {
   };
 }
 
-function renderResults(): void {
+// Windowed/virtualized rendering: above VIRTUALIZE_THRESHOLD rows, only the
+// rows in (or just outside) the visible viewport get real <tr> DOM nodes —
+// two spacer rows stand in for the skipped rows above/below, sized so the
+// native scrollbar behaves as if every row were present. This matters most
+// for a live view that can re-run every tick, and especially the combined
+// hot+cold view where the result can hold real history.
+const VIRTUALIZE_THRESHOLD = 200;
+const VIRTUAL_OVERSCAN = 8;
+let measuredRowHeight = 25; // corrected from a real rendered row below; this is just the initial estimate
+let virtualState: { order: number[]; rowHeight: number } | undefined;
+let virtualRenderScheduled = false;
+
+function buildRowElement(i: number, displayIdx: number): HTMLTableRowElement {
+  const { rows, cellChanged, rowIsNew, columnStatsKind } = lastResult!;
+  const row = rows[i];
+  const tr = document.createElement('tr');
+  tr.className = displayIdx % 2 === 0 ? 'even' : 'odd';
+  const isNewRow = rowIsNew?.[i] === true;
+  if (isNewRow) tr.classList.add('row-new');
+  row.forEach((value, j) => {
+    const td = document.createElement('td');
+    td.textContent = formatValue(value, columnStatsKind[j]);
+    if (value === null || value === undefined) td.classList.add('cell-null');
+    if (!isNewRow && cellChanged?.[i]?.[j]) td.classList.add('cell-changed');
+    td.addEventListener('dblclick', () => openCellInspector(i, j));
+    tr.appendChild(td);
+  });
+  return tr;
+}
+
+function appendSpacerRow(tbody: HTMLTableSectionElement, heightPx: number, colCount: number): void {
+  if (heightPx <= 0) return;
+  const tr = document.createElement('tr');
+  tr.className = 'spacer-row';
+  tr.style.height = `${heightPx}px`;
+  const td = document.createElement('td');
+  td.colSpan = colCount;
+  td.style.padding = '0';
+  td.style.border = 'none';
+  tr.appendChild(td);
+  tbody.appendChild(tr);
+}
+
+function renderVirtualWindow(): void {
+  if (!virtualState || !lastResult) return;
+  const tbody = resultsEl.querySelector('tbody');
+  if (!tbody) return;
+  const { order, rowHeight } = virtualState;
+  const scrollTop = resultsEl.scrollTop;
+  const viewportH = resultsEl.clientHeight || 400;
+  const start = Math.max(0, Math.floor(scrollTop / rowHeight) - VIRTUAL_OVERSCAN);
+  const end = Math.min(order.length, Math.ceil((scrollTop + viewportH) / rowHeight) + VIRTUAL_OVERSCAN);
+  tbody.innerHTML = '';
+  appendSpacerRow(tbody, start * rowHeight, lastResult.columns.length);
+  const frag = document.createDocumentFragment();
+  for (let displayIdx = start; displayIdx < end; displayIdx++) {
+    frag.appendChild(buildRowElement(order[displayIdx], displayIdx));
+  }
+  tbody.appendChild(frag);
+  appendSpacerRow(tbody, (order.length - end) * rowHeight, lastResult.columns.length);
+}
+
+// Attached once, not per-render — renderResults() below fully rebuilds
+// #results' contents on every call, which would orphan a listener declared
+// there. Reads whatever `virtualState`/`lastResult` currently hold instead.
+resultsEl.addEventListener('scroll', () => {
+  // Pinned-to-bottom tracking for live mode's sliding tail window: only
+  // auto-follow new rows in when the user was already at the bottom (log
+  // tail/chat-scroll convention) — otherwise a live tick would repeatedly
+  // yank someone inspecting history back down to the newest row.
+  pinnedToBottom = resultsEl.scrollTop + resultsEl.clientHeight >= resultsEl.scrollHeight - 4;
+  if (virtualRenderScheduled) return;
+  virtualRenderScheduled = true;
+  requestAnimationFrame(() => {
+    virtualRenderScheduled = false;
+    renderVirtualWindow();
+  });
+});
+
+/**
+ * `preserveScroll` is used for live ticks re-rendering the *same* ongoing
+ * query — a fresh manual query/sort always starts scrolled to the top
+ * (the default, `false`). Scroll position is preserved by raw pixel offset,
+ * not by anchoring to a specific row's identity — a live tail's `LIMIT N`
+ * window means the oldest visible row can drop out from under a fixed
+ * index between ticks, so pixel-offset preservation is an approximation,
+ * not a guarantee the exact same row stays under the cursor. Good enough
+ * for the common case (a handful of new rows per tick); true identity-based
+ * anchoring would be a further refinement.
+ */
+function renderResults(preserveScroll = false): void {
+  const preservedScrollTop = preserveScroll ? resultsEl.scrollTop : 0;
+  const wasPinnedToBottom = preserveScroll && pinnedToBottom;
+
   resultsEl.innerHTML = '';
+  virtualState = undefined;
   if (!lastResult) return;
   const { columns, rows, cellChanged, rowIsNew, renamedColumns, columnStatsKind } = lastResult;
 
@@ -595,29 +810,16 @@ function renderResults(): void {
   table.appendChild(thead);
 
   const tbody = document.createElement('tbody');
-  const rowsFragment = document.createDocumentFragment();
   const order = computeDisplayOrder();
-  order.forEach((i, displayIdx) => {
-    const row = rows[i];
-    const tr = document.createElement('tr');
-    tr.className = displayIdx % 2 === 0 ? 'even' : 'odd';
-    const isNewRow = rowIsNew?.[i] === true;
-    if (isNewRow) tr.classList.add('row-new');
-    row.forEach((value, j) => {
-      const td = document.createElement('td');
-      td.textContent = formatValue(value, columnStatsKind[j]);
-      if (value === null || value === undefined) {
-        td.classList.add('cell-null');
-      }
-      if (!isNewRow && cellChanged?.[i]?.[j]) {
-        td.classList.add('cell-changed');
-      }
-      td.addEventListener('dblclick', () => openCellInspector(i, j));
-      tr.appendChild(td);
-    });
-    rowsFragment.appendChild(tr);
-  });
-  tbody.appendChild(rowsFragment);
+  const useVirtual = order.length > VIRTUALIZE_THRESHOLD;
+
+  if (!useVirtual) {
+    const frag = document.createDocumentFragment();
+    order.forEach((i, displayIdx) => frag.appendChild(buildRowElement(i, displayIdx)));
+    tbody.appendChild(frag);
+  } else {
+    virtualState = { order, rowHeight: measuredRowHeight };
+  }
   table.appendChild(tbody);
   resultsEl.appendChild(table);
 
@@ -643,6 +845,24 @@ function renderResults(): void {
   }
 
   resultsEl.appendChild(footer);
+
+  if (useVirtual) {
+    resultsEl.scrollTop = preservedScrollTop;
+    renderVirtualWindow();
+    // Correct the row-height estimate from a real rendered row, now that
+    // one exists, and re-render the window against the corrected value —
+    // the initial constant is just a seed for the very first paint.
+    const sample = tbody.querySelector('tr:not(.spacer-row)') as HTMLTableRowElement | null;
+    if (sample) {
+      const h = sample.getBoundingClientRect().height;
+      if (h > 0 && Math.abs(h - measuredRowHeight) > 0.5) {
+        measuredRowHeight = h;
+        if (virtualState) virtualState.rowHeight = h;
+        renderVirtualWindow();
+      }
+    }
+    if (wasPinnedToBottom) resultsEl.scrollTop = resultsEl.scrollHeight;
+  }
 }
 
 function addThousandsSeparators(digits: string): string {
@@ -682,11 +902,11 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
   const message = event.data;
   switch (message.command) {
     case 'tables':
-      renderTables(message.tables);
+      renderTables(message.tables, message.combinedTableNames);
       break;
     case 'queryResult':
       setRunning(false);
-      statusEl.textContent = '';
+      statusEl.textContent = message.timeColumnWarning ?? '';
       lastResult = {
         columns: message.columns,
         rows: message.rows,
@@ -700,6 +920,10 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
         editableTable: message.editableTable,
       };
       sortState = undefined;
+      // A brand-new query result (not a live tick re-running the same one)
+      // always starts scrolled to the top — "pinned to bottom" only matters
+      // once this same query starts live-ticking.
+      pinnedToBottom = false;
       renderResults();
       break;
     case 'sortQueryResult':
@@ -735,7 +959,46 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
       break;
     case 'safeModeState':
       safeModeCheck.checked = message.safeMode;
-      unlockOptionsEl.hidden = message.safeMode;
+      unlockOptionsEl.hidden = message.safeMode || liveEnabled;
+      break;
+    case 'liveRefreshStarted':
+      setLiveUiEnabled(true);
+      liveIntervalInput.value = String(message.intervalMs / 1000);
+      liveLastUpdatedMs = undefined;
+      liveStale = false;
+      startLiveStatusTicker();
+      break;
+    case 'liveRefreshStopped':
+      setLiveUiEnabled(false);
+      break;
+    case 'liveRefreshRejected':
+      modeStaticRadio.checked = true;
+      modeLiveRadio.checked = false;
+      statusEl.textContent = message.reason;
+      break;
+    case 'liveRefreshIntervalSet':
+      liveIntervalInput.value = String(message.intervalMs / 1000);
+      break;
+    case 'liveTick':
+      liveLastUpdatedMs = message.lastUpdatedMs;
+      liveStale = message.stale;
+      updateLiveStatusText();
+      if (!message.unchanged && message.result) {
+        const r = message.result;
+        lastResult = {
+          columns: r.columns,
+          rows: r.rows,
+          columnStatsKind: r.columnStatsKind,
+          cellChanged: r.cellChanged,
+          rowIsNew: r.rowIsNew,
+          renamedColumns: r.renamedColumns,
+          diffSkipped: r.diffSkipped,
+          hasLimit: r.hasLimit,
+          editable: r.editable,
+          editableTable: r.editableTable,
+        };
+        renderResults(true); // preserve scroll position / pinned-bottom auto-follow — this is the same ongoing query, not a fresh one
+      }
       break;
     case 'columnStatsResult':
       if (statsPopoverEl && pendingStatsColumn === message.column) {
