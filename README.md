@@ -91,6 +91,53 @@ Every results grid — table previews and hand-written queries alike — gets:
   column's value (there's no universal row-id across table kinds), so a
   table with fully duplicate rows will update all of them together.
 
+### Live mode: watching a file another process is still writing
+
+For files being actively written by an external process — most notably the
+hot/cold pattern used by `web_table_scraper.py` and `alpaca_extractor.py`
+(a small `*_hot.sqlite` file overwritten on every poll, paired with a
+`*.duckdb` file that accumulates the finalized/closed rows) — this extension
+can keep the results grid updating on its own instead of requiring a manual
+re-run of the query.
+
+- **Combined hot+cold view.** Opening either half of such a pair (a
+  `<name>.duckdb` next to a `<name>.sqlite`/`<name>_hot.sqlite`, or vice
+  versa) auto-attaches the other file and adds a `<table>_combined` entry to
+  the sidebar. Clicking it runs a synthesized, read-only query that unions
+  the cold (finalized) rows with the hot (still-forming) rows — tagging each
+  with an `is_hot` column — ordered by whatever time column it can detect,
+  most-recent rows last. No hand-written SQL needed to see both halves as
+  one continuous table.
+- **Static / Live toggle.** The toolbar above the results grid has a
+  Static/Live switch. Live only works against a read-only query (a `SELECT`
+  or `WITH` — including the auto-generated combined query above); trying to
+  turn it on against anything else is rejected with an explanation instead
+  of silently doing nothing. Turning Live on also locks out cell editing
+  until it's turned back off, since it keeps the document's connection
+  read-only so it can safely reconnect on every tick.
+- **Refresh interval.** Editable next to the toggle, in seconds (quarter-second
+  steps, minimum 0.25s). If the table being viewed has a `sheet_metadata`
+  row with a `live_poll_seconds` hint in its `extra_json` — which
+  `alpaca_extractor.py` publishes automatically, set to its own
+  `LIVE_POLL_SECONDS` — that value is used to pre-fill the interval instead
+  of the extension's own default (`dataFileViewer.liveRefreshIntervalMs` in
+  Settings, default 2000ms), so the viewer polls at the same cadence as the
+  process writing the file. You can still override it by hand.
+- **How a tick works.** Each tick watches the file plus its WAL/SHM sidecar
+  files (where the actual writes land under WAL mode) and only does
+  anything once those change on disk. When they do, it opens a fresh
+  read-only connection — DuckDB's own connection doesn't observe another
+  process's commits otherwise — reruns the last query, and reposts the
+  result only if it actually differs from what's already on screen (so a
+  poll that produced no new rows doesn't cause a visible flicker). A status
+  line next to the toggle shows how long ago the last update landed, and
+  switches to "stale" after three consecutive failed ticks (file locked,
+  temporarily missing mid-write, etc.) without turning Live off — it keeps
+  retrying with backoff and clears the stale state itself once a tick
+  succeeds again.
+- Turning Live back off reconnects normally (read-write), so editing works
+  again immediately.
+
 ### Safe Mode and backups
 
 Safe Mode is on by default. Turning it off makes a timestamped backup copy
