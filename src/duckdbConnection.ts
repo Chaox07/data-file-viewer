@@ -19,6 +19,8 @@ export interface QueryResult {
   columns: string[];
   rows: unknown[][];
   columnStatsKind: StatsKind[];
+  /** Set when a maxRows cap actually cut the result short (see runQuery). */
+  truncated?: boolean;
 }
 
 export interface QueryDiff {
@@ -59,11 +61,6 @@ export interface DuckDbFileOpenOptions {
   forceReadOnly?: boolean;
   /** Absolute path to the other half of a hot/cold pair, if one was found — see duckdbEditorProvider.ts's sibling detection. */
   siblingPath?: string;
-}
-
-/** A poll-cadence hint published by a writer into `sheet_metadata.extra_json` (see alpaca_extractor.py's `_sheet_metadata_extra_json`). */
-export interface PollCadenceHint {
-  livePollSeconds: number;
 }
 
 function quoteIdent(name: string): string {
@@ -687,14 +684,30 @@ export class DuckDbFile {
     }
   }
 
-  async runQuery(sql: string): Promise<QueryResult> {
-    // No row cap: whatever the query returns is shown in full. If you want a
-    // bounded preview, write your own LIMIT (e.g. via the sidebar click).
-    const reader = await this.connection.streamAndReadAll(sql);
+  /**
+   * `maxRows <= 0` keeps the historical behaviour: whatever the query returns
+   * is shown in full. Above zero, reading stops early rather than the result
+   * being sliced afterwards -- the cost this cap exists to avoid is
+   * materializing every row into JSON and structured-cloning the lot across
+   * the webview boundary, and a post-hoc slice would still pay both.
+   *
+   * The cap is a parameter rather than a config read because this module
+   * deliberately imports no `vscode`; duckdbEditorProvider owns the setting.
+   */
+  async runQuery(sql: string, maxRows = 0): Promise<QueryResult> {
+    const capped = maxRows > 0;
+    // One past the cap: that extra row is what distinguishes "exactly maxRows
+    // rows exist" from "there were more", without reading the rest.
+    const reader = capped
+      ? await this.connection.streamAndReadUntil(sql, maxRows + 1)
+      : await this.connection.streamAndReadAll(sql);
     const columns = reader.columnNames();
-    const rows = reader.getRowsJson() as unknown[][];
+    let rows = reader.getRowsJson() as unknown[][];
+    // Rows arrive a vector at a time, so a read of maxRows + 1 can overshoot.
+    const truncated = capped && rows.length > maxRows;
+    if (truncated) rows = rows.slice(0, maxRows);
     const columnStatsKind = reader.columnTypes().map((t) => classifyForStats(t.typeId));
-    return { columns, rows, columnStatsKind };
+    return { columns, rows, columnStatsKind, truncated };
   }
 
   /**
@@ -708,14 +721,21 @@ export class DuckDbFile {
    * outside, so "sorted" always means sorted across the whole matching
    * data set, not just whatever happened to already be in memory.
    */
-  async runSortedQuery(baseSql: string, column: string, direction: 'asc' | 'desc'): Promise<QueryResult> {
+  async runSortedQuery(
+    baseSql: string,
+    column: string,
+    direction: 'asc' | 'desc',
+    maxRows = 0
+  ): Promise<QueryResult> {
     const stripped = stripTrailingSemicolon(baseSql);
     const extracted = extractTrailingLimit(stripped);
     const inner = extracted ? extracted.withoutLimit : stripped;
     const col = quoteIdent(column);
     const limitSuffix = extracted ? ` ${extracted.limitClause}` : '';
     const sortedSql = `select * from ${wrapAsSubquery(inner)} as _sorted order by ${col} ${direction} nulls last${limitSuffix}`;
-    return this.runQuery(sortedSql);
+    // The cap applies to the sorted result, so it stays "the true top N by
+    // this column" rather than "N arbitrary rows, then sorted".
+    return this.runQuery(sortedSql, maxRows);
   }
 
   /** Flushes pending writes to disk, then copies the file. Returns the backup path. */

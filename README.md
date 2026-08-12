@@ -149,6 +149,22 @@ above a configurable row count (`dataFileViewer.diffRowThreshold` in
 Settings, default 50,000) this automatic highlighting is skipped for
 performance and replaced with a manual "Diff anyway" button.
 
+While Safe Mode is on, a query is only allowed to run if the whole thing is
+read-only — not just its first word. That means `select 1; drop table x` is
+blocked for containing a second statement, and `with x as (…) delete from t`
+is blocked for the `delete`, even though both open with a safe keyword.
+Comments, text values and quoted column names are ignored when deciding, so
+an ordinary query over a column containing `;` or the word `update` still
+runs.
+
+### Large results
+
+By default every matching row is sent to the view. If very large results feel
+slow, set `dataFileViewer.maxResultRows` (in Settings) to a row count and the
+viewer stops reading past it, noting in the footer that the result was capped.
+Sorting still happens across the full result before the cap applies, so what
+you see is the true top N by that column rather than an arbitrary N re-ordered.
+
 ## Local development
 
 ```sh

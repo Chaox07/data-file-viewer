@@ -354,7 +354,7 @@ class KdbReader {
 
 const HEADER_LEN = 2;
 
-export function parseKdbBuffer(buf: Buffer): KdbTable {
+function parseKdbBuffer(buf: Buffer): KdbTable {
   if (buf.length >= 8 && buf.subarray(0, 8).toString('ascii') === 'kxzipped') {
     throw new Error('This kdb+ file uses on-disk compression ("kxzipped"), which is not supported.');
   }

@@ -21,6 +21,7 @@ interface QueryResultFields {
   renamedColumns?: Record<string, string>;
   diffSkipped: boolean;
   hasLimit: boolean;
+  truncated?: boolean;
   editable: boolean;
   editableTable?: string;
   timeColumnWarning?: string;
@@ -827,6 +828,15 @@ function renderResults(preserveScroll = false): void {
   footer.className = 'results-footer';
   footer.textContent = `${rows.length} row${rows.length === 1 ? '' : 's'} shown`;
 
+  if (lastResult.truncated) {
+    // The count above is the whole story only when nothing was cut -- say so
+    // explicitly, otherwise a capped result reads as the complete answer.
+    const cap = document.createElement('span');
+    cap.className = 'diff-skipped-note';
+    cap.textContent = ' — capped by dataFileViewer.maxResultRows; there are more rows.';
+    footer.appendChild(cap);
+  }
+
   if (lastResult.diffSkipped) {
     const note = document.createElement('span');
     note.className = 'diff-skipped-note';
@@ -916,6 +926,7 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
         renamedColumns: message.renamedColumns,
         diffSkipped: message.diffSkipped,
         hasLimit: message.hasLimit,
+        truncated: message.truncated,
         editable: message.editable,
         editableTable: message.editableTable,
       };
@@ -938,6 +949,7 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
         renamedColumns: message.renamedColumns,
         diffSkipped: message.diffSkipped,
         hasLimit: message.hasLimit,
+        truncated: message.truncated,
         editable: message.editable,
         editableTable: message.editableTable,
       };
@@ -994,6 +1006,7 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
           renamedColumns: r.renamedColumns,
           diffSkipped: r.diffSkipped,
           hasLimit: r.hasLimit,
+          truncated: r.truncated,
           editable: r.editable,
           editableTable: r.editableTable,
         };

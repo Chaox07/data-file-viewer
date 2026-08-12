@@ -78,6 +78,12 @@
           "minimum": 1,
           "description": "Above this many rows, automatic diff-against-backup highlighting is skipped after a query — use \"Diff anyway\" to run it on demand instead."
         },
+        "dataFileViewer.maxResultRows": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Maximum number of rows a query result sends to the view. 0 (the default) means no cap — every matching row is shown. Set a cap if very large results feel slow: sorting still runs across the whole result before the cap is applied, so the rows you see remain the true top N."
+        },
         "dataFileViewer.liveRefreshIntervalMs": {
           "type": "number",
           "default": 2000,

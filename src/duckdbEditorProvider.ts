@@ -4,7 +4,7 @@ import { randomBytes } from 'node:crypto';
 import { open as fsOpen, readFile, stat, unlink } from 'node:fs/promises';
 import { existsSync, realpathSync } from 'node:fs';
 import { DescriptiveStats, DuckDbFile, FileKind, QueryDiff, TopValuesStats, hasTrailingLimit } from './duckdbConnection';
-import { isDestructiveStatement } from './sqlSafety';
+import { destructiveReason, hasMultipleStatements } from './sqlSafety';
 import { LiveRefreshController } from './liveRefresh';
 
 // Real, permanent debug channel rather than throwaway instrumentation — this
@@ -43,9 +43,13 @@ function clampIntervalMs(candidateMs: unknown): number {
 // every live tick is what actually prevents a write from executing, so this
 // only needs to catch the common case well enough to produce a clear error
 // instead of a confusing stale/backoff spiral — no need for a real SQL
-// parser here.
+// parser here. Kept deliberately narrower than Safe Mode's allowlist (no
+// explain/describe/show), but it does share the multi-statement check: a
+// leading "select" is exactly as easy to satisfy with `select 1; drop table
+// x` here as it was there.
 function looksReadOnly(sql: string): boolean {
   const t = sql.trim().toLowerCase();
+  if (hasMultipleStatements(sql)) return false;
   return t.startsWith('select') || t.startsWith('with');
 }
 
@@ -167,6 +171,14 @@ function isVerifiedSiblingPath(expectedDir: string, candidate: string): boolean 
 function getDiffRowThreshold(): number {
   const value = vscode.workspace.getConfiguration('dataFileViewer').get<number>('diffRowThreshold', 50_000);
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 50_000;
+}
+
+// 0 (the default) means uncapped, i.e. exactly what this extension did before
+// the setting existed. Anything unparseable falls back to uncapped too --
+// silently showing fewer rows than the data has would be the worse failure.
+function getMaxResultRows(): number {
+  const value = vscode.workspace.getConfiguration('dataFileViewer').get<number>('maxResultRows', 0);
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 }
 
 /**
@@ -395,7 +407,9 @@ async function runLiveTick(document: DuckDBDocument, webview: vscode.Webview): P
   await reconnectDocument(document, true);
 
   if (!document.lastSql) return;
-  const result = await document.file.runQuery(document.lastSql);
+  // Same cap as the manual run that produced lastSql, so a live tick can't
+  // quietly return a different number of rows than the view it's refreshing.
+  const result = await document.file.runQuery(document.lastSql, getMaxResultRows());
 
   const rowCount = result.rows.length;
   const shouldHash = rowCount <= HASH_ROW_THRESHOLD;
@@ -698,7 +712,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
           document.combinedQueryMap.set(sql, message.table);
           document.statsCache.clear();
 
-          const result = await document.file.runQuery(sql);
+          const result = await document.file.runQuery(sql, getMaxResultRows());
           // Never editable — a UNION/subquery, not a plain single-table
           // SELECT, independent of Live state (checkEditableSelect's own
           // structural gate already excludes it; this just avoids the
@@ -789,17 +803,20 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             return;
           }
 
-          const destructive = isDestructiveStatement(message.sql);
+          // The reason, not the first word: for `select 1; drop table x` the
+          // first word is the harmless half, so reporting it would describe
+          // the query as a select while blocking it as a write.
+          const reason = destructiveReason(message.sql);
+          const destructive = reason !== null;
           if (document.safeMode && destructive) {
-            const firstWord = message.sql.trim().match(/^[a-zA-Z]+/)?.[0] ?? 'this statement';
             webview.postMessage({
               command: 'error',
-              message: `Blocked by Safe Mode: this looks like a write statement ("${firstWord}"). Uncheck Safe Mode to allow it.`,
+              message: `Blocked by Safe Mode: this looks like a write statement (${reason}). Uncheck Safe Mode to allow it.`,
             });
             return;
           }
 
-          const result = await document.file.runQuery(message.sql);
+          const result = await document.file.runQuery(message.sql, getMaxResultRows());
           document.lastSql = message.sql;
           document.statsCache.clear();
 
@@ -855,7 +872,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
         if (running || !document.lastSql || !document.hasBackup) return;
         running = true;
         try {
-          const result = await document.file.runQuery(document.lastSql);
+          const result = await document.file.runQuery(document.lastSql, getMaxResultRows());
           const diff = await document.file.diffQueryAgainstBackup(document.lastSql, result.columns, result.rows);
           webview.postMessage({
             command: 'queryResult',
@@ -887,7 +904,12 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
         if (running || !document.lastSql) return;
         running = true;
         try {
-          const result = await document.file.runSortedQuery(document.lastSql, message.column, message.direction);
+          const result = await document.file.runSortedQuery(
+            document.lastSql,
+            message.column,
+            message.direction,
+            getMaxResultRows()
+          );
 
           let diffFields: Partial<QueryDiff> = {};
           let diffSkipped = false;
