@@ -98,7 +98,9 @@ function groupColumnsByTable(rows: unknown[][]): Map<string, string[]> {
   return map;
 }
 
-function fnv1aFold(hash: number, str: string): number {
+export const FNV_OFFSET_BASIS = 0x811c9dc5;
+
+export function fnv1aFold(hash: number, str: string): number {
   for (let i = 0; i < str.length; i++) {
     hash ^= str.charCodeAt(i);
     hash = Math.imul(hash, 0x01000193);
@@ -109,7 +111,7 @@ function fnv1aFold(hash: number, str: string): number {
 /** Cheap per-column content signature used to narrow rename-match candidates
  *  before falling back to an exact array comparison (below). */
 function columnSignature(rows: unknown[][], colIdx: number, len: number): number {
-  let hash = 0x811c9dc5;
+  let hash = FNV_OFFSET_BASIS;
   for (let r = 0; r < len; r++) {
     hash = fnv1aFold(hash, stableStringify(rows[r][colIdx]));
     hash = fnv1aFold(hash, ' '); // row delimiter, prevents value-boundary collisions
@@ -120,6 +122,27 @@ function columnSignature(rows: unknown[][], colIdx: number, len: number): number
 function isLockConflict(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   return /lock/i.test(message);
+}
+
+// INSTALL writes into DuckDB's extension directory on disk, so it only needs
+// to happen once per process — but LOAD is per-connection state and must run
+// every time. Splitting the two matters on the live path, where a connection
+// used to be rebuilt from scratch on every tick.
+let sqliteExtensionInstalled = false;
+
+async function ensureSqliteExtension(connection: DuckDBConnection): Promise<void> {
+  try {
+    if (!sqliteExtensionInstalled) {
+      await connection.run(`install sqlite`);
+      sqliteExtensionInstalled = true;
+    }
+    await connection.run(`load sqlite`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Could not load DuckDB's SQLite extension — this requires an internet connection the first time it's used on this machine. (${message})`
+    );
+  }
 }
 
 function stripTrailingSemicolon(sql: string): string {
@@ -322,8 +345,11 @@ export class DuckDbFile {
     private readonly catalogName: string,
     private readonly mainObjectName: string,
     private readonly readOnly: boolean,
-    private readonly siblingCatalogName: string | undefined,
-    private readonly siblingIsSqlite: boolean = false
+    private siblingCatalogName: string | undefined,
+    private siblingIsSqlite: boolean = false,
+    /** The catalog `connect()` started in, before any ATTACH/USE — the parking spot refreshInPlace() needs to DETACH from. */
+    private readonly rootCatalogName: string = 'memory',
+    private readonly siblingPath: string | undefined = undefined
   ) {}
 
   isReadOnly(): boolean {
@@ -402,6 +428,12 @@ export class DuckDbFile {
     }
     const connection = await instance.connect();
 
+    // Captured before any ATTACH/USE below moves the current database — a
+    // catalog can't DETACH itself, so refreshInPlace() needs somewhere to
+    // stand while it swaps the SQLite attachment.
+    const rootReader = await connection.runAndReadAll('select current_database()');
+    const rootCatalogName = String(rootReader.getRows()[0][0]);
+
     const mainObjectName = basename(path, extname(path)).replace(/"/g, '""');
 
     if (isParquet) {
@@ -438,15 +470,7 @@ export class DuckDbFile {
     }
 
     if (isSqlite) {
-      try {
-        await connection.run(`install sqlite`);
-        await connection.run(`load sqlite`);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        throw new Error(
-          `Could not load DuckDB's SQLite extension — this requires an internet connection the first time it's used on this machine. (${message})`
-        );
-      }
+      await ensureSqliteExtension(connection);
       const filePath = path.replace(/'/g, "''");
       if (forceReadOnly) {
         await connection.run(`attach '${filePath}' as "${mainObjectName}" (type sqlite, read_only)`);
@@ -480,6 +504,13 @@ export class DuckDbFile {
     // sibling has vanished or isn't actually a valid database file, skip it
     // silently rather than failing the whole open — the primary file is
     // still perfectly usable without it.
+    // The in-memory kinds (parquet/csv/dta) have no lock to fall back from, so
+    // nothing above ever marked them read-only — but a caller that asked for
+    // read-only meant it, and checkEditableSelect keys the edit affordance off
+    // this flag. Without it, "Live implies read-only" held for .duckdb/.sqlite
+    // and quietly didn't for flat files.
+    if (forceReadOnly) readOnly = true;
+
     let siblingCatalogName: string | undefined;
     let siblingIsSqlite = false;
     if (options?.siblingPath) {
@@ -488,7 +519,18 @@ export class DuckDbFile {
       siblingIsSqlite = attached?.isSqlite ?? false;
     }
 
-    return new DuckDbFile(connection, path, kind, catalogName, mainObjectName, readOnly, siblingCatalogName, siblingIsSqlite);
+    return new DuckDbFile(
+      connection,
+      path,
+      kind,
+      catalogName,
+      mainObjectName,
+      readOnly,
+      siblingCatalogName,
+      siblingIsSqlite,
+      rootCatalogName,
+      options?.siblingPath
+    );
   }
 
   private static async tryAttachSibling(
@@ -500,8 +542,7 @@ export class DuckDbFile {
     try {
       const filePath = siblingPath.replace(/'/g, "''");
       if (isSiblingSqlite) {
-        await connection.run(`install sqlite`);
-        await connection.run(`load sqlite`);
+        await ensureSqliteExtension(connection);
         await connection.run(`attach '${filePath}' as ${quoteIdent(alias)} (type sqlite, read_only)`);
       } else {
         await connection.run(`attach '${filePath}' as ${quoteIdent(alias)} (read_only)`);
@@ -685,6 +726,72 @@ export class DuckDbFile {
   }
 
   /**
+   * Makes this connection observe writes another process has committed since
+   * it was opened, *without* rebuilding the instance — the live path used to
+   * pay for a full `DuckDBInstance.create` + `connect` + extension install +
+   * re-ATTACH on every tick, at up to 4 ticks a second.
+   *
+   * Returns false when the kind can't be refreshed in place, or when the
+   * refresh failed partway: either way the caller falls back to a full
+   * re-open, so a connection left half-detached is always replaced rather
+   * than reused. Deliberately restricted to already-read-only connections —
+   * going back to read-write is a different operation and always re-opens.
+   */
+  async refreshInPlace(): Promise<boolean> {
+    if (!this.readOnly) return false;
+    try {
+      switch (this.kind) {
+        case 'sqlite': {
+          // The SQLite scanner holds its own file handle, so re-ATTACHing is
+          // what actually makes another process's commits visible. A catalog
+          // can't detach itself, hence the hop through the root catalog.
+          const filePath = this.path.replace(/'/g, "''");
+          await this.connection.run(`use ${quoteIdent(this.rootCatalogName)}`);
+          await this.connection.run(`detach ${quoteIdent(this.catalogName)}`);
+          await this.connection.run(
+            `attach '${filePath}' as ${quoteIdent(this.catalogName)} (type sqlite, read_only)`
+          );
+          await this.connection.run(`use ${quoteIdent(this.catalogName)}`);
+          break;
+        }
+        case 'parquet':
+        case 'csv':
+        case 'dta':
+          // The view calls read_parquet()/read_csv_auto()/read_dta() afresh on
+          // every query, so each query already re-reads the file — there is
+          // genuinely nothing to refresh. The exception is a view an edit has
+          // materialized into a real table, where this connection's data no
+          // longer comes from the file at all.
+          if (this.materialized) return false;
+          break;
+        case 'duckdb':
+          // A DuckDB database's MVCC snapshot is fixed for the life of the
+          // instance, so nothing short of a new one sees another process's
+          // commits. The single kind that genuinely has to pay for a re-open.
+          return false;
+        case 'kdb':
+          // Parsed off disk once at open (see openKdb) — no live connection to refresh.
+          return false;
+      }
+      await this.refreshSibling();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Re-ATTACHes the hot/cold sibling for the same reason refreshInPlace() re-ATTACHes the main file. */
+  private async refreshSibling(): Promise<void> {
+    if (!this.siblingCatalogName || !this.siblingPath) return;
+    await this.connection.run(`detach ${quoteIdent(this.siblingCatalogName)}`);
+    const attached = await DuckDbFile.tryAttachSibling(this.connection, this.siblingPath);
+    // A sibling that has since vanished or gone unreadable degrades to "no
+    // sibling", exactly as it would have on a fresh open.
+    this.siblingCatalogName = attached?.alias;
+    this.siblingIsSqlite = attached?.isSqlite ?? false;
+  }
+
+  /**
    * `maxRows <= 0` keeps the historical behaviour: whatever the query returns
    * is shown in full. Above zero, reading stops early rather than the result
    * being sliced afterwards -- the cost this cap exists to avoid is
@@ -726,7 +833,7 @@ export class DuckDbFile {
     column: string,
     direction: 'asc' | 'desc',
     maxRows = 0
-  ): Promise<QueryResult> {
+  ): Promise<QueryResult & { sortedSql: string }> {
     const stripped = stripTrailingSemicolon(baseSql);
     const extracted = extractTrailingLimit(stripped);
     const inner = extracted ? extracted.withoutLimit : stripped;
@@ -735,7 +842,12 @@ export class DuckDbFile {
     const sortedSql = `select * from ${wrapAsSubquery(inner)} as _sorted order by ${col} ${direction} nulls last${limitSuffix}`;
     // The cap applies to the sorted result, so it stays "the true top N by
     // this column" rather than "N arbitrary rows, then sorted".
-    return this.runQuery(sortedSql, maxRows);
+    const result = await this.runQuery(sortedSql, maxRows);
+    // Handed back because the caller has to diff against the backup using the
+    // *same* ordering: diffQueryAgainstBackup compares row-by-row positionally,
+    // so running the unsorted base query on the backup side lights up nearly
+    // every cell as changed.
+    return { ...result, sortedSql };
   }
 
   /** Flushes pending writes to disk, then copies the file. Returns the backup path. */

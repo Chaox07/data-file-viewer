@@ -116,6 +116,8 @@
   "scripts": {
     "build": "node esbuild.js",
     "watch": "node esbuild.js --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc -p tsconfig.test.json && node --test \"out-test/test/*.test.js\"",
     "package": "npm run build && npx vsce package"
   },
   "devDependencies": {
