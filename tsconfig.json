@@ -10,5 +10,6 @@
     "skipLibCheck": true,
     "moduleResolution": "node"
   },
-  "exclude": ["node_modules", "dist", ".vscode-test"]
+  "include": ["src"],
+  "exclude": ["node_modules", "dist", "out-test", ".vscode-test"]
 }

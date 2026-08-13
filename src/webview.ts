@@ -3,6 +3,7 @@ import { keymap } from '@codemirror/view';
 import { sql } from '@codemirror/lang-sql';
 import { json } from '@codemirror/lang-json';
 import { oneDark } from '@codemirror/theme-one-dark';
+import { computeSortOrder } from './sortOrder';
 
 interface VsCodeApi {
   postMessage(message: unknown): void;
@@ -25,6 +26,8 @@ interface QueryResultFields {
   editable: boolean;
   editableTable?: string;
   timeColumnWarning?: string;
+  /** DuckDB already ordered these rows — see computeDisplayOrder, which must not re-sort them. */
+  serverSorted?: boolean;
 }
 
 type ExtensionMessage =
@@ -36,10 +39,21 @@ type ExtensionMessage =
   | { command: 'tableChangeStatus'; status: Record<string, TableStatus> }
   | { command: 'safeModeState'; safeMode: boolean }
   | { command: 'liveRefreshStarted'; intervalMs: number; suggestedIntervalSeconds: number | null }
-  | { command: 'liveRefreshStopped' }
+  | { command: 'liveRefreshStopped'; readOnly?: boolean }
   | { command: 'liveRefreshRejected'; reason: string }
   | { command: 'liveRefreshIntervalSet'; intervalMs: number }
-  | ({ command: 'liveTick'; lastUpdatedMs: number; stale: boolean; unchanged: boolean } & { result?: QueryResultFields })
+  | ({ command: 'liveTick'; lastUpdatedMs: number; unchanged: boolean } & { result?: QueryResultFields })
+  // Pushed on every transition by the host's scheduler, independent of whether
+  // a tick produced anything. A failing tick posts no liveTick at all, so
+  // carrying staleness on that message meant the flag was unreachable during
+  // exactly the outage it describes.
+  | {
+      command: 'liveStatus';
+      stale: boolean;
+      failureCount: number;
+      lastError?: string;
+      lastSuccessMs?: number;
+    }
   | {
       command: 'columnStatsResult';
       column: string;
@@ -129,6 +143,8 @@ let combinedTableNames = new Set<string>();
 let liveEnabled = false;
 let liveLastUpdatedMs: number | undefined;
 let liveStale = false;
+let liveLastError: string | undefined;
+let liveIntervalMs = 2000;
 let liveStatusTicker: number | undefined;
 // Sliding-tail scroll behavior for live combined views: only auto-follow
 // new rows in (log-tail style) when the user was already at the bottom —
@@ -251,11 +267,25 @@ function formatAgo(ms: number): string {
   return `${minutes}m ${seconds % 60}s ago`;
 }
 
+/**
+ * Second, independent staleness signal, computed here rather than reported by
+ * the host. The host's own `stale` flag can only arrive if the host is still
+ * running its scheduler at all — so a wedged extension host is precisely the
+ * case it cannot report. Time since the last successful update is observable
+ * from this side no matter what happened over there.
+ */
+function isLocallyStale(): boolean {
+  if (liveLastUpdatedMs === undefined) return false;
+  return Date.now() - liveLastUpdatedMs > Math.max(3 * liveIntervalMs, 10_000);
+}
+
 function updateLiveStatusText(): void {
   if (!liveEnabled) return;
+  const stale = liveStale || isLocallyStale();
   const agoText = liveLastUpdatedMs !== undefined ? `updated ${formatAgo(liveLastUpdatedMs)}` : 'waiting for first update…';
-  liveStatusEl.textContent = liveStale ? `Live · stale, last ${agoText}` : `Live · ${agoText}`;
-  liveStatusEl.className = `live-status ${liveStale ? 'live-status-stale' : 'live-status-active'}`;
+  liveStatusEl.textContent = stale ? `Live · stale, last ${agoText}` : `Live · ${agoText}`;
+  liveStatusEl.className = `live-status ${stale ? 'live-status-stale' : 'live-status-active'}`;
+  liveStatusEl.title = stale && liveLastError ? `Last error: ${liveLastError}` : '';
 }
 
 function startLiveStatusTicker(): void {
@@ -330,46 +360,36 @@ function applyTableChangeStatus(status: Record<string, TableStatus>): void {
   });
 }
 
-/** Value-to-string used for the sort fallback and JSON-detection — distinct
- *  from formatValue (display) since it needs to be collision-resistant for
- *  ordering (JSON.stringify for objects, not the raw "[object Object]"
- *  String() would produce). */
-function sortableString(value: unknown): string {
-  if (value === null || value === undefined) return '';
-  if (typeof value === 'object') return JSON.stringify(value);
-  return String(value);
+/**
+ * Thin wrapper over the shared ordering logic in sortOrder.ts: decides
+ * *whether* to sort, which is webview state, and delegates *how* to sort,
+ * which is pure and lives where it can be tested against DuckDB's own output.
+ */
+function computeDisplayOrder(): number[] {
+  const result = lastResult!;
+  const n = result.rows.length;
+  // Already ordered by DuckDB across the full data set. Re-sorting here is not
+  // just wasted work: where the client comparator disagrees with DuckDB's
+  // ordering, it would scramble a correct top-N back into a wrong one.
+  if (!sortState || result.serverSorted) return Array.from({ length: n }, (_, i) => i);
+  return computeSortOrder(
+    result.rows,
+    sortState.columnIndex,
+    sortState.direction,
+    result.columnStatsKind[sortState.columnIndex]
+  );
 }
 
-/** Permutation of original row indices — never physically reorders
- *  rows/cellChanged/rowIsNew, so every array stays indexed by the same
- *  original row index and diff-highlighting alignment is structural, not
- *  something that has to be hand-maintained across a sort. */
-function computeDisplayOrder(): number[] {
-  const n = lastResult!.rows.length;
-  const order = Array.from({ length: n }, (_, i) => i);
-  if (!sortState) return order;
-  const { columnIndex, direction } = sortState;
-  const rows = lastResult!.rows;
-  order.sort((a, b) => {
-    const va = rows[a][columnIndex];
-    const vb = rows[b][columnIndex];
-    const aNull = va === null || va === undefined;
-    const bNull = vb === null || vb === undefined;
-    if (aNull && bNull) return 0;
-    if (aNull) return 1; // nulls always last, regardless of direction
-    if (bNull) return -1;
-    let cmp: number;
-    if (typeof va === 'bigint' && typeof vb === 'bigint') {
-      cmp = va < vb ? -1 : va > vb ? 1 : 0;
-    } else if (typeof va === 'number' && typeof vb === 'number') {
-      cmp = Number.isNaN(va) && Number.isNaN(vb) ? 0 : Number.isNaN(va) ? 1 : Number.isNaN(vb) ? -1 : va - vb;
-    } else {
-      const sa = sortableString(va);
-      const sb = sortableString(vb);
-      cmp = sa < sb ? -1 : sa > sb ? 1 : 0;
-    }
-    return direction === 'asc' ? cmp : -cmp;
-  });
+// Sorting the same rows the same way on every render is pure waste, and
+// renderResults runs on every live tick.
+let cachedOrder: { rows: unknown[][]; key: string; order: number[] } | undefined;
+
+function displayOrder(): number[] {
+  const result = lastResult!;
+  const key = sortState && !result.serverSorted ? `${sortState.columnIndex}:${sortState.direction}` : '';
+  if (cachedOrder && cachedOrder.rows === result.rows && cachedOrder.key === key) return cachedOrder.order;
+  const order = computeDisplayOrder();
+  cachedOrder = { rows: result.rows, key, order };
   return order;
 }
 
@@ -511,7 +531,13 @@ function openStatsPopover(anchor: HTMLElement, column: string, statsKind: StatsK
 }
 
 let inspectorCleanup: (() => void) | null = null;
-let pendingCellEdit: { rowIdx: number; colIdx: number; column: string; statusEl: HTMLSpanElement } | null = null;
+let pendingCellEdit: {
+  rowIdx: number;
+  colIdx: number;
+  column: string;
+  statusEl: HTMLSpanElement;
+  saveBtn: HTMLButtonElement;
+} | null = null;
 
 function closeCellInspector(): void {
   inspectorCleanup?.();
@@ -601,7 +627,11 @@ function openCellInspector(rowIdx: number, colIdx: number): void {
     statusSpan.className = 'cell-inspector-status';
 
     saveBtn.addEventListener('click', () => {
-      if (running || !lastResult) return;
+      // The host serializes edits rather than dropping a second one, so a
+      // double-click would otherwise send two updates and the second would
+      // come back as "no matching row" against the row the first just changed.
+      if (running || !lastResult || saveBtn.disabled) return;
+      saveBtn.disabled = true;
       const text = inspectorEditor.state.doc.toString();
       // Empty input means NULL, not the literal empty string — matches how
       // NULL is already shown as literal text "NULL" elsewhere in the grid.
@@ -610,7 +640,7 @@ function openCellInspector(rowIdx: number, colIdx: number): void {
       lastResult.columns.forEach((c, j) => {
         rowValues[c] = lastResult!.rows[rowIdx][j];
       });
-      pendingCellEdit = { rowIdx, colIdx, column, statusEl: statusSpan };
+      pendingCellEdit = { rowIdx, colIdx, column, statusEl: statusSpan, saveBtn };
       statusSpan.textContent = 'Saving…';
       vscode.postMessage({ command: 'updateCell', column, newValue, rowValues });
     });
@@ -649,6 +679,8 @@ function openCellInspector(rowIdx: number, colIdx: number): void {
 const VIRTUALIZE_THRESHOLD = 200;
 const VIRTUAL_OVERSCAN = 8;
 let measuredRowHeight = 25; // corrected from a real rendered row below; this is just the initial estimate
+// Signature of the header currently on screen — see the reuse check in renderResults.
+let renderedHeaderKey: string | undefined;
 let virtualState: { order: number[]; rowHeight: number } | undefined;
 let virtualRenderScheduled = false;
 
@@ -664,7 +696,12 @@ function buildRowElement(i: number, displayIdx: number): HTMLTableRowElement {
     td.textContent = formatValue(value, columnStatsKind[j]);
     if (value === null || value === undefined) td.classList.add('cell-null');
     if (!isNewRow && cellChanged?.[i]?.[j]) td.classList.add('cell-changed');
-    td.addEventListener('dblclick', () => openCellInspector(i, j));
+    // Coordinates on the element, handled by one delegated listener below,
+    // rather than a closure per cell: renderVirtualWindow rebuilds its window
+    // on every scroll frame, so per-cell listeners meant thousands of closure
+    // allocations per frame.
+    td.dataset.r = String(i);
+    td.dataset.c = String(j);
     tr.appendChild(td);
   });
   return tr;
@@ -702,6 +739,17 @@ function renderVirtualWindow(): void {
   appendSpacerRow(tbody, (order.length - end) * rowHeight, lastResult.columns.length);
 }
 
+// Delegated cell-inspector trigger. Attached to #results, which survives every
+// re-render, so it covers rows that don't exist yet — including the ones the
+// virtual window creates and destroys as you scroll.
+resultsEl.addEventListener('dblclick', (e) => {
+  const td = (e.target as HTMLElement | null)?.closest?.('td');
+  if (!td || !resultsEl.contains(td)) return;
+  const { r, c } = (td as HTMLTableCellElement).dataset;
+  if (r === undefined || c === undefined) return;
+  openCellInspector(Number(r), Number(c));
+});
+
 // Attached once, not per-render — renderResults() below fully rebuilds
 // #results' contents on every call, which would orphan a listener declared
 // there. Reads whatever `virtualState`/`lastResult` currently hold instead.
@@ -734,15 +782,35 @@ function renderResults(preserveScroll = false): void {
   const preservedScrollTop = preserveScroll ? resultsEl.scrollTop : 0;
   const wasPinnedToBottom = preserveScroll && pinnedToBottom;
 
-  resultsEl.innerHTML = '';
   virtualState = undefined;
-  if (!lastResult) return;
+  if (!lastResult) {
+    resultsEl.innerHTML = '';
+    renderedHeaderKey = undefined;
+    return;
+  }
   const { columns, rows, cellChanged, rowIsNew, renamedColumns, columnStatsKind } = lastResult;
 
   if (columns.length === 0) {
     resultsEl.innerHTML = '<div class="empty">Query returned no columns.</div>';
+    renderedHeaderKey = undefined;
     return;
   }
+
+  // A live tick re-runs the same query, so the header is almost always
+  // identical to the one already on screen. Rebuilding it anyway threw away
+  // the sort/stats buttons several times a second — and with them the anchor
+  // element an open stats popover positions against.
+  const headerKey = JSON.stringify([columns, renamedColumns ?? null, sortState ?? null, columnStatsKind]);
+  const existingTable = resultsEl.querySelector('table');
+  const reuseHeader = preserveScroll && existingTable !== null && headerKey === renderedHeaderKey;
+
+  if (reuseHeader) {
+    renderRowsInto(existingTable, preservedScrollTop, wasPinnedToBottom);
+    return;
+  }
+
+  resultsEl.innerHTML = '';
+  renderedHeaderKey = headerKey;
 
   const table = document.createElement('table');
 
@@ -780,6 +848,7 @@ function renderResults(preserveScroll = false): void {
       if (running) return;
       const direction = isActiveSort && sortState!.direction === 'asc' ? 'desc' : 'asc';
       sortState = { columnIndex: colIdx, direction };
+      if (lastResult) lastResult.serverSorted = false;
       if (lastResult?.hasLimit) {
         // A LIMIT-ed result can't be correctly re-sorted from just the rows
         // already in memory (see hasLimit's origin in duckdbConnection.ts) --
@@ -809,9 +878,20 @@ function renderResults(preserveScroll = false): void {
   });
   thead.appendChild(headRow);
   table.appendChild(thead);
+  resultsEl.appendChild(table);
+
+  renderRowsInto(table, preservedScrollTop, wasPinnedToBottom);
+}
+
+/** Body + footer only. Split out so a live tick can refresh the rows under an untouched header. */
+function renderRowsInto(table: HTMLTableElement, preservedScrollTop: number, wasPinnedToBottom: boolean): void {
+  const { rows } = lastResult!;
+
+  table.querySelector('tbody')?.remove();
+  resultsEl.querySelector('.results-footer')?.remove();
 
   const tbody = document.createElement('tbody');
-  const order = computeDisplayOrder();
+  const order = displayOrder();
   const useVirtual = order.length > VIRTUALIZE_THRESHOLD;
 
   if (!useVirtual) {
@@ -822,13 +902,12 @@ function renderResults(preserveScroll = false): void {
     virtualState = { order, rowHeight: measuredRowHeight };
   }
   table.appendChild(tbody);
-  resultsEl.appendChild(table);
 
   const footer = document.createElement('div');
   footer.className = 'results-footer';
   footer.textContent = `${rows.length} row${rows.length === 1 ? '' : 's'} shown`;
 
-  if (lastResult.truncated) {
+  if (lastResult!.truncated) {
     // The count above is the whole story only when nothing was cut -- say so
     // explicitly, otherwise a capped result reads as the complete answer.
     const cap = document.createElement('span');
@@ -837,7 +916,7 @@ function renderResults(preserveScroll = false): void {
     footer.appendChild(cap);
   }
 
-  if (lastResult.diffSkipped) {
+  if (lastResult!.diffSkipped) {
     const note = document.createElement('span');
     note.className = 'diff-skipped-note';
     note.textContent = ' — result too large to auto-diff against the backup.';
@@ -929,6 +1008,7 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
         truncated: message.truncated,
         editable: message.editable,
         editableTable: message.editableTable,
+        serverSorted: false,
       };
       sortState = undefined;
       // A brand-new query result (not a live tick re-running the same one)
@@ -952,6 +1032,9 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
         truncated: message.truncated,
         editable: message.editable,
         editableTable: message.editableTable,
+        // DuckDB ordered these across the full data set; computeDisplayOrder
+        // must leave them exactly as they arrived.
+        serverSorted: message.serverSorted ?? true,
       };
       // sortState is intentionally left as-is -- this response IS the
       // result of the sort that was just clicked, so the arrow icon must
@@ -975,13 +1058,19 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
       break;
     case 'liveRefreshStarted':
       setLiveUiEnabled(true);
+      liveIntervalMs = message.intervalMs;
       liveIntervalInput.value = String(message.intervalMs / 1000);
       liveLastUpdatedMs = undefined;
       liveStale = false;
+      liveLastError = undefined;
       startLiveStatusTicker();
       break;
     case 'liveRefreshStopped':
       setLiveUiEnabled(false);
+      if (message.readOnly) {
+        statusEl.textContent =
+          'Live off — but this file is still open read-only, because another process holds the write lock. Editing stays disabled until it releases.';
+      }
       break;
     case 'liveRefreshRejected':
       modeStaticRadio.checked = true;
@@ -989,11 +1078,16 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
       statusEl.textContent = message.reason;
       break;
     case 'liveRefreshIntervalSet':
+      liveIntervalMs = message.intervalMs;
       liveIntervalInput.value = String(message.intervalMs / 1000);
+      break;
+    case 'liveStatus':
+      liveStale = message.stale;
+      liveLastError = message.lastError;
+      updateLiveStatusText();
       break;
     case 'liveTick':
       liveLastUpdatedMs = message.lastUpdatedMs;
-      liveStale = message.stale;
       updateLiveStatusText();
       if (!message.unchanged && message.result) {
         const r = message.result;
@@ -1009,6 +1103,10 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
           truncated: r.truncated,
           editable: r.editable,
           editableTable: r.editableTable,
+          // A live tick re-runs the user's own query, which carries whatever
+          // ORDER BY they wrote but not the client-side sort — so any active
+          // column sort still has to be applied here.
+          serverSorted: false,
         };
         renderResults(true); // preserve scroll position / pinned-bottom auto-follow — this is the same ongoing query, not a fresh one
       }
@@ -1043,6 +1141,10 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
         );
         if (colIdx !== -1 && rowIdx !== -1) {
           lastResult.rows[rowIdx][colIdx] = message.newValue;
+          // Edited in place, so the rows array keeps its identity — the cached
+          // permutation has to be dropped explicitly or an edit to the sort
+          // column would leave the row sitting in its old position.
+          cachedOrder = undefined;
           if (lastResult.cellChanged) {
             if (!lastResult.cellChanged[rowIdx]) {
               lastResult.cellChanged[rowIdx] = lastResult.columns.map(() => false);
@@ -1057,6 +1159,8 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
     case 'cellUpdateError':
       if (pendingCellEdit && pendingCellEdit.column === message.column) {
         pendingCellEdit.statusEl.textContent = message.message;
+        // Re-armed so a failed edit can be corrected and retried.
+        pendingCellEdit.saveBtn.disabled = false;
       }
       break;
     case 'editStatus':
