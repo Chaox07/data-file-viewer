@@ -209,7 +209,11 @@ milliseconds), row ordering — asserted to agree with what DuckDB itself
 produces for the same column, which is what keeps sorting consistent between
 the client-side and server-side paths — and the read-only/Safe Mode SQL
 scanner. It uses Node's built-in test runner, so there's no test framework to
-install.
+install; it does need Node 22 or newer, which is only a requirement for
+running the tests, not for building or using the extension.
+
+Both run in CI on every push, and a failing suite blocks the `latest` release
+below from being published.
 
 Press `F5` in VS Code (with this folder open) to launch an Extension Development
 Host, then open any `.duckdb`/`.parquet`/`.csv`/`.dta`/`.db`/`.sqlite`/kdb+ file in

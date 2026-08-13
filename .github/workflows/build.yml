@@ -1,6 +1,29 @@
 name: Build extension
 on: [push]
+
+# The release job below deletes the `latest` release before recreating it, so
+# two runs overlapping on the same ref could interleave those steps and leave
+# no release published at all. One run per ref at a time; superseded runs are
+# cancelled rather than queued, since only the newest push is worth publishing.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # Platform-independent checks, so they run once rather than per-OS. Node 22:
+  # `node --test` only accepts a glob pattern from Node 21 on.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
   build:
     strategy:
       matrix:
@@ -11,7 +34,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm install
+          cache: npm
+      - run: npm ci
       - run: npm run build
       - run: npx vsce package
       - name: Tag vsix filename with platform
@@ -29,7 +53,9 @@ jobs:
           path: '*.vsix'
 
   release:
-    needs: build
+    # Also gated on `test`, so a failing suite blocks publishing rather than
+    # shipping a broken build to the one URL people install from.
+    needs: [build, test]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
