@@ -71,6 +71,18 @@ Every results grid — table previews and hand-written queries alike — gets:
   matching data set on the server first, not just whatever rows happened to
   already be on screen — so "top 10 by X" is always the true top 10, not an
   arbitrary 10 rows re-ordered.
+
+  Sorting follows the column's actual type rather than the text on screen.
+  That matters more than it sounds: DuckDB hands large integers, decimals
+  and timestamps to the view as text, so sorting them as text would put `9`
+  after `10` and `2024-03` next to `2023-12` only by luck. Numbers sort as
+  numbers (exactly, even past the range a JavaScript number can hold
+  precisely), dates and timestamps sort chronologically, and empty (`NULL`)
+  values always collect at the end regardless of direction. Text sorts by
+  the alphabet rather than by internal character codes — so `apple` comes
+  before `Zebra`, Turkish letters like `ç`, `ı`, `ö`, `ş` and `ü` sort where
+  you'd expect rather than after `z`, and names such as `item9`/`item10`
+  come out in counting order.
 - **Column stats**: a button in each header computes, on demand and across
   the *entire* column (not just the visible rows): for numeric/date columns,
   the minimum, maximum, average, and 5th/95th percentiles; for everything
@@ -123,20 +135,36 @@ re-run of the query.
   of the extension's own default (`dataFileViewer.liveRefreshIntervalMs` in
   Settings, default 2000ms), so the viewer polls at the same cadence as the
   process writing the file. You can still override it by hand.
-- **How a tick works.** Each tick watches the file plus its WAL/SHM sidecar
-  files (where the actual writes land under WAL mode) and only does
-  anything once those change on disk. When they do, it opens a fresh
-  read-only connection — DuckDB's own connection doesn't observe another
-  process's commits otherwise — reruns the last query, and reposts the
-  result only if it actually differs from what's already on screen (so a
-  poll that produced no new rows doesn't cause a visible flicker). A status
-  line next to the toggle shows how long ago the last update landed, and
-  switches to "stale" after three consecutive failed ticks (file locked,
-  temporarily missing mid-write, etc.) without turning Live off — it keeps
-  retrying with backoff and clears the stale state itself once a tick
-  succeeds again.
+- **How a tick works.** Each tick watches the folder holding the file, so it
+  notices changes to the file itself and to the WAL/SHM sidecar files where
+  the actual writes land under WAL mode — including sidecars that don't
+  exist yet when Live starts, and files a writer replaces wholesale rather
+  than editing in place. A tick only does real work once something has
+  actually changed on disk. When it has, the connection is refreshed as
+  cheaply as that format allows — a `.duckdb` file needs a fresh connection
+  to observe another process's commits, a `.sqlite` file only needs
+  reattaching, and `.csv`/`.parquet`/`.dta` re-read themselves on every
+  query anyway — then the last query is rerun and the result reposted only
+  if it actually differs from what's on screen (so a poll that produced no
+  new rows doesn't cause a visible flicker).
+- **When something goes wrong.** A status line next to the toggle shows how
+  long ago the last update landed, and switches to "stale" while ticks are
+  failing — hover it to see the underlying error. Live is never turned off
+  for you: it keeps retrying, backing off further after each consecutive
+  failure, and clears the stale state itself once a tick succeeds. A tick
+  that hangs outright (typically waiting on a lock the writing process is
+  holding) is given up on after a timeout rather than being waited on
+  forever, so a single stuck query can't quietly end live updates for the
+  rest of the session. If updates stop arriving for any reason at all, the
+  view marks itself stale on its own rather than showing an old grid as if
+  it were current.
+- **Ticks yield to you.** If a tick comes due while one of your own queries,
+  sorts, or column-stat lookups is still running, it steps aside and waits
+  for the next one instead of competing for the same connection.
 - Turning Live back off reconnects normally (read-write), so editing works
-  again immediately.
+  again immediately — unless the writing process still holds the write lock,
+  in which case the file stays open read-only and the status line says so,
+  rather than leaving editing mysteriously disabled.
 
 ### Safe Mode and backups
 
@@ -169,9 +197,19 @@ you see is the true top N by that column rather than an arbitrary N re-ordered.
 
 ```sh
 npm install
-npm run build      # one-off build (esbuild -> dist/extension.js, dist/webview.js)
+npm run build       # one-off build (esbuild -> dist/extension.js, dist/webview.js)
 npm run watch       # rebuild on file changes
+npm run typecheck   # tsc --noEmit
+npm test            # node --test
 ```
+
+`npm test` covers the parts that are hard to check by hand: the live-refresh
+scheduler (driven by a fake clock, so a 30-second backoff is tested in
+milliseconds), row ordering — asserted to agree with what DuckDB itself
+produces for the same column, which is what keeps sorting consistent between
+the client-side and server-side paths — and the read-only/Safe Mode SQL
+scanner. It uses Node's built-in test runner, so there's no test framework to
+install.
 
 Press `F5` in VS Code (with this folder open) to launch an Extension Development
 Host, then open any `.duckdb`/`.parquet`/`.csv`/`.dta`/`.db`/`.sqlite`/kdb+ file in
