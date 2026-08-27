@@ -1,7 +1,7 @@
 # Data File Viewer
 
 A VS Code extension that opens `.duckdb`, `.parquet`, `.csv`, `.dta` (Stata),
-`.arrow`/`.arrows` (Arrow IPC), `.db`/`.sqlite` (SQLite), and kdb+ table files
+`.arrow`/`.arrows` (Arrow IPC), `.xlsx` (Excel), `.db`/`.sqlite` (SQLite), and kdb+ table files
 with a table list ("sheets") in the sidebar,
 an editable SQL query box, and a results grid — modeled on
 [caioricciuti/vs-duckdb-viewer](https://github.com/caioricciuti/vs-duckdb-viewer).
@@ -18,6 +18,7 @@ below).
 | `.csv` | Yes |
 | `.dta` | Yes |
 | `.arrow` / `.arrows` | Yes |
+| `.xlsx` | Yes |
 | `.sqlite` | Yes |
 | `.db` | **No** — see below |
 | kdb+ table files (inside a `..._kdb/` folder) | Yes, inside VS Code — see below |
@@ -31,7 +32,8 @@ Palette's "Reopen Editor With..." on an already-open one. Opening a
 which needs an internet connection the *first* time it's used on a given
 machine (cached locally after that). Opening a `.dta` or `.arrow`/`.arrows`
 file has the same one-time internet-on-first-use requirement, for DuckDB's
-`dta` and `arrow` community extensions respectively.
+`dta` and `arrow` community extensions respectively — as does an `.xlsx` file,
+for DuckDB's `excel` extension.
 
 ### A note on `.arrow` vs `.feather`
 
@@ -60,6 +62,26 @@ which `read_arrow()` rejects with "Unrecognized Field type with value 24".
 they're exposed as a single view named after the file — the sidebar will
 show just that one entry, and clicking it previews the file's data like any
 other table.
+
+### Excel workbooks
+
+`.xlsx` is the one flat format here that *is* multi-table, so it gets the
+`.duckdb` treatment instead: **one view per sheet**, named after the sheet and
+listed in the sidebar in the order the workbook declares them. Click a sheet to
+preview it, or join across sheets in the query box like any other tables.
+
+Sheet names are read out of the workbook package directly (`xl/workbook.xml`
+plus its `.rels`), because DuckDB's `read_xlsx()` addresses a sheet by name but
+offers no way to ask which names exist. A sheet that can't be read — a chart
+sheet, a macro sheet, an empty one — is skipped rather than failing the whole
+workbook; the file only errors if *none* of its sheets can be read.
+
+**Workbooks are view-only.** DuckDB can write an `.xlsx`, but a workbook is many
+sheets and that writes a file containing one — saving an edit to a single sheet
+would silently destroy every other sheet in the book. (Excel also has no integer
+type, so a round trip turns `1` into `1.0` throughout.) Rather than do either
+quietly behind a double-click, cell editing is simply not offered for `.xlsx`,
+the same as for kdb+ tables.
 
 ### kdb+ tables
 
@@ -241,7 +263,7 @@ Both run in CI on every push, and a failing suite blocks the `latest` release
 below from being published.
 
 Press `F5` in VS Code (with this folder open) to launch an Extension Development
-Host, then open any `.duckdb`/`.parquet`/`.csv`/`.dta`/`.arrow`/`.db`/`.sqlite`/kdb+ file in
+Host, then open any `.duckdb`/`.parquet`/`.csv`/`.dta`/`.arrow`/`.xlsx`/`.db`/`.sqlite`/kdb+ file in
 that window.
 
 ## Packaging
@@ -284,9 +306,9 @@ This section is about the operating system's own file association — a
 separate, one-time setting per machine, independent of anything this
 extension can configure on its own:
 
-- **macOS**: right-click a `.duckdb`/`.parquet`/`.csv`/`.dta`/`.arrow`/`.sqlite` file →
+- **macOS**: right-click a `.duckdb`/`.parquet`/`.csv`/`.dta`/`.arrow`/`.xlsx`/`.sqlite` file →
   Get Info → "Open with" → select Visual Studio Code → "Change All…".
-- **Windows**: right-click a `.duckdb`/`.parquet`/`.csv`/`.dta`/`.arrow`/`.sqlite` file →
+- **Windows**: right-click a `.duckdb`/`.parquet`/`.csv`/`.dta`/`.arrow`/`.xlsx`/`.sqlite` file →
   "Open with" → "Choose another app" → Visual Studio Code → check "Always
   use this app to open this file type".
 
