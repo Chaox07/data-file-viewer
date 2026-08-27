@@ -5,7 +5,17 @@
     "outDir": "out-test",
     "module": "commonjs",
     "sourceMap": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ]
   },
-  "include": ["src/liveRefresh.ts", "src/sqlSafety.ts", "src/sortOrder.ts", "src/duckdbConnection.ts", "src/kdbParser.ts", "test/**/*.ts"]
+  "include": [
+    "src/liveRefresh.ts",
+    "src/sqlSafety.ts",
+    "src/sortOrder.ts",
+    "src/duckdbConnection.ts",
+    "src/kdbParser.ts",
+    "src/xlsxSheets.ts",
+    "test/**/*.ts"
+  ]
 }

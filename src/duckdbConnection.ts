@@ -12,6 +12,7 @@ import {
 import { basename, dirname, extname, join } from 'node:path';
 import { chmod, copyFile, stat } from 'node:fs/promises';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
+import { listSheets } from './xlsxSheets';
 
 export type StatsKind = 'numeric' | 'datetime' | 'other';
 
@@ -54,7 +55,7 @@ export interface DescriptiveStats {
   p95: unknown;
 }
 
-export type FileKind = 'duckdb' | 'parquet' | 'sqlite' | 'csv' | 'dta' | 'arrow' | 'kdb';
+export type FileKind = 'duckdb' | 'parquet' | 'sqlite' | 'csv' | 'dta' | 'arrow' | 'xlsx' | 'kdb';
 
 export interface DuckDbFileOpenOptions {
   /** Request read-only up front (live-refresh reconnects) instead of trying read-write first. */
@@ -377,8 +378,9 @@ export class DuckDbFile {
     const isCsv = path.toLowerCase().endsWith('.csv');
     const isDta = path.toLowerCase().endsWith('.dta');
     const isArrow = /\.arrows?$/i.test(path);
+    const isXlsx = path.toLowerCase().endsWith('.xlsx');
     const isSqlite = path.toLowerCase().endsWith('.db') || path.toLowerCase().endsWith('.sqlite');
-    const useMemory = isParquet || isCsv || isDta || isArrow || isSqlite;
+    const useMemory = isParquet || isCsv || isDta || isArrow || isXlsx || isSqlite;
     const kind: FileKind = isParquet
       ? 'parquet'
       : isCsv
@@ -387,9 +389,11 @@ export class DuckDbFile {
           ? 'dta'
           : isArrow
             ? 'arrow'
-            : isSqlite
-              ? 'sqlite'
-              : 'duckdb';
+            : isXlsx
+              ? 'xlsx'
+              : isSqlite
+                ? 'sqlite'
+                : 'duckdb';
     // Live-refresh reconnects request read-only up front rather than trying
     // read-write first and falling back on a lock conflict — there's never a
     // reason for a live tick to want read-write, and going through the
@@ -502,6 +506,53 @@ export class DuckDbFile {
       }
       const filePath = path.replace(/'/g, "''");
       await connection.run(`create view "${mainObjectName}" as select * from read_arrow('${filePath}')`);
+    }
+
+    if (isXlsx) {
+      // The one flat format here that is genuinely MULTI-table: a workbook's
+      // sheets each become their own view, named after the sheet, so the
+      // sidebar lists them the way it lists a .duckdb file's tables rather
+      // than collapsing a whole workbook to a single entry.
+      //
+      // `excel` is a core DuckDB extension (not community), but still needs
+      // fetching once per machine like sqlite/dta above.
+      try {
+        await connection.run(`install excel`);
+        await connection.run(`load excel`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `Could not load DuckDB's excel extension — this requires an internet connection the first time it's used on this machine. (${message})`
+        );
+      }
+      const sheets = await listSheets(path);
+      if (sheets.length === 0) {
+        throw new Error(`"${basename(path)}" declares no readable sheets.`);
+      }
+      const filePath = path.replace(/'/g, "''");
+      const failures: string[] = [];
+      for (const sheet of sheets) {
+        // read_xlsx addresses a sheet by NAME, so the sheet name is a SQL
+        // string literal here and a quoted identifier for the view -- two
+        // different escapes, and mixing them up is how a sheet called
+        // O'Brien's Data breaks the whole workbook.
+        const asLiteral = sheet.name.replace(/'/g, "''");
+        const asIdent = sheet.name.replace(/"/g, '""');
+        try {
+          await connection.run(
+            `create view "${asIdent}" as select * from read_xlsx('${filePath}', sheet = '${asLiteral}')`
+          );
+        } catch (err) {
+          // One unreadable sheet (a chart sheet, a macro sheet, an empty one)
+          // must not cost the user the rest of the workbook.
+          failures.push(sheet.name);
+        }
+      }
+      if (failures.length === sheets.length) {
+        throw new Error(
+          `None of the ${sheets.length} sheet(s) in "${basename(path)}" could be read.`
+        );
+      }
     }
 
     if (isSqlite) {
@@ -793,7 +844,9 @@ export class DuckDbFile {
         case 'csv':
         case 'dta':
         case 'arrow':
-          // The view calls read_parquet()/read_csv_auto()/read_dta()/read_arrow() afresh on
+        case 'xlsx':
+          // The view calls read_parquet()/read_csv_auto()/read_dta()/read_arrow()/
+          // read_xlsx() afresh on
           // every query, so each query already re-reads the file — there is
           // genuinely nothing to refresh. The exception is a view an edit has
           // materialized into a real table, where this connection's data no
@@ -1109,7 +1162,14 @@ export class DuckDbFile {
     // kdb+ tables are read from the real on-disk file (see kdbParser.ts) into
     // an in-memory table purely so this viewer can query it -- there is no
     // write-back path to real kdb+ format, so editing is never offered.
-    if (this.readOnly || this.kind === 'kdb') return { editable: false };
+    //
+    // .xlsx is view-only for a different and sharper reason. DuckDB CAN write
+    // one (`copy ... to ... (format xlsx)`), but a workbook is many sheets and
+    // that writes a file containing ONE -- saving an edit to a single sheet
+    // would silently destroy every other sheet in the book. It also has no
+    // integer type, so a round trip turns 1 into 1.0 throughout. Neither is a
+    // trade worth making silently behind a double-click.
+    if (this.readOnly || this.kind === 'kdb' || this.kind === 'xlsx') return { editable: false };
     const trimmed = sql.trim();
 
     try {

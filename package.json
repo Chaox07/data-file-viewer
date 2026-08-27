@@ -1,7 +1,7 @@
 {
   "name": "data-file-viewer",
   "displayName": "Data File Viewer",
-  "description": "Open and explore .duckdb, .parquet, .csv, .dta (Stata), .arrow/.arrows (Arrow IPC), .db/.sqlite (SQLite), and kdb+ data files right inside VS Code, without needing a separate database program. A sidebar lists every table in the file — click one to see its rows in a grid, or write your own SQL query to look at exactly the data you want. Click a column header to sort by it, or open the stats panel to see quick numbers for that column — minimum, maximum, average, and percentiles — worked out across the whole dataset, not just the rows on screen. For editable formats (.duckdb, .parquet, .csv, .dta, .arrow/.arrows, .db/.sqlite), double-click a cell to change its value and save it straight back to the file; turn on Safe Mode first to keep an automatic backup and see exactly which rows changed before you commit to the edit. kdb+ tables are read directly in their real, original format — no conversion step — though they are view-only for now, since there is no way yet to write changes back into that format.",
+  "description": "Open and explore .duckdb, .parquet, .csv, .dta (Stata), .arrow/.arrows (Arrow IPC), .xlsx (Excel), .db/.sqlite (SQLite), and kdb+ data files right inside VS Code, without needing a separate database program. A sidebar lists every table in the file \u2014 click one to see its rows in a grid, or write your own SQL query to look at exactly the data you want. Click a column header to sort by it, or open the stats panel to see quick numbers for that column \u2014 minimum, maximum, average, and percentiles \u2014 worked out across the whole dataset, not just the rows on screen. For editable formats (.duckdb, .parquet, .csv, .dta, .arrow/.arrows, .db/.sqlite), double-click a cell to change its value and save it straight back to the file; turn on Safe Mode first to keep an automatic backup and see exactly which rows changed before you commit to the edit. kdb+ tables are read directly in their real, original format \u2014 no conversion step \u2014 though they are view-only for now, since there is no way yet to write changes back into that format. Excel workbooks show one sheet per sidebar entry and are also view-only, because writing one back would replace the whole workbook with the single sheet being edited.",
   "publisher": "kemal-local",
   "version": "0.0.1",
   "private": true,
@@ -40,6 +40,9 @@
           },
           {
             "filenamePattern": "*.arrows"
+          },
+          {
+            "filenamePattern": "*.xlsx"
           }
         ],
         "priority": "default"
@@ -82,13 +85,13 @@
           "type": "number",
           "default": 50000,
           "minimum": 1,
-          "description": "Above this many rows, automatic diff-against-backup highlighting is skipped after a query — use \"Diff anyway\" to run it on demand instead."
+          "description": "Above this many rows, automatic diff-against-backup highlighting is skipped after a query \u2014 use \"Diff anyway\" to run it on demand instead."
         },
         "dataFileViewer.maxResultRows": {
           "type": "number",
           "default": 0,
           "minimum": 0,
-          "description": "Maximum number of rows a query result sends to the view. 0 (the default) means no cap — every matching row is shown. Set a cap if very large results feel slow: sorting still runs across the whole result before the cap is applied, so the rows you see remain the true top N."
+          "description": "Maximum number of rows a query result sends to the view. 0 (the default) means no cap \u2014 every matching row is shown. Set a cap if very large results feel slow: sorting still runs across the whole result before the cap is applied, so the rows you see remain the true top N."
         },
         "dataFileViewer.liveRefreshIntervalMs": {
           "type": "number",
@@ -138,6 +141,7 @@
     "@codemirror/lang-sql": "^6.7.0",
     "@codemirror/theme-one-dark": "^6.1.3",
     "@duckdb/node-api": "1.5.5-r.3",
-    "codemirror": "^6.0.1"
+    "codemirror": "^6.0.1",
+    "fflate": "^0.8.3"
   }
 }
