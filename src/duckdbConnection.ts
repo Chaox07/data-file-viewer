@@ -54,7 +54,7 @@ export interface DescriptiveStats {
   p95: unknown;
 }
 
-export type FileKind = 'duckdb' | 'parquet' | 'sqlite' | 'csv' | 'dta' | 'kdb';
+export type FileKind = 'duckdb' | 'parquet' | 'sqlite' | 'csv' | 'dta' | 'arrow' | 'kdb';
 
 export interface DuckDbFileOpenOptions {
   /** Request read-only up front (live-refresh reconnects) instead of trying read-write first. */
@@ -361,7 +361,7 @@ export class DuckDbFile {
   }
 
   private isFlatFileKind(): boolean {
-    return this.kind === 'parquet' || this.kind === 'csv' || this.kind === 'dta';
+    return this.kind === 'parquet' || this.kind === 'csv' || this.kind === 'dta' || this.kind === 'arrow';
   }
 
   static async open(path: string, forceKind?: FileKind, options?: DuckDbFileOpenOptions): Promise<DuckDbFile> {
@@ -376,9 +376,20 @@ export class DuckDbFile {
     const isParquet = path.toLowerCase().endsWith('.parquet');
     const isCsv = path.toLowerCase().endsWith('.csv');
     const isDta = path.toLowerCase().endsWith('.dta');
+    const isArrow = /\.arrows?$/i.test(path);
     const isSqlite = path.toLowerCase().endsWith('.db') || path.toLowerCase().endsWith('.sqlite');
-    const useMemory = isParquet || isCsv || isDta || isSqlite;
-    const kind: FileKind = isParquet ? 'parquet' : isCsv ? 'csv' : isDta ? 'dta' : isSqlite ? 'sqlite' : 'duckdb';
+    const useMemory = isParquet || isCsv || isDta || isArrow || isSqlite;
+    const kind: FileKind = isParquet
+      ? 'parquet'
+      : isCsv
+        ? 'csv'
+        : isDta
+          ? 'dta'
+          : isArrow
+            ? 'arrow'
+            : isSqlite
+              ? 'sqlite'
+              : 'duckdb';
     // Live-refresh reconnects request read-only up front rather than trying
     // read-write first and falling back on a lock conflict — there's never a
     // reason for a live tick to want read-write, and going through the
@@ -467,6 +478,30 @@ export class DuckDbFile {
       }
       const filePath = path.replace(/'/g, "''");
       await connection.run(`create view "${mainObjectName}" as select * from read_dta('${filePath}')`);
+    }
+
+    if (isArrow) {
+      // Same single-view treatment as Parquet/CSV/dta. Uses DuckDB's community
+      // `arrow` extension, whose read_arrow() reads the Arrow IPC *stream*
+      // encoding -- the one `COPY ... TO ... (FORMAT arrow)` and polars'
+      // write_ipc_stream() produce, conventionally .arrows/.arrow.
+      //
+      // A Feather/IPC *file* (the `ARROW1` magic that pyarrow's write_feather
+      // and polars' write_ipc produce) is a DIFFERENT encoding and read_arrow
+      // rejects it -- "Expected -1 field nodes in message but found 2". That is
+      // why .feather is deliberately not in the selector: claiming it would
+      // open a viewer that fails on the majority of files carrying that name.
+      try {
+        await connection.run(`install arrow from community`);
+        await connection.run(`load arrow`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `Could not load DuckDB's arrow extension — this requires an internet connection the first time it's used on this machine. (${message})`
+        );
+      }
+      const filePath = path.replace(/'/g, "''");
+      await connection.run(`create view "${mainObjectName}" as select * from read_arrow('${filePath}')`);
     }
 
     if (isSqlite) {
@@ -757,7 +792,8 @@ export class DuckDbFile {
         case 'parquet':
         case 'csv':
         case 'dta':
-          // The view calls read_parquet()/read_csv_auto()/read_dta() afresh on
+        case 'arrow':
+          // The view calls read_parquet()/read_csv_auto()/read_dta()/read_arrow() afresh on
           // every query, so each query already re-reads the file — there is
           // genuinely nothing to refresh. The exception is a view an edit has
           // materialized into a real table, where this connection's data no
@@ -914,7 +950,14 @@ export class DuckDbFile {
       // into a table via an edit, the backup itself is still the original
       // pre-edit flat file on disk — read back with the same read_* function
       // used to open it in the first place, regardless of materialization.)
-      const readFn = this.kind === 'parquet' ? 'read_parquet' : this.kind === 'dta' ? 'read_dta' : 'read_csv_auto';
+      const readFn =
+        this.kind === 'parquet'
+          ? 'read_parquet'
+          : this.kind === 'dta'
+            ? 'read_dta'
+            : this.kind === 'arrow'
+              ? 'read_arrow'
+              : 'read_csv_auto';
       await this.connection.run(`attach ':memory:' as backup_cmp`);
       await this.connection.run('use backup_cmp');
       await this.connection.run(
@@ -1193,6 +1236,8 @@ export class DuckDbFile {
       // Outputs Stata format 119 (Stata 15) — the dta extension's write
       // format, regardless of the original file's own format version.
       await this.connection.run(`copy ${table} to '${filePath}' (format dta)`);
+    } else if (this.kind === 'arrow') {
+      await this.connection.run(`copy ${table} to '${filePath}' (format arrow)`);
     }
   }
 

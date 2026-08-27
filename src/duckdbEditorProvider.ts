@@ -746,7 +746,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
   }
 
   private async openDocumentInternal(uri: vscode.Uri, forceKind?: FileKind): Promise<DuckDBDocument> {
-    const isFlatFile = forceKind === undefined && /\.(parquet|csv|dta)$/i.test(uri.fsPath);
+    const isFlatFile = forceKind === undefined && /\.(parquet|csv|dta|arrows?)$/i.test(uri.fsPath);
     if (isFlatFile && this.openFlatFilePaths.has(uri.fsPath)) {
       const message = `${basename(
         uri.fsPath
