@@ -242,6 +242,24 @@ Comments, text values and quoted column names are ignored when deciding, so
 an ordinary query over a column containing `;` or the word `update` still
 runs.
 
+### How many rows are there really?
+
+The footer reads `146 of 146 rows shown` — how many you can see, and how many
+your query matches in total. Both numbers are given even when they agree,
+because that is the case where the count on its own is ambiguous: write
+`limit 200` against a 146-row table and you get 146 back, which looks
+identical to a table holding a million rows whose limit cut it at 146.
+
+The total ignores your trailing `LIMIT` but respects your `WHERE` — it answers
+"how many rows does my query match", not "how many rows are in the file", so
+filtering down to 20 rows reports 20. A `LIMIT` nested inside a subquery is
+part of what the query means and is left alone.
+
+It is computed after the rows are already on screen, so a limited query against
+a huge table still appears instantly and the total fills in behind it. During
+live refresh the total is dropped rather than carried, since the data it
+described has just changed.
+
 ### Large results
 
 By default every matching row is sent to the view. If very large results feel
