@@ -58,6 +58,16 @@ pl.read_ipc("in.feather").write_ipc_stream(
 `compat_level` matters: polars writes strings as Arrow `Utf8View` by default,
 which `read_arrow()` rejects with "Unrecognized Field type with value 24".
 
+A truncated `.arrows` file is refused rather than opened. It has to be checked
+explicitly, because `read_arrow()` does not notice: an Arrow stream is a schema
+followed by record batches, and a file that simply stops looks the same to it
+as one that ended. A 50-row stream cut to 90%, 50% or 25% comes back as **zero
+rows and no error** — the schema survives, so you get the right column headers
+over an empty grid, which reads as "the export produced nothing" rather than
+"this file is damaged". The viewer therefore checks for the 8-byte
+end-of-stream marker before reading. A table that genuinely has no rows still
+carries that marker, so an empty dataset opens normally.
+
 `.parquet`/`.csv`/`.dta`/`.arrow` files aren't databases with multiple tables, so
 they're exposed as a single view named after the file — the sidebar will
 show just that one entry, and clicking it previews the file's data like any

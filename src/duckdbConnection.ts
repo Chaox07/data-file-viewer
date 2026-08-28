@@ -10,7 +10,7 @@ import {
   StatementType,
 } from '@duckdb/node-api';
 import { basename, dirname, extname, join } from 'node:path';
-import { chmod, copyFile, stat } from 'node:fs/promises';
+import { chmod, copyFile, open, stat } from 'node:fs/promises';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
 import { listSheets } from './xlsxSheets';
 
@@ -62,6 +62,48 @@ export interface DuckDbFileOpenOptions {
   forceReadOnly?: boolean;
   /** Absolute path to the other half of a hot/cold pair, if one was found — see duckdbEditorProvider.ts's sibling detection. */
   siblingPath?: string;
+}
+
+/**
+ * Refuse a truncated Arrow IPC stream before it can be shown as an empty table.
+ *
+ * read_arrow does not notice. An Arrow stream is a schema message followed by
+ * record batches, and a file that simply stops looks the same to it as one
+ * that ended: cut a 50-row stream to 90%, 50% or 25% and every one of them
+ * comes back as **zero rows and no error**. The schema survives, so the viewer
+ * draws the right column headers over an empty grid — which reads as "this
+ * export produced nothing", not as "this file is damaged". Only cutting past
+ * the schema itself (~5%) produces a real error.
+ *
+ * A complete stream ends with the 8-byte end-of-stream marker: the 0xFFFFFFFF
+ * continuation followed by a zero metadata length. A legitimately EMPTY table
+ * still carries it (verified: a 152-byte zero-row stream ends the same way),
+ * so this separates damaged from empty, which is the distinction read_arrow
+ * loses.
+ */
+const ARROW_END_OF_STREAM = Buffer.from([0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00]);
+
+async function assertArrowStreamComplete(path: string): Promise<void> {
+  const { size } = await stat(path);
+  if (size < ARROW_END_OF_STREAM.length) {
+    throw new Error(
+      `"${basename(path)}" is too small to be an Arrow IPC stream (${size} bytes) — it looks truncated or empty.`
+    );
+  }
+  const handle = await open(path, 'r');
+  try {
+    const tail = Buffer.alloc(ARROW_END_OF_STREAM.length);
+    await handle.read(tail, 0, tail.length, size - tail.length);
+    if (!tail.equals(ARROW_END_OF_STREAM)) {
+      throw new Error(
+        `"${basename(path)}" is not a complete Arrow IPC stream — the end-of-stream marker is missing, ` +
+          `so the file was truncated (a writer that was interrupted, or a partial copy). ` +
+          `Reading it anyway would show an empty table rather than an error.`
+      );
+    }
+  } finally {
+    await handle.close();
+  }
 }
 
 function quoteIdent(name: string): string {
@@ -504,6 +546,7 @@ export class DuckDbFile {
           `Could not load DuckDB's arrow extension — this requires an internet connection the first time it's used on this machine. (${message})`
         );
       }
+      await assertArrowStreamComplete(path);
       const filePath = path.replace(/'/g, "''");
       await connection.run(`create view "${mainObjectName}" as select * from read_arrow('${filePath}')`);
     }
