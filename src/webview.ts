@@ -23,6 +23,8 @@ interface QueryResultFields {
   diffSkipped: boolean;
   hasLimit: boolean;
   truncated?: boolean;
+  /** Rows the query matches ignoring its trailing LIMIT. Arrives after the rows. */
+  totalRows?: number;
   editable: boolean;
   editableTable?: string;
   timeColumnWarning?: string;
@@ -34,6 +36,7 @@ type ExtensionMessage =
   | { command: 'tables'; tables: string[]; combinedTableNames: string[] }
   | ({ command: 'queryResult' } & QueryResultFields)
   | ({ command: 'sortQueryResult' } & QueryResultFields)
+  | { command: 'rowTotal'; sql: string; total: number }
   | { command: 'error'; message: string }
   | { command: 'backupStatus'; message: string }
   | { command: 'tableChangeStatus'; status: Record<string, TableStatus> }
@@ -138,6 +141,8 @@ const liveStatusEl = document.getElementById('live-status') as HTMLSpanElement;
 
 let running = false;
 let lastResult: LastResult | undefined;
+/** The query whose row total is still in flight; see runQuery and the 'rowTotal' case. */
+let awaitingTotalForSql: string | undefined;
 let sortState: { columnIndex: number; direction: 'asc' | 'desc' } | undefined;
 let combinedTableNames = new Set<string>();
 let liveEnabled = false;
@@ -202,6 +207,10 @@ function runQuery(sqlText: string): void {
   if (!trimmed) return;
   setRunning(true);
   statusEl.textContent = 'Running…';
+  // Remembered so a 'rowTotal' arriving late can be matched to the query it
+  // counted -- it is computed after the rows are already on screen, and by
+  // then the user may have run something else.
+  awaitingTotalForSql = trimmed;
   vscode.postMessage({ command: 'runQuery', sql: trimmed });
 }
 
@@ -883,6 +892,11 @@ function renderResults(preserveScroll = false): void {
   renderRowsInto(table, preservedScrollTop, wasPinnedToBottom);
 }
 
+/** Thousands separators, so a six-figure row count is readable at a glance. */
+function fmtCount(n: number): string {
+  return n.toLocaleString();
+}
+
 /** Body + footer only. Split out so a live tick can refresh the rows under an untouched header. */
 function renderRowsInto(table: HTMLTableElement, preservedScrollTop: number, wasPinnedToBottom: boolean): void {
   const { rows } = lastResult!;
@@ -905,7 +919,17 @@ function renderRowsInto(table: HTMLTableElement, preservedScrollTop: number, was
 
   const footer = document.createElement('div');
   footer.className = 'results-footer';
-  footer.textContent = `${rows.length} row${rows.length === 1 ? '' : 's'} shown`;
+  // "146 rows shown" cannot say whether 146 IS the answer or merely where it
+  // stopped — write `limit 200` against a 146-row table and you get the same
+  // footer you would get if a million rows were waiting behind it. So the
+  // total is spelled out even when the two match: "146 of 146" is redundant
+  // only until it is the thing you needed to know.
+  const total = lastResult!.totalRows;
+  const shown = rows.length;
+  footer.textContent =
+    total === undefined
+      ? `${fmtCount(shown)} row${shown === 1 ? '' : 's'} shown`
+      : `${fmtCount(shown)} of ${fmtCount(total)} row${total === 1 ? '' : 's'} shown`;
 
   if (lastResult!.truncated) {
     // The count above is the whole story only when nothing was cut -- say so
@@ -1017,6 +1041,16 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
       pinnedToBottom = false;
       renderResults();
       break;
+    case 'rowTotal':
+      // Late-arriving companion to the queryResult above. Ignored unless it
+      // counted the query currently on screen — the user can run something
+      // else while a count is still running, and a total from the previous
+      // query under these rows would be worse than no total at all.
+      if (lastResult && message.sql === awaitingTotalForSql) {
+        lastResult.totalRows = message.total;
+        renderResults();
+      }
+      break;
     case 'sortQueryResult':
       setRunning(false);
       statusEl.textContent = '';
@@ -1030,6 +1064,10 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
         diffSkipped: message.diffSkipped,
         hasLimit: message.hasLimit,
         truncated: message.truncated,
+        // Sorting re-orders the same matching rows and re-applies the same
+        // LIMIT, so the total is unchanged — carried across rather than
+        // recomputed, which would re-run the count on every column click.
+        totalRows: lastResult?.totalRows,
         editable: message.editable,
         editableTable: message.editableTable,
         // DuckDB ordered these across the full data set; computeDisplayOrder
@@ -1101,6 +1139,12 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
           diffSkipped: r.diffSkipped,
           hasLimit: r.hasLimit,
           truncated: r.truncated,
+          // Deliberately NOT carried across. A live tick means the underlying
+          // data just moved, so the previous total is exactly the number that
+          // has stopped being true — the footer drops back to "N rows shown"
+          // rather than asserting a stale one. Recounting every tick would
+          // double the cost of the poll loop to state something that is
+          // already about to change again.
           editable: r.editable,
           editableTable: r.editableTable,
           // A live tick re-runs the user's own query, which carries whatever

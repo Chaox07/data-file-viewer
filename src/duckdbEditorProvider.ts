@@ -584,6 +584,40 @@ async function runLiveTick(document: DuckDBDocument, webview: vscode.Webview, ge
   });
 }
 
+/**
+ * Send the footer its "of N" total, once it is known.
+ *
+ * Posted as a follow-up rather than folded into the queryResult above,
+ * because the count is a SECOND execution of the query without its LIMIT.
+ * `select * from big limit 100` returns instantly and its count does not, so
+ * blocking the grid on it would make every limited query feel as slow as the
+ * unlimited one it was written to avoid. The rows land first and the total
+ * fills in behind them.
+ *
+ * Skipped entirely when the rows in hand already are the total: no trailing
+ * LIMIT and nothing cut by maxResultRows means the count is `rows.length`,
+ * and re-running the whole query to rediscover a number we have would be the
+ * expensive way to learn nothing.
+ */
+async function reportRowTotal(
+  document: DuckDBDocument,
+  webview: vscode.Webview,
+  sql: string,
+  result: { rows: unknown[][]; truncated?: boolean }
+): Promise<void> {
+  const couldBeMore = result.truncated === true || hasTrailingLimit(sql);
+  if (!couldBeMore) {
+    webview.postMessage({ command: 'rowTotal', sql, total: result.rows.length });
+    return;
+  }
+  const total = await document.runExclusive(() => document.file.countMatchingRows(sql)).catch(() => undefined);
+  if (total === undefined) return;
+  // The user may have run something else while the count was in flight; a
+  // stale total under a newer result would be worse than none at all. The
+  // webview checks this against the query the footer belongs to.
+  webview.postMessage({ command: 'rowTotal', sql, total });
+}
+
 async function startLiveRefresh(
   document: DuckDBDocument,
   webview: vscode.Webview,
@@ -1043,6 +1077,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             editable: editability.editable,
             editableTable: editability.editable ? editability.table : undefined,
           });
+          void reportRowTotal(document, webview, sql, result);
         } catch (err) {
           const message2 = (err as Error).message;
           webview.postMessage({

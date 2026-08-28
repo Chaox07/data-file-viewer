@@ -982,6 +982,43 @@ export class DuckDbFile {
     return { ...result, sortedSql };
   }
 
+  /**
+   * How many rows this query matches in total, ignoring its trailing LIMIT.
+   *
+   * "247 rows shown" cannot answer the question people actually have, which is
+   * whether that is the whole answer. Write `limit 200` against a 146-row
+   * table and you get 146 back — the same footer you would get if the table
+   * held a million rows and your limit had cut it. The two cases are
+   * indistinguishable from the count alone, and the cap note below only fires
+   * for the viewer's OWN maxResultRows, never for a LIMIT you typed.
+   *
+   * Only the trailing LIMIT is stripped, by the same `extractTrailingLimit`
+   * the sort path uses, so a LIMIT nested inside the query's own logic is left
+   * alone. WHERE clauses are deliberately NOT stripped: the useful total is
+   * "how many rows your query matches", not "how many rows the table holds" —
+   * the filter is part of the question being asked.
+   *
+   * Returns undefined rather than throwing. A count is a nicety; a query whose
+   * shape defeats the wrapper (or that gets cancelled) must still show its
+   * rows.
+   */
+  async countMatchingRows(sql: string): Promise<number | undefined> {
+    try {
+      const stripped = stripTrailingSemicolon(sql);
+      const extracted = extractTrailingLimit(stripped);
+      const inner = extracted ? extracted.withoutLimit : stripped;
+      const reader = await this.connection.runAndReadAll(
+        `select count(*) from ${wrapAsSubquery(inner)} as _rowcount`
+      );
+      const value = reader.getRows()[0]?.[0];
+      // count(*) comes back as a BIGINT, so the driver hands over a bigint.
+      const total = typeof value === 'bigint' ? Number(value) : Number(value);
+      return Number.isFinite(total) ? total : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** Flushes pending writes to disk, then copies the file. Returns the backup path. */
   async createBackup(): Promise<string> {
     if (this.kind === 'kdb') {
