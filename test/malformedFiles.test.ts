@@ -53,6 +53,27 @@ async function assertRefused(path: string, what: string): Promise<void> {
   );
 }
 
+/**
+ * Assert a file is refused AND that the message names the right problem.
+ *
+ * "Did it throw" is not enough for the cases below. A Feather file thrown out
+ * as "truncated", or as DuckDB's own "Expected -1 field nodes in message but
+ * found 2", is refused correctly and diagnosed wrongly -- and the wrong
+ * diagnosis sends someone looking for an interrupted writer when the fix is
+ * one method name away. What is under test is the sentence, not the throw.
+ */
+async function assertRefusedWith(path: string, what: string, expected: RegExp): Promise<void> {
+  await assert.rejects(
+    () => openAndRead(path),
+    (err: unknown) => {
+      assert.ok(err instanceof Error, `${what}: threw a non-Error (${typeof err})`);
+      assert.match(err.message, expected, `${what}: refused, but not for the stated reason`);
+      return true;
+    },
+    `${what}: was read without complaint instead of being refused`
+  );
+}
+
 before(async () => {
   dir = await mkdtemp(join(tmpdir(), 'dfv-malformed-'));
   const instance = await DuckDBInstance.create(':memory:');
@@ -71,15 +92,34 @@ before(async () => {
   await dbConnection.run(`create table t as select i as id from range(1, 11) s(i)`);
   dbConnection.closeSync();
 
-  // The trap this project actually hit: Feather (a.k.a. Arrow IPC *file*) and
-  // Arrow IPC *stream* share a name and a library, and read_arrow reads only
-  // the stream one. Written here under the .arrows name a user would give it.
-  await connection.run(`copy t to '${q('feather-in-disguise.arrows')}' (format parquet)`);
+  // A wholly different format wearing the .arrows name.
+  await connection.run(`copy t to '${q('parquet-in-disguise.arrows')}' (format parquet)`);
 
   const bytes = async (name: string) => readFile(join(dir, name));
   const parquet = await bytes('good.parquet');
   const arrows = await bytes('good.arrows');
   const duckdb = await bytes('good.duckdb');
+
+  // The trap this project actually hit: Feather (a.k.a. Arrow IPC *file*) and
+  // Arrow IPC *stream* share a name and a library, and read_arrow reads only
+  // the stream one. A Feather file really is the stream body wrapped in the
+  // ASCII magic `ARROW1` at both ends, so building one from the good stream
+  // gives a fixture whose LEADING magic is genuine -- and the leading magic is
+  // the whole of what the viewer inspects to tell the encodings apart. (A
+  // flatbuffers footer would sit before the trailing magic in a real one;
+  // nothing here reads that far.) Written under the .arrows name a user would
+  // give it, which is the only way this reaches the viewer at all -- .feather
+  // is deliberately absent from the editor's selector.
+  await writeFile(
+    join(dir, 'feather-file.arrows'),
+    Buffer.concat([Buffer.from('ARROW1', 'ascii'), Buffer.from([0, 0]), arrows, Buffer.from('ARROW1', 'ascii')])
+  );
+
+  // Feather V1, the legacy encoding pandas wrote for years.
+  await writeFile(
+    join(dir, 'feather-v1.arrows'),
+    Buffer.concat([Buffer.from('FEA1', 'ascii'), arrows])
+  );
 
   // Truncations: header intact, body cut. The case where a naive reader has
   // every reason to believe the file is fine.
@@ -117,10 +157,43 @@ test('the valid controls really do read, so a refusal below means something', as
   }
 });
 
-test('a Feather file under an .arrows name is refused, not silently misread', async () => {
-  // read_arrow handles the STREAM encoding only. The danger is not that this
-  // fails — it is that a container this close to correct might half-decode.
-  await assertRefused(join(dir, 'feather-in-disguise.arrows'), 'feather-as-arrows');
+test('a Parquet file under an .arrows name is refused, not silently misread', async () => {
+  await assertRefused(join(dir, 'parquet-in-disguise.arrows'), 'parquet-as-arrows');
+});
+
+test('a Feather / Arrow IPC file is refused by name, not by symptom', async () => {
+  // The message has to do two jobs: say which of the two same-named encodings
+  // this actually is, and say what to write instead. DuckDB's own error
+  // ("Expected -1 field nodes in message but found 2") does neither.
+  const path = join(dir, 'feather-file.arrows');
+  await assertRefusedWith(path, 'feather-v2 names the format', /Feather \/ Arrow IPC \*file\*/);
+  await assertRefusedWith(path, 'feather-v2 names the magic', /ARROW1/);
+  await assertRefusedWith(path, 'feather-v2 gives the remedy', /write_ipc_stream/);
+
+  await assertRefusedWith(join(dir, 'feather-v1.arrows'), 'feather-v1', /Feather V1/);
+  await assertRefusedWith(join(dir, 'feather-v1.arrows'), 'feather-v1 remedy', /write_ipc_stream/);
+});
+
+test('the Feather check does not swallow the truncation check', async () => {
+  // Order-sensitive in both directions. A Feather file ends with its own
+  // ARROW1 footer rather than the 8-byte end-of-stream marker, so if the
+  // truncation check ran first it would call Feather "truncated"; and if the
+  // Feather check were too loose it would call a truncated stream "Feather".
+  // Both diagnoses are wrong in the way that costs someone an afternoon.
+  await assertRefusedWith(join(dir, 'truncated.arrows'), 'truncated stream', /truncated/i);
+  await assert.rejects(
+    () => openAndRead(join(dir, 'truncated.arrows')),
+    (err: unknown) =>
+      err instanceof Error && !/Feather/i.test(err.message),
+    'a truncated stream was misdiagnosed as a Feather file'
+  );
+});
+
+test('a valid Arrow stream still opens after the Feather check', async () => {
+  // The failure mode a magic-byte check invites: rejecting what it should pass.
+  // That would be worse than the confusing error it replaces.
+  const rows = await openAndRead(join(dir, 'good.arrows'));
+  assert.ok(rows.length > 0, 'the valid Arrow stream was refused');
 });
 
 test('truncated files are refused rather than read up to the cut', async () => {
