@@ -106,6 +106,64 @@ async function assertArrowStreamComplete(path: string): Promise<void> {
   }
 }
 
+/**
+ * Refuse a Feather / Arrow IPC *file* by name, rather than by symptom.
+ *
+ * Arrow has two encodings that share a name, and picking the wrong one is the
+ * single easiest mistake to make when writing a file for this viewer:
+ *
+ *   - the *stream* encoding, which read_arrow() reads: polars'
+ *     write_ipc_stream(), pyarrow's RecordBatchStreamWriter, DuckDB's
+ *     COPY ... TO ... (FORMAT arrow). Conventionally .arrows/.arrow.
+ *   - the *file* encoding, also called Feather V2, which read_arrow() rejects:
+ *     polars' write_ipc(), pyarrow.feather.write_feather(), pandas'
+ *     DataFrame.to_feather(). It begins with the ASCII magic `ARROW1`.
+ *
+ * Not supporting the file encoding is deliberate -- read_arrow is the only
+ * Arrow path here. But the refusal used to arrive as DuckDB's own
+ * "Expected -1 field nodes in message but found 2", which is accurate and
+ * useless: it describes a symptom of the mismatch rather than the mismatch,
+ * and gives no hint that the fix is one method name away.
+ *
+ * Checked BEFORE the truncation check, and that order is load-bearing: a
+ * Feather file ends with its own `ARROW1` footer magic rather than the 8-byte
+ * end-of-stream marker, so assertArrowStreamComplete would otherwise claim it
+ * was truncated -- sending someone to look for an interrupted writer when
+ * nothing is damaged at all.
+ */
+const ARROW_FILE_MAGIC = Buffer.from('ARROW1', 'ascii');
+const FEATHER_V1_MAGIC = Buffer.from('FEA1', 'ascii');
+
+const ARROW_STREAM_REMEDY =
+  `Write it as an Arrow IPC *stream* instead: polars ` +
+  `write_ipc_stream(path, compat_level=pl.CompatLevel.oldest()), pyarrow's ` +
+  `RecordBatchStreamWriter, or DuckDB's COPY ... TO '...' (FORMAT arrow).`;
+
+async function assertNotFeatherFile(path: string): Promise<void> {
+  const head = Buffer.alloc(ARROW_FILE_MAGIC.length);
+  const handle = await open(path, 'r');
+  let bytesRead = 0;
+  try {
+    ({ bytesRead } = await handle.read(head, 0, head.length, 0));
+  } finally {
+    await handle.close();
+  }
+
+  if (bytesRead >= ARROW_FILE_MAGIC.length && head.equals(ARROW_FILE_MAGIC)) {
+    throw new Error(
+      `"${basename(path)}" is a Feather / Arrow IPC *file* — it starts with the ARROW1 magic bytes. ` +
+        `This viewer reads the Arrow IPC *stream* encoding, which is a different byte layout despite ` +
+        `the shared name, so the file cannot be opened as-is. ${ARROW_STREAM_REMEDY}`
+    );
+  }
+  if (bytesRead >= FEATHER_V1_MAGIC.length && head.subarray(0, FEATHER_V1_MAGIC.length).equals(FEATHER_V1_MAGIC)) {
+    throw new Error(
+      `"${basename(path)}" is a legacy Feather V1 file — it starts with the FEA1 magic bytes. ` +
+        `This viewer reads the Arrow IPC stream encoding only. ${ARROW_STREAM_REMEDY}`
+    );
+  }
+}
+
 function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
 }
@@ -546,6 +604,9 @@ export class DuckDbFile {
           `Could not load DuckDB's arrow extension — this requires an internet connection the first time it's used on this machine. (${message})`
         );
       }
+      // Feather first: it is a specific diagnosis, and a Feather file would
+      // otherwise fail the truncation check below and be reported as damaged.
+      await assertNotFeatherFile(path);
       await assertArrowStreamComplete(path);
       const filePath = path.replace(/'/g, "''");
       await connection.run(`create view "${mainObjectName}" as select * from read_arrow('${filePath}')`);

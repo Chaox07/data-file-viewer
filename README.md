@@ -58,6 +58,23 @@ pl.read_ipc("in.feather").write_ipc_stream(
 `compat_level` matters: polars writes strings as Arrow `Utf8View` by default,
 which `read_arrow()` rejects with "Unrecognized Field type with value 24".
 
+Hand one of those files to the viewer under an `.arrows` name and it says so
+directly, rather than passing DuckDB's `Expected -1 field nodes in message but
+found 2` up to you:
+
+> `"matches.arrows"` is a Feather / Arrow IPC \*file\* — it starts with the
+> ARROW1 magic bytes. This viewer reads the Arrow IPC \*stream\* encoding, which
+> is a different byte layout despite the shared name, so the file cannot be
+> opened as-is. Write it as an Arrow IPC \*stream\* instead: polars
+> `write_ipc_stream(path, compat_level=pl.CompatLevel.oldest())`, pyarrow's
+> `RecordBatchStreamWriter`, or DuckDB's `COPY … TO '…' (FORMAT arrow)`.
+
+Legacy Feather V1 (`FEA1` magic, what `pandas.DataFrame.to_feather()` wrote for
+years) gets the same treatment. The check reads the first six bytes and runs
+*before* the truncation check below — a Feather file ends with its own `ARROW1`
+footer rather than the stream's end-of-stream marker, so the other order would
+report it as damaged and send you looking for an interrupted writer.
+
 A truncated `.arrows` file is refused rather than opened. It has to be checked
 explicitly, because `read_arrow()` does not notice: an Arrow stream is a schema
 followed by record batches, and a file that simply stops looks the same to it
