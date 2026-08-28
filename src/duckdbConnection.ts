@@ -10,7 +10,8 @@ import {
   StatementType,
 } from '@duckdb/node-api';
 import { basename, dirname, extname, join } from 'node:path';
-import { chmod, copyFile, open, stat } from 'node:fs/promises';
+import { chmod, copyFile, mkdtemp, open, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
 import { listSheets } from './xlsxSheets';
 
@@ -55,7 +56,7 @@ export interface DescriptiveStats {
   p95: unknown;
 }
 
-export type FileKind = 'duckdb' | 'parquet' | 'sqlite' | 'csv' | 'dta' | 'arrow' | 'xlsx' | 'kdb';
+export type FileKind = 'duckdb' | 'parquet' | 'sqlite' | 'csv' | 'dta' | 'arrow' | 'feather' | 'xlsx' | 'kdb';
 
 export interface DuckDbFileOpenOptions {
   /** Request read-only up front (live-refresh reconnects) instead of trying read-write first. */
@@ -107,61 +108,122 @@ async function assertArrowStreamComplete(path: string): Promise<void> {
 }
 
 /**
- * Refuse a Feather / Arrow IPC *file* by name, rather than by symptom.
+ * Tell the two Arrow encodings apart by their leading magic bytes.
  *
- * Arrow has two encodings that share a name, and picking the wrong one is the
- * single easiest mistake to make when writing a file for this viewer:
+ * Arrow has two byte layouts that share a name, and which one a file is
+ * decides how it has to be opened:
  *
- *   - the *stream* encoding, which read_arrow() reads: polars'
+ *   - the *stream* encoding, which read_arrow() reads directly: polars'
  *     write_ipc_stream(), pyarrow's RecordBatchStreamWriter, DuckDB's
  *     COPY ... TO ... (FORMAT arrow). Conventionally .arrows/.arrow.
- *   - the *file* encoding, also called Feather V2, which read_arrow() rejects:
- *     polars' write_ipc(), pyarrow.feather.write_feather(), pandas'
- *     DataFrame.to_feather(). It begins with the ASCII magic `ARROW1`.
+ *   - the *file* encoding, a.k.a. Feather V2, which read_arrow() cannot read
+ *     at any version: polars' write_ipc(), pyarrow.feather.write_feather(),
+ *     pandas' DataFrame.to_feather(). Begins with the ASCII magic `ARROW1`.
+ *     Feather V1, which pandas wrote for years, begins with `FEA1`.
  *
- * Not supporting the file encoding is deliberate -- read_arrow is the only
- * Arrow path here. But the refusal used to arrive as DuckDB's own
- * "Expected -1 field nodes in message but found 2", which is accurate and
- * useless: it describes a symptom of the mismatch rather than the mismatch,
- * and gives no hint that the fix is one method name away.
- *
- * Checked BEFORE the truncation check, and that order is load-bearing: a
- * Feather file ends with its own `ARROW1` footer magic rather than the 8-byte
- * end-of-stream marker, so assertArrowStreamComplete would otherwise claim it
- * was truncated -- sending someone to look for an interrupted writer when
- * nothing is damaged at all.
+ * Sniffed rather than taken from the extension, because both encodings turn up
+ * under both names in the wild -- and getting it wrong is not a clean failure:
+ * a Feather file ends with its own `ARROW1` footer rather than the stream's
+ * 8-byte end-of-stream marker, so the truncation check would call it damaged.
  */
 const ARROW_FILE_MAGIC = Buffer.from('ARROW1', 'ascii');
 const FEATHER_V1_MAGIC = Buffer.from('FEA1', 'ascii');
 
-const ARROW_STREAM_REMEDY =
-  `Write it as an Arrow IPC *stream* instead: polars ` +
-  `write_ipc_stream(path, compat_level=pl.CompatLevel.oldest()), pyarrow's ` +
-  `RecordBatchStreamWriter, or DuckDB's COPY ... TO '...' (FORMAT arrow).`;
-
-async function assertNotFeatherFile(path: string): Promise<void> {
+async function isFeatherEncoding(path: string): Promise<boolean> {
   const head = Buffer.alloc(ARROW_FILE_MAGIC.length);
-  const handle = await open(path, 'r');
   let bytesRead = 0;
   try {
-    ({ bytesRead } = await handle.read(head, 0, head.length, 0));
-  } finally {
-    await handle.close();
+    const handle = await open(path, 'r');
+    try {
+      ({ bytesRead } = await handle.read(head, 0, head.length, 0));
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return false; // unreadable — let the normal open path report it
+  }
+  if (bytesRead >= ARROW_FILE_MAGIC.length && head.equals(ARROW_FILE_MAGIC)) return true;
+  return bytesRead >= FEATHER_V1_MAGIC.length && head.subarray(0, FEATHER_V1_MAGIC.length).equals(FEATHER_V1_MAGIC);
+}
+
+/**
+ * Convert a Feather file to an Arrow IPC stream in a temp file, and return it.
+ *
+ * DuckDB has no Feather reader — verified against duckdb 1.5.5 with the arrow
+ * community extension loaded: read_arrow() fails on the file encoding whether
+ * or not it is compressed, and no other function in that extension takes one.
+ * So the only way to show a Feather file is to re-encode it, which is what the
+ * apache-arrow JS library is here for: tableFromIPC() reads BOTH encodings,
+ * tableToIPC(t, 'stream') writes the one read_arrow wants.
+ *
+ * The whole table goes through memory, unlike every other format here, which
+ * DuckDB streams off disk. That is inherent to converting rather than reading,
+ * and it is the reason .feather is worth having as its own kind rather than
+ * being treated as just another Arrow file.
+ *
+ * COMPRESSED Feather cannot be handled and is refused with a message saying
+ * so. apache-arrow JS has no IPC codecs at all — it throws "Record batch is
+ * compressed but codec not found" for lz4 and zstd alike (measured 2026-08-28
+ * against apache-arrow 21.2). Worth knowing: read_arrow() itself DOES read
+ * zstd-compressed *streams*, so this limitation is the converter's, not
+ * DuckDB's.
+ */
+async function convertFeatherToStream(path: string): Promise<{ streamPath: string; tempDir: string }> {
+  const arrow = await import('apache-arrow');
+  const { tableFromIPC, tableToIPC, Table, Type, Utf8, vectorFromArray } = arrow;
+
+  /**
+   * Re-encode Utf8View columns as plain Utf8.
+   *
+   * polars writes strings as Arrow Utf8View by DEFAULT, and read_arrow rejects
+   * that type outright: "Unrecognized Field type with value 24" -- 24 being
+   * Type.Utf8View exactly. Converting the container is therefore not enough on
+   * its own; the string columns have to be brought down to a type DuckDB knows,
+   * or every file polars wrote fails after a successful conversion.
+   *
+   * This is the same hazard `compat_level=oldest` exists for on the write side,
+   * arriving from the other direction. It is worth knowing that this was missed
+   * by a green test suite: the fixtures were built from DuckDB's own output,
+   * which is plain Utf8, so the corpus agreed with the code and both were wrong
+   * about real polars files.
+   */
+  const downcastViews = (t: InstanceType<typeof Table>): InstanceType<typeof Table> => {
+    const columns: Record<string, unknown> = {};
+    let changed = false;
+    for (const field of t.schema.fields) {
+      const vector = t.getChild(field.name);
+      if (!vector) continue;
+      if (field.type.typeId === Type.Utf8View) {
+        columns[field.name] = vectorFromArray(vector.toJSON() as (string | null)[], new Utf8());
+        changed = true;
+      } else {
+        columns[field.name] = vector;
+      }
+    }
+    return changed ? new Table(columns as never) : t;
+  };
+
+  let table;
+  try {
+    table = downcastViews(tableFromIPC(await readFile(path)));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/compress/i.test(message)) {
+      throw new Error(
+        `"${basename(path)}" is a COMPRESSED Feather file, which cannot be opened. The converter ` +
+          `this viewer uses to read Feather has no decompression codecs. Re-write it uncompressed ` +
+          `(polars write_ipc(path, compression=None), pyarrow write_feather(df, path, ` +
+          `compression="uncompressed")), or write an Arrow IPC stream instead — a zstd-compressed ` +
+          `.arrows stream opens here without any conversion.`
+      );
+    }
+    throw new Error(`"${basename(path)}" could not be read as a Feather / Arrow IPC file: ${message}`);
   }
 
-  if (bytesRead >= ARROW_FILE_MAGIC.length && head.equals(ARROW_FILE_MAGIC)) {
-    throw new Error(
-      `"${basename(path)}" is a Feather / Arrow IPC *file* — it starts with the ARROW1 magic bytes. ` +
-        `This viewer reads the Arrow IPC *stream* encoding, which is a different byte layout despite ` +
-        `the shared name, so the file cannot be opened as-is. ${ARROW_STREAM_REMEDY}`
-    );
-  }
-  if (bytesRead >= FEATHER_V1_MAGIC.length && head.subarray(0, FEATHER_V1_MAGIC.length).equals(FEATHER_V1_MAGIC)) {
-    throw new Error(
-      `"${basename(path)}" is a legacy Feather V1 file — it starts with the FEA1 magic bytes. ` +
-        `This viewer reads the Arrow IPC stream encoding only. ${ARROW_STREAM_REMEDY}`
-    );
-  }
+  const tempDir = await mkdtemp(join(tmpdir(), 'dfv-feather-'));
+  const streamPath = join(tempDir, `${basename(path, extname(path))}.arrows`);
+  await writeFile(streamPath, Buffer.from(tableToIPC(table, 'stream')));
+  return { streamPath, tempDir };
 }
 
 function quoteIdent(name: string): string {
@@ -450,7 +512,9 @@ export class DuckDbFile {
     private siblingIsSqlite: boolean = false,
     /** The catalog `connect()` started in, before any ATTACH/USE — the parking spot refreshInPlace() needs to DETACH from. */
     private readonly rootCatalogName: string = 'memory',
-    private readonly siblingPath: string | undefined = undefined
+    private readonly siblingPath: string | undefined = undefined,
+    /** Temp dir holding the stream a .feather file was converted into, if any. */
+    private readonly featherTempDir: string | undefined = undefined
   ) {}
 
   isReadOnly(): boolean {
@@ -477,10 +541,20 @@ export class DuckDbFile {
     const isParquet = path.toLowerCase().endsWith('.parquet');
     const isCsv = path.toLowerCase().endsWith('.csv');
     const isDta = path.toLowerCase().endsWith('.dta');
-    const isArrow = /\.arrows?$/i.test(path);
+    // Either Arrow encoding may arrive under either name, so which one this
+    // actually is comes from the magic bytes, not the extension. A Feather
+    // file becomes its own kind: it has to be converted before DuckDB can see
+    // it, and converting makes it view-only (an edit written back through
+    // `COPY ... (FORMAT arrow)` would put a STREAM inside a .feather file).
+    // Set when a Feather file is converted; the instance owns it and removes
+    // it on dispose(), so a session leaves nothing behind in the temp dir.
+    let featherTempDir: string | undefined;
+    const looksArrow = /\.(arrows?|feather)$/i.test(path);
+    const isFeather = looksArrow && (await isFeatherEncoding(path));
+    const isArrow = looksArrow && !isFeather;
     const isXlsx = path.toLowerCase().endsWith('.xlsx');
     const isSqlite = path.toLowerCase().endsWith('.db') || path.toLowerCase().endsWith('.sqlite');
-    const useMemory = isParquet || isCsv || isDta || isArrow || isXlsx || isSqlite;
+    const useMemory = isParquet || isCsv || isDta || isArrow || isFeather || isXlsx || isSqlite;
     const kind: FileKind = isParquet
       ? 'parquet'
       : isCsv
@@ -489,11 +563,13 @@ export class DuckDbFile {
           ? 'dta'
           : isArrow
             ? 'arrow'
-            : isXlsx
-              ? 'xlsx'
-              : isSqlite
-                ? 'sqlite'
-                : 'duckdb';
+            : isFeather
+              ? 'feather'
+              : isXlsx
+                ? 'xlsx'
+                : isSqlite
+                  ? 'sqlite'
+                  : 'duckdb';
     // Live-refresh reconnects request read-only up front rather than trying
     // read-write first and falling back on a lock conflict — there's never a
     // reason for a live tick to want read-write, and going through the
@@ -584,17 +660,11 @@ export class DuckDbFile {
       await connection.run(`create view "${mainObjectName}" as select * from read_dta('${filePath}')`);
     }
 
-    if (isArrow) {
-      // Same single-view treatment as Parquet/CSV/dta. Uses DuckDB's community
-      // `arrow` extension, whose read_arrow() reads the Arrow IPC *stream*
-      // encoding -- the one `COPY ... TO ... (FORMAT arrow)` and polars'
-      // write_ipc_stream() produce, conventionally .arrows/.arrow.
-      //
-      // A Feather/IPC *file* (the `ARROW1` magic that pyarrow's write_feather
-      // and polars' write_ipc produce) is a DIFFERENT encoding and read_arrow
-      // rejects it -- "Expected -1 field nodes in message but found 2". That is
-      // why .feather is deliberately not in the selector: claiming it would
-      // open a viewer that fails on the majority of files carrying that name.
+    if (isArrow || isFeather) {
+      // Same single-view treatment as Parquet/CSV/dta, through DuckDB's
+      // community `arrow` extension. read_arrow() reads the Arrow IPC *stream*
+      // encoding only, so a Feather file is converted to one first and the
+      // view is built over the conversion instead of the original.
       try {
         await connection.run(`install arrow from community`);
         await connection.run(`load arrow`);
@@ -604,11 +674,19 @@ export class DuckDbFile {
           `Could not load DuckDB's arrow extension — this requires an internet connection the first time it's used on this machine. (${message})`
         );
       }
-      // Feather first: it is a specific diagnosis, and a Feather file would
-      // otherwise fail the truncation check below and be reported as damaged.
-      await assertNotFeatherFile(path);
-      await assertArrowStreamComplete(path);
-      const filePath = path.replace(/'/g, "''");
+
+      let readPath = path;
+      if (isFeather) {
+        const converted = await convertFeatherToStream(path);
+        readPath = converted.streamPath;
+        featherTempDir = converted.tempDir;
+      } else {
+        // Only a real stream can be checked this way: a Feather file ends with
+        // its own ARROW1 footer rather than the end-of-stream marker, and the
+        // conversion above always produces a complete stream anyway.
+        await assertArrowStreamComplete(path);
+      }
+      const filePath = readPath.replace(/'/g, "''");
       await connection.run(`create view "${mainObjectName}" as select * from read_arrow('${filePath}')`);
     }
 
@@ -719,7 +797,8 @@ export class DuckDbFile {
       siblingCatalogName,
       siblingIsSqlite,
       rootCatalogName,
-      options?.siblingPath
+      options?.siblingPath,
+      featherTempDir
     );
   }
 
@@ -948,6 +1027,7 @@ export class DuckDbFile {
         case 'csv':
         case 'dta':
         case 'arrow':
+        case 'feather':
         case 'xlsx':
           // The view calls read_parquet()/read_csv_auto()/read_dta()/read_arrow()/
           // read_xlsx() afresh on
@@ -1514,5 +1594,11 @@ export class DuckDbFile {
 
   dispose(): void {
     this.connection.closeSync();
+    if (this.featherTempDir) {
+      // Fire-and-forget: dispose() is synchronous by contract, and a temp file
+      // left behind on a failed unlink is a far smaller problem than a throw
+      // out of teardown. The OS clears the directory eventually either way.
+      void rm(this.featherTempDir, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 }

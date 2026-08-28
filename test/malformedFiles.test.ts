@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DuckDBInstance } from '@duckdb/node-api';
 import { zipSync, strToU8 } from 'fflate';
+import { tableFromIPC, tableToIPC } from 'apache-arrow';
 import { DuckDbFile } from '../src/duckdbConnection';
 
 /**
@@ -24,6 +25,18 @@ import { DuckDbFile } from '../src/duckdbConnection';
  * That is why `openAndRead` below always does both, and why "did open() throw"
  * is never asserted on its own — it would pass for the wrong reason.
  */
+
+// Written by polars with its DEFAULT compat level, so its string columns are
+// Utf8View -- the type read_arrow rejects as "Unrecognized Field type with
+// value 24". This fixture exists because the suite passed WITHOUT it while
+// real polars files failed: every other Arrow fixture here comes from DuckDB,
+// which writes plain Utf8, so the corpus and the code were wrong together.
+const FEATHER_UTF8VIEW_B64 =
+  'QVJST1cxAAAEAAAA8v///xQAAAAEAAEAAAAKAAsACAAKAAQA+P///wwAAAAIAAgAAAAEAAIAAAAwAAAABAAAAMT///8cAAAAEAAAAAgAAAABGAAAAAAAAPz///8EAAQAAQAAAG4AAADs////OAAAACAAAAAYAAAAAQIAABAAEgAEABAAEQAIAAAADAAAAAAA9P///0AAAAABAAAACAAJAAQACAACAAAAaWQAAAAAAAD/////yAAAAAQAAADs////gAAAAAAAAAAUAAAABAADAAwAEwAQABIADAAEAOb///8DAAAAAAAAAHQAAAAoAAAAFAAAAAAADgAYAAQADAAQAAAAFAABAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAMAAAAAAAAAAAAAAAAgAAAAMAAAAAAAAAAAAAAAAAAAADAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAACAAAAAAAAAAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAABhAAAAAAAAAAAAAAABAAAAYgAAAAAAAAAAAAAAAQAAAGMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/////AAAAAAQAAADs////QAAAADgAAAAUAAAABAAAAAwAEgAQAAQACAAMAAEAAACwAAAAAAAAANAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAAPj///8MAAAACAAIAAAABAACAAAAMAAAAAQAAADE////HAAAABAAAAAIAAAAARgAAAAAAAD8////BAAEAAEAAABuAAAA7P///zgAAAAgAAAAGAAAAAECAAAQABIABAAQABEACAAAAAwAAAAAAPT///9AAAAAAQAAAAgACQAEAAgAAgAAAGlkAM8AAABBUlJPVzE=';
+const FEATHER_LZ4_B64 =
+  'QVJST1cxAAAEAAAA8v///xQAAAAEAAEAAAAKAAsACAAKAAQA+P///wwAAAAIAAgAAAAEAAIAAAAwAAAABAAAAMT///8cAAAAEAAAAAgAAAABGAAAAAAAAPz///8EAAQAAQAAAG4AAADs////OAAAACAAAAAYAAAAAQIAABAAEgAEABAAEQAIAAAADAAAAAAA9P///0AAAAABAAAACAAJAAQACAACAAAAaWQAAAAAAAD/////2AAAAAQAAADs////gAAAAAAAAAAUAAAABAADAAwAEwAQABIADAAEAN7///8DAAAAAAAAAIQAAAA4AAAALAAAABgAAAAAAAAAAAAOABwABAAMABAAFAAYAAEAAAAAAAAAAAAAAAAAAAD8////BAAEAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAyAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAEAAAAAAAAAAAAAAAAIAAAADAAAAAAAAAAAAAAAAAAAAAwAAAAAAAAAAAAAAAAAAABgAAAAAAAAABCJNGFRArhMAAAAiAQABABICBwCQAAMAAAAAAAAAZUJ+lgAAAABJmhwqAAAAAAAAAAAAAAAAAAAwAAAAAAAAAAQiTRhUQK4hAAAAZgEAAABhAAEAABAAFmIPABAAIADAYwAAAAAAAAAAAAAAVr8TPQAAAABUomTn/////wAAAAAEAAAA7P///0AAAAA4AAAAFAAAAAQAAAAMABIAEAAEAAgADAABAAAAsAAAAAAAAADgAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAD4////DAAAAAgACAAAAAQAAgAAADAAAAAEAAAAxP///xwAAAAQAAAACAAAAAEYAAAAAAAA/P///wQABAABAAAAbgAAAOz///84AAAAIAAAABgAAAABAgAAEAASAAQAEAARAAgAAAAMAAAAAAD0////QAAAAAEAAAAIAAkABAAIAAIAAABpZADPAAAAQVJST1cx';
+const FEATHER_ZSTD_B64 =
+  'QVJST1cxAAAEAAAA8v///xQAAAAEAAEAAAAKAAsACAAKAAQA+P///wwAAAAIAAgAAAAEAAIAAAAwAAAABAAAAMT///8cAAAAEAAAAAgAAAABGAAAAAAAAPz///8EAAQAAQAAAG4AAADs////OAAAACAAAAAYAAAAAQIAABAAEgAEABAAEQAIAAAADAAAAAAA9P///0AAAAABAAAACAAJAAQACAACAAAAaWQAAAAAAAD/////2AAAAAQAAADs////gAAAAAAAAAAUAAAABAADAAwAEwAQABIADAAEAN7///8DAAAAAAAAAIQAAAA4AAAAKAAAABgAAAAAAAAAAAAOABwABAAMABAAFAAYAAEAAAAAAAAAAAAAAPr///8BAAYABQAEAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAlAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAACoAAAAAAAAAAAAAAAIAAAADAAAAAAAAAAAAAAAAAAAAAwAAAAAAAAAAAAAAAAAAABgAAAAAAAAAKLUv/QBYpQAAYAEAAgADAAAAAAAAAAIAYOABYAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwAAAAAAAAACi1L/0AWM0AAJABAAAAYQABAAAAYgABAAAAYwADVAYABwEAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/////wAAAAAEAAAA7P///0AAAAA4AAAAFAAAAAQAAAAMABIAEAAEAAgADAABAAAAsAAAAAAAAADgAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAD4////DAAAAAgACAAAAAQAAgAAADAAAAAEAAAAxP///xwAAAAQAAAACAAAAAEYAAAAAAAA/P///wQABAABAAAAbgAAAOz///84AAAAIAAAABgAAAABAgAAEAASAAQAEAARAAgAAAAMAAAAAAD0////QAAAAAEAAAAIAAkABAAIAAIAAABpZADPAAAAQVJST1cx';
 
 let dir: string;
 
@@ -100,26 +113,24 @@ before(async () => {
   const arrows = await bytes('good.arrows');
   const duckdb = await bytes('good.duckdb');
 
-  // The trap this project actually hit: Feather (a.k.a. Arrow IPC *file*) and
-  // Arrow IPC *stream* share a name and a library, and read_arrow reads only
-  // the stream one. A Feather file really is the stream body wrapped in the
-  // ASCII magic `ARROW1` at both ends, so building one from the good stream
-  // gives a fixture whose LEADING magic is genuine -- and the leading magic is
-  // the whole of what the viewer inspects to tell the encodings apart. (A
-  // flatbuffers footer would sit before the trailing magic in a real one;
-  // nothing here reads that far.) Written under the .arrows name a user would
-  // give it, which is the only way this reaches the viewer at all -- .feather
-  // is deliberately absent from the editor's selector.
-  await writeFile(
-    join(dir, 'feather-file.arrows'),
-    Buffer.concat([Buffer.from('ARROW1', 'ascii'), Buffer.from([0, 0]), arrows, Buffer.from('ARROW1', 'ascii')])
-  );
+  // Real Feather (Arrow IPC *file*), the encoding read_arrow cannot read and
+  // the viewer therefore converts. Written by round-tripping the good stream
+  // through apache-arrow -- the same library the conversion uses, and the only
+  // writer available here, since DuckDB cannot produce this encoding at all.
+  // Under BOTH names, because either encoding turns up under either extension
+  // in the wild and the viewer is supposed to sniff rather than trust the name.
+  const featherBytes = Buffer.from(tableToIPC(tableFromIPC(arrows), 'file'));
+  await writeFile(join(dir, 'feather-file.feather'), featherBytes);
+  await writeFile(join(dir, 'feather-file.arrows'), featherBytes);
 
-  // Feather V1, the legacy encoding pandas wrote for years.
-  await writeFile(
-    join(dir, 'feather-v1.arrows'),
-    Buffer.concat([Buffer.from('FEA1', 'ascii'), arrows])
-  );
+  // Compressed Feather, which nothing in JS can write -- apache-arrow ships no
+  // IPC codecs, which is exactly why these have to be refused rather than
+  // opened. Embedded as base64 rather than generated, so the suite stays
+  // self-contained and needs no Python on the machine running it. Each is a
+  // three-row {id, n} table written by polars.
+  await writeFile(join(dir, 'feather-utf8view.feather'), Buffer.from(FEATHER_UTF8VIEW_B64, 'base64'));
+  await writeFile(join(dir, 'feather-lz4.feather'), Buffer.from(FEATHER_LZ4_B64, 'base64'));
+  await writeFile(join(dir, 'feather-zstd.feather'), Buffer.from(FEATHER_ZSTD_B64, 'base64'));
 
   // Truncations: header intact, body cut. The case where a naive reader has
   // every reason to believe the file is fine.
@@ -161,30 +172,47 @@ test('a Parquet file under an .arrows name is refused, not silently misread', as
   await assertRefused(join(dir, 'parquet-in-disguise.arrows'), 'parquet-as-arrows');
 });
 
-test('a Feather / Arrow IPC file is refused by name, not by symptom', async () => {
-  // The message has to do two jobs: say which of the two same-named encodings
-  // this actually is, and say what to write instead. DuckDB's own error
-  // ("Expected -1 field nodes in message but found 2") does neither.
-  const path = join(dir, 'feather-file.arrows');
-  await assertRefusedWith(path, 'feather-v2 names the format', /Feather \/ Arrow IPC \*file\*/);
-  await assertRefusedWith(path, 'feather-v2 names the magic', /ARROW1/);
-  await assertRefusedWith(path, 'feather-v2 gives the remedy', /write_ipc_stream/);
-
-  await assertRefusedWith(join(dir, 'feather-v1.arrows'), 'feather-v1', /Feather V1/);
-  await assertRefusedWith(join(dir, 'feather-v1.arrows'), 'feather-v1 remedy', /write_ipc_stream/);
+test('an uncompressed Feather file OPENS, under either extension', async () => {
+  // DuckDB cannot read the file encoding at all, so this only works because
+  // the file is converted to a stream first. What is being asserted is that
+  // the conversion is wired in and produces the same rows, not merely that
+  // nothing threw.
+  for (const name of ['feather-file.feather', 'feather-file.arrows']) {
+    const rows = await openAndRead(join(dir, name));
+    assert.ok(rows.length > 0, `${name}: opened but read back no rows`);
+    assert.equal(String(rows[0][0]), '1', `${name}: first row is not the row that was written`);
+  }
 });
 
-test('the Feather check does not swallow the truncation check', async () => {
-  // Order-sensitive in both directions. A Feather file ends with its own
-  // ARROW1 footer rather than the 8-byte end-of-stream marker, so if the
-  // truncation check ran first it would call Feather "truncated"; and if the
-  // Feather check were too loose it would call a truncated stream "Feather".
-  // Both diagnoses are wrong in the way that costs someone an afternoon.
+test('a Feather file with polars Utf8View strings opens, not just DuckDB-shaped ones', async () => {
+  // read_arrow rejects Utf8View outright, so converting the CONTAINER is not
+  // enough -- the string columns have to come down to plain Utf8 too. Every
+  // file polars writes by default hits this, and nothing else in this corpus
+  // does, because the rest come from DuckDB.
+  const rows = await openAndRead(join(dir, 'feather-utf8view.feather'));
+  assert.equal(rows.length, 3, 'Utf8View Feather did not read back its rows');
+  assert.equal(String(rows[0][1]), 'a', 'the string column did not survive the downcast');
+});
+
+test('a COMPRESSED Feather file is refused with the reason and the remedy', async () => {
+  // apache-arrow JS ships no IPC codecs, so this cannot be converted. The
+  // message has to say that rather than surface "codec not found", and has to
+  // point at the two ways out.
+  for (const name of ['feather-lz4.feather', 'feather-zstd.feather']) {
+    await assertRefusedWith(join(dir, name), `${name} names the problem`, /COMPRESSED Feather/);
+    await assertRefusedWith(join(dir, name), `${name} gives the remedy`, /compression=None|uncompressed/);
+  }
+});
+
+test('a truncated stream is still diagnosed as truncated, not as Feather', async () => {
+  // The two checks look at opposite ends of the file and must not be confused
+  // for one another: a Feather file ends with its own ARROW1 footer rather
+  // than the end-of-stream marker, so a sloppy split here would report a
+  // truncated stream as a format problem and send someone the wrong way.
   await assertRefusedWith(join(dir, 'truncated.arrows'), 'truncated stream', /truncated/i);
   await assert.rejects(
     () => openAndRead(join(dir, 'truncated.arrows')),
-    (err: unknown) =>
-      err instanceof Error && !/Feather/i.test(err.message),
+    (err: unknown) => err instanceof Error && !/Feather/i.test(err.message),
     'a truncated stream was misdiagnosed as a Feather file'
   );
 });
