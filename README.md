@@ -1,7 +1,7 @@
 # Data File Viewer
 
 A VS Code extension that opens `.duckdb`, `.parquet`, `.csv`, `.dta` (Stata),
-`.arrow`/`.arrows` (Arrow IPC), `.xlsx` (Excel), `.db`/`.sqlite` (SQLite), and kdb+ table files
+`.arrow`/`.arrows`/`.feather` (Arrow IPC), `.xlsx` (Excel), `.db`/`.sqlite` (SQLite), and kdb+ table files
 with a table list ("sheets") in the sidebar,
 an editable SQL query box, and a results grid — modeled on
 [caioricciuti/vs-duckdb-viewer](https://github.com/caioricciuti/vs-duckdb-viewer).
@@ -35,45 +35,56 @@ file has the same one-time internet-on-first-use requirement, for DuckDB's
 `dta` and `arrow` community extensions respectively — as does an `.xlsx` file,
 for DuckDB's `excel` extension.
 
-### A note on `.arrow` vs `.feather`
+### `.arrow`, `.arrows` and `.feather`
 
 Arrow IPC comes in two encodings that share a name and don't share a format.
-This extension reads the **stream** encoding — what `COPY … TO … (FORMAT
-arrow)` in DuckDB, `polars.DataFrame.write_ipc_stream()`, and pyarrow's
-`RecordBatchStreamWriter` produce, conventionally `.arrows` or `.arrow`.
+Both open here, by different routes.
 
-It does **not** read the Feather/IPC **file** encoding (the one starting with
-the `ARROW1` magic bytes, produced by `pyarrow.feather.write_feather()` and
-`polars.DataFrame.write_ipc()`). DuckDB's `read_arrow()` rejects those
-outright, so `.feather` is deliberately left out of the selector rather than
-offered as a viewer that fails on most files carrying that name. To view one,
-re-save it as a stream first:
+The **stream** encoding is read directly, through DuckDB's `arrow` extension —
+what `COPY … TO … (FORMAT arrow)`, `polars.DataFrame.write_ipc_stream()` and
+pyarrow's `RecordBatchStreamWriter` produce. This is the cheaper path: DuckDB
+streams it off disk and never holds the table in memory.
 
-```python
-import polars as pl
-pl.read_ipc("in.feather").write_ipc_stream(
-    "out.arrows", compat_level=pl.CompatLevel.oldest())
-```
+The **file** encoding — Feather V2, the one starting with the `ARROW1` magic,
+produced by `pyarrow.feather.write_feather()`, `polars.DataFrame.write_ipc()`
+and `pandas.DataFrame.to_feather()` — DuckDB cannot read at all. There is no
+`read_feather`, and `read_arrow()` fails on it whether or not it is compressed.
+So the viewer converts it to a stream first, using the `apache-arrow` library,
+and opens the conversion. Two consequences worth knowing:
 
-`compat_level` matters: polars writes strings as Arrow `Utf8View` by default,
-which `read_arrow()` rejects with "Unrecognized Field type with value 24".
+- **The whole table goes through memory**, unlike every other format here.
+  Fine for a search-result export; not what you want for something enormous.
+- **`.feather` files are view-only.** Writing an edit back would mean
+  re-encoding the other way, and `COPY … (FORMAT arrow)` would silently put a
+  *stream* inside a file named `.feather`.
 
-Hand one of those files to the viewer under an `.arrows` name and it says so
-directly, rather than passing DuckDB's `Expected -1 field nodes in message but
-found 2` up to you:
+Which encoding a file actually is comes from its first six bytes, not its
+name — both turn up under both extensions in the wild, and guessing wrong is
+not a clean failure: a Feather file ends with its own `ARROW1` footer rather
+than the stream's end-of-stream marker, so the truncation check below would
+call it damaged.
 
-> `"matches.arrows"` is a Feather / Arrow IPC \*file\* — it starts with the
-> ARROW1 magic bytes. This viewer reads the Arrow IPC \*stream\* encoding, which
-> is a different byte layout despite the shared name, so the file cannot be
-> opened as-is. Write it as an Arrow IPC \*stream\* instead: polars
-> `write_ipc_stream(path, compat_level=pl.CompatLevel.oldest())`, pyarrow's
-> `RecordBatchStreamWriter`, or DuckDB's `COPY … TO '…' (FORMAT arrow)`.
+Two things are handled during the conversion because they otherwise bite:
 
-Legacy Feather V1 (`FEA1` magic, what `pandas.DataFrame.to_feather()` wrote for
-years) gets the same treatment. The check reads the first six bytes and runs
-*before* the truncation check below — a Feather file ends with its own `ARROW1`
-footer rather than the stream's end-of-stream marker, so the other order would
-report it as damaged and send you looking for an interrupted writer.
+**Utf8View.** polars writes strings as Arrow `Utf8View` by default, and
+`read_arrow()` rejects that type outright — "Unrecognized Field type with value
+24", 24 being `Utf8View` exactly. Converting the container is not enough, so
+string columns are brought down to plain `Utf8` on the way through. (On the
+write side, `compat_level=pl.CompatLevel.oldest()` is the same fix from the
+other direction, and is still worth passing.)
+
+**Compression.** `apache-arrow` ships no IPC codecs, so a *compressed* Feather
+file cannot be converted and is refused by name:
+
+> `"data.feather"` is a COMPRESSED Feather file, which cannot be opened. The
+> converter this viewer uses to read Feather has no decompression codecs.
+> Re-write it uncompressed (`polars write_ipc(path, compression=None)`,
+> `pyarrow write_feather(df, path, compression="uncompressed")`), or write an
+> Arrow IPC stream instead — a zstd-compressed `.arrows` stream opens here
+> without any conversion.
+
+That last clause is not a consolation prize: `read_arrow()` genuinely does read
+zstd-compressed *streams*. The limitation is the converter's, not DuckDB's.
 
 A truncated `.arrows` file is refused rather than opened. It has to be checked
 explicitly, because `read_arrow()` does not notice: an Arrow stream is a schema
