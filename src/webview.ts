@@ -4,6 +4,29 @@ import { sql } from '@codemirror/lang-sql';
 import { json } from '@codemirror/lang-json';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { computeSortOrder } from './sortOrder';
+import { pickTimeSeries, isSingleSeries, toSeriesPoints } from './chartSpec';
+// Modular import rather than `from 'echarts'`: the umbrella entry point
+// registers every chart type and component and took the webview bundle from
+// 468 KB to 1.5 MB. This registers the line chart and the five components
+// actually used below.
+import * as echarts from 'echarts/core';
+import { LineChart } from 'echarts/charts';
+import {
+  GridComponent,
+  TooltipComponent,
+  LegendComponent,
+  DataZoomComponent,
+} from 'echarts/components';
+import { CanvasRenderer } from 'echarts/renderers';
+
+echarts.use([
+  LineChart,
+  GridComponent,
+  TooltipComponent,
+  LegendComponent,
+  DataZoomComponent,
+  CanvasRenderer,
+]);
 
 interface VsCodeApi {
   postMessage(message: unknown): void;
@@ -33,7 +56,17 @@ interface QueryResultFields {
 }
 
 type ExtensionMessage =
-  | { command: 'tables'; tables: string[]; combinedTableNames: string[]; previewFirst?: boolean }
+  | { command: 'tables'; tables: string[]; combinedTableNames: string[]; previewFirst?: boolean; autoChart?: boolean }
+  | {
+      command: 'chartResult';
+      xColumn: string;
+      yColumns: string[];
+      columns: string[];
+      rows: unknown[][];
+      truncated: boolean;
+      maxPoints: number;
+    }
+  | { command: 'chartError'; message: string }
   | ({ command: 'queryResult' } & QueryResultFields)
   | ({ command: 'sortQueryResult' } & QueryResultFields)
   | { command: 'rowTotal'; sql: string; total: number }
@@ -93,6 +126,7 @@ root.innerHTML = `
     <div class="main">
       <div class="editor-toolbar">
         <button id="run-btn" title="Run (Ctrl/Cmd+Enter)">Run &#9654;</button>
+        <button id="chart-btn" title="Plot the whole series, ignoring the preview's LIMIT" hidden>Chart &#128200;</button>
         <label id="safe-mode-label" class="toolbar-check" title="Blocks write/destructive statements until unchecked">
           <input type="checkbox" id="safe-mode-check" checked /> Safe Mode
         </label>
@@ -119,6 +153,13 @@ root.innerHTML = `
         </span>
       </div>
       <div id="editor" class="editor"></div>
+      <div id="chart-panel" class="chart-panel" hidden>
+        <div class="chart-header">
+          <span id="chart-title" class="chart-title"></span>
+          <button id="chart-close" class="chart-close" title="Back to the table">Close &#10005;</button>
+        </div>
+        <div id="chart-canvas" class="chart-canvas"></div>
+      </div>
       <div id="results" class="results"></div>
     </div>
   </div>
@@ -138,6 +179,11 @@ const modeLiveRadio = document.getElementById('mode-live-radio') as HTMLInputEle
 const liveOptionsEl = document.getElementById('live-options') as HTMLSpanElement;
 const liveIntervalInput = document.getElementById('live-interval-input') as HTMLInputElement;
 const liveStatusEl = document.getElementById('live-status') as HTMLSpanElement;
+const chartBtn = document.getElementById('chart-btn') as HTMLButtonElement;
+const chartPanelEl = document.getElementById('chart-panel') as HTMLDivElement;
+const chartCanvasEl = document.getElementById('chart-canvas') as HTMLDivElement;
+const chartTitleEl = document.getElementById('chart-title') as HTMLSpanElement;
+const chartCloseBtn = document.getElementById('chart-close') as HTMLButtonElement;
 
 let running = false;
 let lastResult: LastResult | undefined;
@@ -346,8 +392,147 @@ function previewTable(name: string): void {
   runQuery(sqlText);
 }
 
-function renderTables(tables: string[], combined: string[], previewFirst = false): void {
+// ------------------------------------------------------------------- charts
+
+// One navy, and it is the same navy the R plotting scripts use for a lone
+// series. A single line needs a colour, not a palette; the extra entries only
+// come into play when a query puts several numeric columns on one axis.
+const SERIES_COLOURS = ['#000080', '#b0532a', '#2e7d5b', '#7a3d8f', '#a3872c', '#3c6ea5'];
+
+let chart: echarts.ECharts | undefined;
+let chartOpen = false;
+// Whether the NEXT result should open a chart by itself. Set when a file opens
+// with the setting on, and cleared as soon as it is used -- auto-opening is
+// about arriving at a file, so a query run later must not spring a chart.
+let autoChartArmed = false;
+
+function themeTextColour(): string {
+  // The webview inherits VS Code's theme through CSS variables; reading the
+  // resolved value is what lets ECharts, which wants concrete colours, follow
+  // a light/dark switch instead of drawing black axes on a dark ground.
+  const styles = getComputedStyle(document.body);
+  return styles.getPropertyValue('--vscode-editor-foreground').trim() || '#333';
+}
+
+function chartableSpec(): { x: string; y: string[] } | undefined {
+  if (!lastResult) return undefined;
+  return pickTimeSeries(lastResult.columns, lastResult.columnStatsKind);
+}
+
+function updateChartButton(): void {
+  chartBtn.hidden = chartableSpec() === undefined;
+}
+
+function requestChart(): void {
+  const spec = chartableSpec();
+  if (!spec) return;
+  vscode.postMessage({ command: 'chartQuery', xColumn: spec.x, yColumns: spec.y });
+}
+
+function closeChart(): void {
+  chartOpen = false;
+  chartPanelEl.hidden = true;
+  resultsEl.hidden = false;
+  chart?.dispose();
+  chart = undefined;
+}
+
+function showChartMessage(text: string): void {
+  chartOpen = true;
+  resultsEl.hidden = true;
+  chartPanelEl.hidden = false;
+  chart?.dispose();
+  chart = undefined;
+  chartCanvasEl.textContent = text;
+}
+
+function renderChart(message: Extract<ExtensionMessage, { command: 'chartResult' }>): void {
+  if (message.truncated) {
+    // Refused, not truncated. runChartQuery strips the preview's LIMIT so the
+    // chart is of the whole series; drawing the first N here would put back
+    // exactly the lie that stripping it removed, and a chart that stops early
+    // looks identical to a series that ends early.
+    showChartMessage(
+      `Too many points to chart (over ${message.maxPoints.toLocaleString()}). ` +
+      'Narrow the query, or raise dataFileViewer.chartMaxPoints.'
+    );
+    return;
+  }
+
+  const xIndex = message.columns.indexOf(message.xColumn);
+  if (xIndex < 0) {
+    showChartMessage('The chart query did not return its x column.');
+    return;
+  }
+  const xs = message.rows.map((row) => row[xIndex]);
+  const series = message.yColumns.map((name, i) => {
+    const yIndex = message.columns.indexOf(name);
+    const ys = yIndex < 0 ? [] : message.rows.map((row) => row[yIndex]);
+    return {
+      name,
+      type: 'line' as const,
+      showSymbol: false,
+      // No connectNulls: a gap in a series is a fact about the data, and
+      // joining across it draws a segment nobody measured.
+      data: toSeriesPoints(xs, ys),
+      lineStyle: { color: SERIES_COLOURS[i % SERIES_COLOURS.length], width: 1.4 },
+      itemStyle: { color: SERIES_COLOURS[i % SERIES_COLOURS.length] },
+      // large/progressive keep a long daily series interactive. No sampling:
+      // lttb invents sharp spikes at the zoomed-out view that are not in the
+      // data, which is the same reason the R scripts turn it off.
+      large: true,
+      largeThreshold: 2000,
+      progressive: 2000,
+      progressiveThreshold: 2000,
+    };
+  });
+
+  const drawn = series.reduce((n, s) => n + s.data.length, 0);
+  if (drawn === 0) {
+    showChartMessage('Nothing to chart -- no row had both a date and a value.');
+    return;
+  }
+
+  chartOpen = true;
+  resultsEl.hidden = true;
+  chartPanelEl.hidden = false;
+  chartCanvasEl.textContent = '';
+  chartTitleEl.textContent =
+    message.yColumns.length === 1
+      ? `${message.yColumns[0]} -- ${drawn.toLocaleString()} points`
+      : `${message.yColumns.length} series -- ${drawn.toLocaleString()} points`;
+
+  chart?.dispose();
+  chart = echarts.init(chartCanvasEl, undefined, { renderer: 'canvas' });
+  const textColour = themeTextColour();
+  chart.setOption({
+    animation: false,
+    textStyle: { color: textColour },
+    grid: { left: 64, right: 24, top: 16, bottom: 56 },
+    // A single series has nothing to be told apart from, so its legend would
+    // be a caption in the wrong place.
+    legend: message.yColumns.length > 1
+      ? { bottom: 0, textStyle: { color: textColour } }
+      : undefined,
+    tooltip: { trigger: 'axis' },
+    xAxis: { type: 'time', axisLabel: { color: textColour }, axisLine: { lineStyle: { color: textColour } } },
+    yAxis: { type: 'value', scale: true, axisLabel: { color: textColour }, splitLine: { show: true } },
+    // Scroll/pinch to zoom in place, and a brush below for coarse navigation.
+    dataZoom: [{ type: 'inside' }, { type: 'slider', bottom: message.yColumns.length > 1 ? 24 : 8, height: 18 }],
+    series,
+  });
+}
+
+// ECharts sizes itself once at init and does not watch its container, so a
+// split-pane drag or a window resize leaves the canvas at its old size.
+window.addEventListener('resize', () => chart?.resize());
+
+chartBtn.addEventListener('click', () => (chartOpen ? closeChart() : requestChart()));
+chartCloseBtn.addEventListener('click', closeChart);
+
+function renderTables(tables: string[], combined: string[], previewFirst = false, autoChart = false): void {
   combinedTableNames = new Set(combined);
+  autoChartArmed = autoChart;
   tableListEl.innerHTML = '';
   for (const name of tables) {
     const item = document.createElement('div');
@@ -1034,7 +1219,12 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
   const message = event.data;
   switch (message.command) {
     case 'tables':
-      renderTables(message.tables, message.combinedTableNames, message.previewFirst === true);
+      renderTables(
+        message.tables,
+        message.combinedTableNames,
+        message.previewFirst === true,
+        message.autoChart === true
+      );
       break;
     case 'queryResult':
       setRunning(false);
@@ -1058,7 +1248,25 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
       // always starts scrolled to the top — "pinned to bottom" only matters
       // once this same query starts live-ticking.
       pinnedToBottom = false;
+      closeChart();
       renderResults();
+      updateChartButton();
+      // Auto-open only for a table that IS one series -- one date column and
+      // one number, nothing else. Anything richer is a choice about scales and
+      // belongs to whoever clicks the button. Disarmed either way, so this
+      // fires on arriving at a file and never on a query run afterwards.
+      if (autoChartArmed) {
+        autoChartArmed = false;
+        if (lastResult && isSingleSeries(lastResult.columns, lastResult.columnStatsKind)) {
+          requestChart();
+        }
+      }
+      break;
+    case 'chartResult':
+      renderChart(message);
+      break;
+    case 'chartError':
+      showChartMessage(message.message);
       break;
     case 'rowTotal':
       // Late-arriving companion to the queryResult above. Ignored unless it

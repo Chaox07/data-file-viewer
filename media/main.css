@@ -518,3 +518,42 @@ html, body {
   color: #7d8493;
   font-size: 12px;
 }
+
+/* ---- chart panel -------------------------------------------------------
+   Sits where the results grid does and replaces it, rather than splitting the
+   pane: a chart of a series and a table of the same rows are two readings of
+   one thing, and half a grid under half a chart is worse at both. */
+.chart-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: #282c34;
+}
+
+.chart-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+}
+
+.chart-title {
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+.chart-close {
+  margin-left: auto;
+}
+
+/* ECharts measures its container on init, so this needs a real height rather
+   than one that collapses to its (empty) content. */
+.chart-canvas {
+  flex: 1;
+  min-height: 240px;
+  padding: 8px;
+  font-size: 12px;
+  opacity: 0.85;
+}

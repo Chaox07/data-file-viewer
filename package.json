@@ -103,9 +103,20 @@
           "description": "Default Live refresh interval (milliseconds) used when a document has no auto-detected sheet_metadata poll-cadence hint. Also acts as a minimum spacing floor between live ticks."
         },
         "dataFileViewer.previewFirstTableOnOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Preview the first table as soon as a file opens, instead of waiting for a click. For a file holding one table that click is pure ceremony; turn this off if opening a very large file should stay instant."
+        },
+        "dataFileViewer.chartMaxPoints": {
+      "type": "number",
+      "default": 200000,
+      "minimum": 1,
+      "description": "Most points a chart will draw. A chart covers the whole series (the preview's LIMIT is stripped for it), so going over this refuses to draw and reports the real count rather than plotting a prefix that would look like a complete series."
+    },
+    "dataFileViewer.autoChartSingleSeries": {
       "type": "boolean",
       "default": true,
-      "description": "Preview the first table as soon as a file opens, instead of waiting for a click. For a file holding one table that click is pure ceremony; turn this off if opening a very large file should stay instant."
+      "description": "When a file opens onto a table that is exactly one series - one date column and one numeric column, nothing else - show its chart straight away. Tables with more than one numeric column are never auto-charted, since putting them on one axis is a choice about scales."
     },
     "dataFileViewer.debugLiveRefresh": {
           "type": "boolean",
@@ -151,6 +162,7 @@
     "@duckdb/node-api": "1.5.5-r.3",
     "apache-arrow": "^21.2.0",
     "codemirror": "^6.0.1",
+    "echarts": "^6.1.0",
     "fflate": "^0.8.3"
   }
 }

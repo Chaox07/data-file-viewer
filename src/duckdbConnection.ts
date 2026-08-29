@@ -1101,6 +1101,38 @@ export class DuckDbFile {
    * outside, so "sorted" always means sorted across the whole matching
    * data set, not just whatever happened to already be in memory.
    */
+  /**
+   * The x and y columns of `baseSql`, across the WHOLE data set, ordered by x.
+   *
+   * The trailing LIMIT is stripped rather than kept, and that is the point of
+   * this method existing. A table preview runs `LIMIT 100`; charting those 100
+   * rows of a 178-row series draws a line that stops in 2006 and says nothing
+   * about it. A chart of an arbitrary prefix is worse than no chart, because
+   * it looks exactly like a complete one.
+   *
+   * `maxPoints` is a real cap and is reported, not hidden -- see the caller,
+   * which refuses to draw rather than silently truncating. Rows whose x is
+   * null are dropped in SQL: they have no position on a time axis, and leaving
+   * them to be dropped client-side means the cap counts rows that were never
+   * going to be drawn.
+   */
+  async runChartQuery(
+    baseSql: string,
+    xColumn: string,
+    yColumns: string[],
+    maxPoints = 0
+  ): Promise<QueryResult> {
+    const stripped = stripTrailingSemicolon(baseSql);
+    const extracted = extractTrailingLimit(stripped);
+    const inner = extracted ? extracted.withoutLimit : stripped;
+    const x = quoteIdent(xColumn);
+    const selected = [x, ...yColumns.map(quoteIdent)].join(', ');
+    const sql =
+      `select ${selected} from ${wrapAsSubquery(inner)} as _chart ` +
+      `where ${x} is not null order by ${x} asc`;
+    return this.runQuery(sql, maxPoints);
+  }
+
   async runSortedQuery(
     baseSql: string,
     column: string,

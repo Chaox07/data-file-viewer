@@ -40,6 +40,19 @@ function isPreviewFirstTableEnabled(): boolean {
   return vscode.workspace.getConfiguration('dataFileViewer').get<boolean>('previewFirstTableOnOpen', true) !== false;
 }
 
+// Most points a chart will draw. A chart is a picture of the whole series --
+// runChartQuery strips the preview's LIMIT for exactly that reason -- so a cap
+// here is refused rather than applied, with the true count reported. Silently
+// drawing the first N would put the lie back.
+function getChartMaxPoints(): number {
+  const value = vscode.workspace.getConfiguration('dataFileViewer').get<number>('chartMaxPoints', 200_000);
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 200_000;
+}
+
+function isAutoChartEnabled(): boolean {
+  return vscode.workspace.getConfiguration('dataFileViewer').get<boolean>('autoChartSingleSeries', true) !== false;
+}
+
 function getGlobalLiveRefreshIntervalMs(): number {
   const value = vscode.workspace.getConfiguration('dataFileViewer').get<number>('liveRefreshIntervalMs', 2000);
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.max(250, value) : 2000;
@@ -871,7 +884,8 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
       | { command: 'updateCell'; column: string; newValue: unknown; rowValues: Record<string, unknown> }
       | { command: 'toggleLiveRefresh'; enabled: boolean; intervalMs?: number }
       | { command: 'setLiveRefreshInterval'; intervalMs: number }
-      | { command: 'runCombinedQuery'; table: string };
+      | { command: 'runCombinedQuery'; table: string }
+      | { command: 'chartQuery'; xColumn: string; yColumns: string[] };
 
     const messageSub = webview.onDidReceiveMessage(async (message: IncomingMessage) => {
       if (message.command === 'ready') {
@@ -882,6 +896,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             tables,
             combinedTableNames: [...document.combinedQueryMap.values()].map((table) => `${table}_combined`),
             previewFirst: isPreviewFirstTableEnabled(),
+            autoChart: isAutoChartEnabled(),
           });
         } catch (err) {
           webview.postMessage({ command: 'error', message: (err as Error).message });
@@ -1123,6 +1138,35 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
           });
         } catch (err) {
           webview.postMessage({ command: 'error', message: (err as Error).message });
+        }
+        return;
+      }
+
+      if (message.command === 'chartQuery') {
+        // Runs against document.lastSql, so the chart follows whatever is on
+        // screen -- a table preview, or a query somebody wrote. lastSql is
+        // deliberately not overwritten: the grid, editability and stats keep
+        // describing the user's own query, and the chart is a second reading
+        // of it rather than a replacement.
+        if (!document.lastSql) return;
+        const cap = getChartMaxPoints();
+        try {
+          const result = await document.runExclusive(() =>
+            document.file.runChartQuery(document.lastSql!, message.xColumn, message.yColumns, cap)
+          );
+          webview.postMessage({
+            command: 'chartResult',
+            xColumn: message.xColumn,
+            yColumns: message.yColumns,
+            columns: result.columns,
+            rows: result.rows,
+            // `truncated` means the cap actually bit. The webview reports the
+            // refusal instead of drawing a prefix of the series.
+            truncated: result.truncated === true,
+            maxPoints: cap,
+          });
+        } catch (err) {
+          webview.postMessage({ command: 'chartError', message: (err as Error).message });
         }
         return;
       }
