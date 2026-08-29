@@ -102,7 +102,12 @@
           "minimum": 250,
           "description": "Default Live refresh interval (milliseconds) used when a document has no auto-detected sheet_metadata poll-cadence hint. Also acts as a minimum spacing floor between live ticks."
         },
-        "dataFileViewer.debugLiveRefresh": {
+        "dataFileViewer.previewFirstTableOnOpen": {
+      "type": "boolean",
+      "default": true,
+      "description": "Preview the first table as soon as a file opens, instead of waiting for a click. For a file holding one table that click is pure ceremony; turn this off if opening a very large file should stay instant."
+    },
+    "dataFileViewer.debugLiveRefresh": {
           "type": "boolean",
           "default": false,
           "description": "Log Live refresh internals (stat-gate skips, watcher/timer triggers, backoff, auto-detect cache hits) to the \"Data File Viewer: Live Refresh\" output channel."

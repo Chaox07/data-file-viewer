@@ -146,6 +146,19 @@ Two things are different for kdb+ compared to every other format here:
   export is regenerated) — dragging the file onto VS Code's Dock icon works
   just as well and needs no setup at all.
 
+### Opening a file
+
+The first table is previewed as soon as a file opens — the sidebar's top entry
+is selected and `SELECT * FROM "<table>" LIMIT 100` runs against it, exactly as
+if you had clicked it. For the single-table formats there is only ever one
+entry, so that click was the last thing standing between opening a file and
+seeing it; for a `.duckdb` or `.xlsx` the first entry is whatever the writer put
+first, which is normally the data rather than a metadata table.
+
+Turn it off with `dataFileViewer.previewFirstTableOnOpen` (in Settings) if
+opening a very large file should stay instant — a preview is a query, and on a
+big enough table that is a wait rather than a blink.
+
 ### Sorting, stats, and cell editing
 
 Every results grid — table previews and hand-written queries alike — gets:

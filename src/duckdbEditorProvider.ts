@@ -33,6 +33,13 @@ function logLive(message: string): void {
   liveRefreshChannel.appendLine(`[${new Date().toISOString()}] ${message}`);
 }
 
+// Whether opening a file should also preview its first table, rather than
+// leaving an empty grid until something is clicked. Read per message rather
+// than cached so toggling the setting takes effect on the next file opened.
+function isPreviewFirstTableEnabled(): boolean {
+  return vscode.workspace.getConfiguration('dataFileViewer').get<boolean>('previewFirstTableOnOpen', true) !== false;
+}
+
 function getGlobalLiveRefreshIntervalMs(): number {
   const value = vscode.workspace.getConfiguration('dataFileViewer').get<number>('liveRefreshIntervalMs', 2000);
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.max(250, value) : 2000;
@@ -874,6 +881,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             command: 'tables',
             tables,
             combinedTableNames: [...document.combinedQueryMap.values()].map((table) => `${table}_combined`),
+            previewFirst: isPreviewFirstTableEnabled(),
           });
         } catch (err) {
           webview.postMessage({ command: 'error', message: (err as Error).message });

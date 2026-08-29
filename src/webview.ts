@@ -33,7 +33,7 @@ interface QueryResultFields {
 }
 
 type ExtensionMessage =
-  | { command: 'tables'; tables: string[]; combinedTableNames: string[] }
+  | { command: 'tables'; tables: string[]; combinedTableNames: string[]; previewFirst?: boolean }
   | ({ command: 'queryResult' } & QueryResultFields)
   | ({ command: 'sortQueryResult' } & QueryResultFields)
   | { command: 'rowTotal'; sql: string; total: number }
@@ -327,7 +327,26 @@ liveIntervalInput.addEventListener('change', () => {
   vscode.postMessage({ command: 'setLiveRefreshInterval', intervalMs });
 });
 
-function renderTables(tables: string[], combined: string[]): void {
+// What clicking a table in the sidebar does. Named, rather than living inline
+// in the click handler, so opening a file can run the SAME thing — an
+// auto-preview that built its own query would be a second code path to keep in
+// step with this one for no reason.
+function previewTable(name: string): void {
+  if (combinedTableNames.has(name)) {
+    // Not a real table — a synthesized hot+cold union built server-side
+    // (see duckdbConnection.ts's buildCombinedQuery); the extension
+    // rebuilds and runs it directly rather than the usual
+    // `SELECT * FROM "<name>"`, which wouldn't resolve to anything.
+    const baseTable = name.slice(0, -'_combined'.length);
+    runCombinedQuery(baseTable);
+    return;
+  }
+  const sqlText = `SELECT * FROM "${name}" LIMIT 100;`;
+  setEditorText(sqlText);
+  runQuery(sqlText);
+}
+
+function renderTables(tables: string[], combined: string[], previewFirst = false): void {
   combinedTableNames = new Set(combined);
   tableListEl.innerHTML = '';
   for (const name of tables) {
@@ -335,24 +354,24 @@ function renderTables(tables: string[], combined: string[]): void {
     item.className = 'table-item';
     item.textContent = name;
     item.dataset.table = name;
-    item.addEventListener('click', () => {
-      if (combinedTableNames.has(name)) {
-        // Not a real table — a synthesized hot+cold union built server-side
-        // (see duckdbConnection.ts's buildCombinedQuery); the extension
-        // rebuilds and runs it directly rather than the usual
-        // `SELECT * FROM "<name>"`, which wouldn't resolve to anything.
-        const baseTable = name.slice(0, -'_combined'.length);
-        runCombinedQuery(baseTable);
-        return;
-      }
-      const sqlText = `SELECT * FROM "${name}" LIMIT 100;`;
-      setEditorText(sqlText);
-      runQuery(sqlText);
-    });
+    item.addEventListener('click', () => previewTable(name));
     tableListEl.appendChild(item);
   }
   if (tables.length === 0) {
     tableListEl.innerHTML = '<div class="empty">No tables found.</div>';
+  }
+  // Show the first table straight away. For the single-table formats
+  // (.parquet/.csv/.dta/.arrow/.arrows/.feather) there is exactly one entry
+  // and clicking it was the only thing left to do; for a .duckdb or .xlsx the
+  // first entry is the one the writer put first, which is the data rather than
+  // its metadata.
+  //
+  // Safe to do unconditionally when enabled: this webview keeps no state
+  // across reloads (there is no getState/setState anywhere in this file), so
+  // there is never a hand-written query here to overwrite — the editor is
+  // empty every time this message arrives.
+  if (previewFirst && tables.length > 0) {
+    previewTable(tables[0]);
   }
 }
 
@@ -1015,7 +1034,7 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
   const message = event.data;
   switch (message.command) {
     case 'tables':
-      renderTables(message.tables, message.combinedTableNames);
+      renderTables(message.tables, message.combinedTableNames, message.previewFirst === true);
       break;
     case 'queryResult':
       setRunning(false);
