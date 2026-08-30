@@ -67,6 +67,13 @@ const SPLIT_LINE = '#e8e8e8';
 /** The x axis these charts always have exactly one of. */
 const X_AXIS_INDEX = 0;
 
+// A drag narrower than this is a click, not a zoom. Load-bearing for
+// double-click-to-reset: with the brush cursor active every click IS a
+// zero-width drag, so without this floor the two clicks of a double-click
+// each zoom into a slice a few pixels wide before the dblclick arrives, and
+// the reset lands on a chart that has already thrown its range away.
+const MIN_DRAG_PX = 6;
+
 const vscode = acquireVsCodeApi();
 
 const root = document.getElementById('chart-root');
@@ -83,18 +90,30 @@ canvasEl.className = 'chart-canvas';
 // series would see it come back just from zooming out.
 const resetEl = document.createElement('button');
 resetEl.className = 'chart-reset';
-resetEl.title = 'Reset zoom';
+resetEl.title = 'Reset zoom (or double-click the plot)';
 resetEl.textContent = '⟲';
 resetEl.hidden = true;
-resetEl.addEventListener('click', () => {
-  chart?.dispatchAction({ type: 'dataZoom', xAxisIndex: X_AXIS_INDEX, start: 0, end: 100 });
-});
+resetEl.addEventListener('click', () => resetZoom());
 plotEl.appendChild(canvasEl);
 plotEl.appendChild(resetEl);
 root.appendChild(titleEl);
 root.appendChild(plotEl);
 
+// Bound once, on the container, rather than through chart.on('dblclick'):
+// zrender never sees a double-click here, because the brush cursor consumes
+// both clicks as drags of its own. The browser still dispatches a native
+// dblclick — brush calls preventDefault on mousedown/mouseup, which suppresses
+// selection and focus but not the click pair — so the DOM is where this has to
+// be listened for.
+canvasEl.addEventListener('dblclick', () => resetZoom());
+
 let chart: echarts.ECharts | undefined;
+
+function resetZoom(): void {
+  if (!chart) return;
+  chart.dispatchAction({ type: 'dataZoom', xAxisIndex: X_AXIS_INDEX, start: 0, end: 100 });
+  chart.dispatchAction({ type: 'brush', areas: [] });
+}
 
 function showMessage(text: string): void {
   chart?.dispose();
@@ -164,7 +183,7 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
   titleEl.textContent = heading;
   const hintEl = document.createElement('span');
   hintEl.className = 'chart-hint';
-  hintEl.textContent = 'drag across the plot to zoom · scroll to zoom · ⟲ to reset';
+  hintEl.textContent = 'drag to zoom · scroll to zoom · double-click to reset';
   titleEl.appendChild(hintEl);
   resetEl.hidden = false;
 
@@ -229,13 +248,25 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
   // Turn the dragged range into a zoom, then clear the shape so the next drag
   // starts from a clean plot rather than on top of the last selection.
   chart.on('brushEnd', (params: unknown) => {
-    const range = (params as { areas?: { coordRange?: number[] }[] }).areas?.[0]?.coordRange;
-    if (!range || range.length < 2 || range[0] === range[1]) return;
+    const area = (params as { areas?: { range?: number[]; coordRange?: number[] }[] }).areas?.[0];
+    const pixels = area?.range;
+    const values = area?.coordRange;
+    // `range` is in pixels and `coordRange` in axis values; the floor is
+    // applied to the pixel one because it is about the gesture, not the data.
+    // Always clear the shape, so an ignored click leaves no band behind.
+    if (!values || values.length < 2 || values[0] === values[1]) {
+      chart?.dispatchAction({ type: 'brush', areas: [] });
+      return;
+    }
+    if (pixels && pixels.length >= 2 && Math.abs(pixels[1] - pixels[0]) < MIN_DRAG_PX) {
+      chart?.dispatchAction({ type: 'brush', areas: [] });
+      return;
+    }
     chart?.dispatchAction({
       type: 'dataZoom',
       xAxisIndex: X_AXIS_INDEX,
-      startValue: range[0],
-      endValue: range[1],
+      startValue: values[0],
+      endValue: values[1],
     });
     chart?.dispatchAction({ type: 'brush', areas: [] });
   });

@@ -196,8 +196,9 @@ Every results grid — table previews and hand-written queries alike — gets:
   redraws the same tab rather than opening another one.
 
   The chart opens showing the whole series, and you **drag across the plot**
-  to zoom into a range — the scroll wheel zooms too, and ⟲ in the top right
-  puts it back. There is no slider along the bottom: that is a second, smaller
+  to zoom into a range — the scroll wheel zooms too, and **double-clicking**
+  the plot (or ⟲ in the top right) puts it back. There is no slider along the
+  bottom: that is a second, smaller
   copy of the chart you have to aim at before you can look at the real one.
   The tab is white whatever your editor theme is, since a chart is a figure —
   it ends up in screenshots and documents, where a dark one reads as a
