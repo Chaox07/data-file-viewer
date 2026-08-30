@@ -1092,6 +1092,13 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             };
           });
 
+          // Raised by the query rather than by opening the file — a workbook
+          // whose sheets had to be re-read tolerating uncomputable cells. Said
+          // once, when it first becomes true, rather than on every run.
+          for (const warning of document.file.takeLateWarnings()) {
+            vscode.window.showWarningMessage(`${basename(document.uri.fsPath)}: ${warning}`);
+          }
+
           document.lastEditableTable = editability.editable ? editability.table : undefined;
           document.lastEditableColumns = editability.editable ? editability.columns : undefined;
           document.lastQueriedBaseTable =

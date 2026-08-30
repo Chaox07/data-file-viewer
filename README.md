@@ -137,12 +137,40 @@ a cell quietly becoming blank is exactly the kind of thing worth saying out loud
 column in the sheet into text to rescue one cell, costing sorting, stats and
 charting on all of them.)
 
-**Workbooks are view-only.** DuckDB can write an `.xlsx`, but a workbook is many
-sheets and that writes a file containing one — saving an edit to a single sheet
-would silently destroy every other sheet in the book. (Excel also has no integer
-type, so a round trip turns `1` into `1.0` throughout.) Rather than do either
-quietly behind a double-click, cell editing is simply not offered for `.xlsx`,
-the same as for kdb+ tables.
+**Workbooks are editable, one cell at a time.** Nothing is regenerated. DuckDB
+*can* write an `.xlsx`, and saving through it was never an option: it writes a
+file containing one sheet, so an edit would have destroyed every other sheet in
+the book, along with the edited sheet's formulas and number formats — and Excel
+having no integer type, `1` would have come back as `1.0` throughout.
+
+Instead the workbook is unzipped, the single `<c>` element the edit targets is
+rewritten inside the worksheet XML, and the package is zipped back up. Measured
+on a real ten-sheet workbook: one part changed, one row in it, one cell in that
+row; all 242 formulas (including an external reference and a shared formula) and
+all 640 style attributes byte-identical.
+
+Finding which cell is the hard half, because an edit identifies its row by the
+row's *values* — DuckDB has no stable rowid across the shapes this viewer opens
+— while the file needs a row *number*. Comparing DuckDB's typed values against
+raw XML in JS would mean re-implementing its comparison against dates stored as
+serial numbers and floats stored at Excel's precision; getting that subtly wrong
+is not an error, it is an edit to the wrong cell of your workbook. So DuckDB
+does the matching in its own types and reports the row's ordinal, the header row
+is *found* (the first row carrying every column name) rather than counted to,
+and the cell about to be overwritten must currently hold what the grid was
+showing. Two independent readings have to agree; when they do not, the edit is
+refused and the file is untouched.
+
+Counting to the header is the mistake worth naming, since it looks correct:
+rows-in-file minus rows-in-table is right only for a sheet with nothing below
+its data. The first real workbook this ran against had 136 rows for 121 rows of
+data — notes underneath — which put the "header" fourteen rows into the data.
+
+Two things it does not preserve, both deliberate. A formula in the edited cell
+is replaced by the value you typed (keeping it would mean Excel recomputing your
+edit away on the next open), and a string is written as an inline string rather
+than appended to the shared-string table, which every sheet in the book points
+into.
 
 ### kdb+ tables
 

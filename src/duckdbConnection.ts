@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
 import { KNOWN_FREQUENCIES, type SeriesFrequency } from './chartSpec';
 import { listSheets } from './xlsxSheets';
+import { patchCell as patchXlsxCell } from './xlsxWrite';
 
 export type StatsKind = 'numeric' | 'datetime' | 'other';
 
@@ -621,6 +622,13 @@ export class DuckDbFile {
   private lastBackupPath: string | undefined;
   private backupAttached = false;
   private materialized = false;
+  /** Set once this workbook's views have been re-created with ignore_errors. */
+  private xlsxErrorsTolerated = false;
+  /**
+   * Notices raised after open, by a query rather than by opening the file.
+   * Drained by the caller -- see takeLateWarnings.
+   */
+  private readonly lateWarnings: string[] = [];
 
   private constructor(
     private readonly connection: DuckDBConnection,
@@ -637,7 +645,13 @@ export class DuckDbFile {
     /** Temp dir holding the stream a .feather file was converted into, if any. */
     private readonly featherTempDir: string | undefined = undefined,
     /** Notices about a file that opened successfully; see openWarnings in open(). */
-    readonly openWarnings: readonly string[] = []
+    readonly openWarnings: readonly string[] = [],
+    /**
+     * Sheet name -> its worksheet part inside the package, for .xlsx only.
+     * Carried from open() because listSheets had already read it, and because
+     * an edit has to reach the right part of the zip knowing only the view name.
+     */
+    private readonly xlsxSheetPaths: Map<string, string> = new Map()
   ) {}
 
   isReadOnly(): boolean {
@@ -688,6 +702,8 @@ export class DuckDbFile {
     // that are not visible in the grid, such as a cell shown as empty because
     // the workbook holds #DIV/0! there.
     const openWarnings: string[] = [];
+    // Populated for .xlsx only; see the constructor parameter of the same name.
+    const xlsxSheetPaths = new Map<string, string>();
     const looksArrow = /\.(arrows?|feather)$/i.test(path);
     const isFeather = looksArrow && (await isFeatherEncoding(path));
     const isArrow = looksArrow && !isFeather;
@@ -859,44 +875,12 @@ export class DuckDbFile {
         // O'Brien's Data breaks the whole workbook.
         const asLiteral = sheet.name.replace(/'/g, "''");
         const asIdent = sheet.name.replace(/"/g, '""');
-        const view = (options: string) =>
-          `create view "${asIdent}" as select * from read_xlsx('${filePath}', sheet = '${asLiteral}'${options})`;
         try {
-          await connection.run(view(''));
+          await connection.run(
+            `create view "${asIdent}" as select * from read_xlsx('${filePath}', sheet = '${asLiteral}')`
+          );
+          xlsxSheetPaths.set(sheet.name, sheet.path);
         } catch (err) {
-          // An Excel ERROR VALUE in an otherwise numeric column -- #DIV/0!,
-          // #N/A, #REF!, #VALUE! -- is the common case here, and read_xlsx
-          // refuses the whole sheet over it: "Failed to parse cell 'E122':
-          // Could not convert string '#DIV/0!' to DOUBLE". One broken formula
-          // in one cell, and a 121-row sheet will not open at all.
-          //
-          // ignore_errors reads that cell as NULL and keeps every column's
-          // real type, which is what the value MEANS: #DIV/0! is Excel saying
-          // it has no number here. Measured on the sheet this was reported
-          // from, it changes exactly the one offending cell and nothing else.
-          //
-          // all_varchar would also open the sheet, and is the wrong trade --
-          // it turns every column in the sheet into text to rescue one cell,
-          // which costs sorting, stats and charting on all of them.
-          //
-          // Retried rather than used first, so a clean sheet is still read
-          // with read_xlsx's own type inference and nothing is quietly
-          // tolerated that did not need to be. The sheet is named in
-          // `openWarnings` afterwards: a cell silently becoming NULL is
-          // exactly the kind of thing that has to be said out loud.
-          if (isCellParseError(err)) {
-            try {
-              await connection.run(view(', ignore_errors = true'));
-              openWarnings.push(
-                `Sheet "${sheet.name}" contains cell values Excel could not compute ` +
-                  `(#DIV/0!, #N/A, #REF! and the like). They are shown as empty cells; ` +
-                  `every other value in the sheet is unchanged.`
-              );
-              continue;
-            } catch {
-              // fall through to the failure list below
-            }
-          }
           // One unreadable sheet (a chart sheet, a macro sheet, an empty one)
           // must not cost the user the rest of the workbook.
           failures.push(sheet.name);
@@ -971,7 +955,8 @@ export class DuckDbFile {
       rootCatalogName,
       options?.siblingPath,
       featherTempDir,
-      openWarnings
+      openWarnings,
+      xlsxSheetPaths
     );
   }
 
@@ -1286,6 +1271,80 @@ export class DuckDbFile {
    * deliberately imports no `vscode`; duckdbEditorProvider owns the setting.
    */
   async runQuery(sql: string, maxRows = 0): Promise<QueryResult> {
+    try {
+      return await this.runQueryOnce(sql, maxRows);
+    } catch (err) {
+      // A workbook cell Excel could not compute -- #DIV/0!, #N/A, #REF! -- in
+      // an otherwise numeric column. read_xlsx types the column from its
+      // values and then refuses the whole sheet over one of them.
+      //
+      // Repaired HERE rather than at open, because `create view ... from
+      // read_xlsx(...)` does not read the sheet: it binds a schema and returns,
+      // so the failure only ever surfaces on the first real query. Repairing at
+      // open would have meant scanning every sheet of every workbook up front
+      // to find out whether it was needed.
+      if (!(await this.repairXlsxViewsForCellErrors(err))) throw err;
+      return await this.runQueryOnce(sql, maxRows);
+    }
+  }
+
+  /**
+   * Re-create this workbook's sheet views with `ignore_errors`, once.
+   *
+   * Returns whether anything was repaired, so the caller knows whether
+   * retrying the query is worth it.
+   *
+   * `ignore_errors` reads an uncomputable cell as NULL and keeps every column's
+   * real type, which is what the value MEANS: Excel saying it has no number
+   * there. Measured on the workbook this was reported from, it changes exactly
+   * the one offending cell and nothing else.
+   *
+   * `all_varchar` would also open the sheet and is the wrong trade -- it turns
+   * every column in the sheet into text to rescue one cell, costing sorting,
+   * stats and charting on all of them.
+   *
+   * Every sheet is repaired rather than just the one queried, because the error
+   * does not say which sheet it came from and a query may join several. The
+   * flag makes it happen at most once per open, so a genuinely broken query
+   * cannot loop.
+   */
+  private async repairXlsxViewsForCellErrors(err: unknown): Promise<boolean> {
+    if (this.kind !== 'xlsx' || this.xlsxErrorsTolerated) return false;
+    if (!isCellParseError(err)) return false;
+
+    this.xlsxErrorsTolerated = true;
+    const filePath = this.path.replace(/'/g, "''");
+    const repaired: string[] = [];
+    for (const name of this.xlsxSheetPaths.keys()) {
+      const asLiteral = name.replace(/'/g, "''");
+      const asIdent = name.replace(/"/g, '""');
+      try {
+        await this.connection.run(
+          `create or replace view "${asIdent}" as select * from ` +
+            `read_xlsx('${filePath}', sheet = '${asLiteral}', ignore_errors = true)`
+        );
+        repaired.push(name);
+      } catch {
+        // Leave the original view in place; the caller's rethrow still reports
+        // the real problem.
+      }
+    }
+    if (repaired.length === 0) return false;
+    // Recorded rather than printed: a cell quietly becoming blank has to be
+    // said out loud, and the provider is what has a UI to say it in.
+    this.lateWarnings.push(
+      `This workbook holds cell values Excel could not compute (#DIV/0!, #N/A, #REF! ` +
+        `and the like). They are shown as empty cells; every other value is unchanged.`
+    );
+    return true;
+  }
+
+  /** Warnings raised since the last call. Emptied, so each is reported once. */
+  takeLateWarnings(): string[] {
+    return this.lateWarnings.splice(0, this.lateWarnings.length);
+  }
+
+  private async runQueryOnce(sql: string, maxRows = 0): Promise<QueryResult> {
     const capped = maxRows > 0;
     // One past the cap: that extra row is what distinguishes "exactly maxRows
     // rows exist" from "there were more", without reading the rest.
@@ -1692,13 +1751,16 @@ export class DuckDbFile {
     // an in-memory table purely so this viewer can query it -- there is no
     // write-back path to real kdb+ format, so editing is never offered.
     //
-    // .xlsx is view-only for a different and sharper reason. DuckDB CAN write
-    // one (`copy ... to ... (format xlsx)`), but a workbook is many sheets and
-    // that writes a file containing ONE -- saving an edit to a single sheet
-    // would silently destroy every other sheet in the book. It also has no
-    // integer type, so a round trip turns 1 into 1.0 throughout. Neither is a
-    // trade worth making silently behind a double-click.
-    if (this.readOnly || this.kind === 'kdb' || this.kind === 'xlsx') return { editable: false };
+    // .xlsx used to be refused here for a sharper reason, now addressed rather
+    // than lived with. DuckDB CAN write a workbook (`copy ... to ... (format
+    // xlsx)`) and that was never the problem -- it writes a file containing ONE
+    // sheet, so saving an edit through it would have destroyed every other
+    // sheet in the book, along with the edited sheet's own formulas, number
+    // formats and (Excel having no integer type) the difference between 1 and
+    // 1.0. Nothing is regenerated now: xlsxWrite.ts rewrites the single <c>
+    // element inside the worksheet XML and leaves the rest of the package
+    // byte-for-byte, so none of that is on the table.
+    if (this.readOnly || this.kind === 'kdb') return { editable: false };
     const trimmed = sql.trim();
 
     try {
@@ -1776,6 +1838,14 @@ export class DuckDbFile {
     rowValues: Record<string, unknown>,
     onStatus?: (message: string) => void
   ): Promise<number> {
+    // A workbook is edited in the FILE, not in a materialized copy of it. Every
+    // other kind here can be rewritten wholesale from the table DuckDB holds; an
+    // .xlsx cannot, because that table is one sheet of many and holds none of
+    // what makes a workbook a workbook. See xlsxWrite.ts.
+    if (this.kind === 'xlsx') {
+      return this.updateXlsxCell(table, column, newValue, rowValues, onStatus);
+    }
+
     if (!this.materialized && this.isFlatFileKind()) {
       onStatus?.('Preparing file for editing…');
     }
@@ -1803,6 +1873,74 @@ export class DuckDbFile {
       await this.writeBackFlatFile();
     }
     return rowsChanged;
+  }
+
+  /**
+   * One cell of one sheet, rewritten inside the workbook package.
+   *
+   * The row is identified the way every other edit here identifies one -- full-
+   * row equality on the pre-edit values -- but the answer this needs is a
+   * spreadsheet ROW NUMBER, and comparing DuckDB's typed values against raw
+   * worksheet XML in JS is exactly the kind of nearly-right that ends with the
+   * wrong cell of somebody's workbook overwritten.
+   *
+   * So DuckDB does the matching in its own types and reports the row's ordinal,
+   * and xlsxWrite then CHECKS that the cell it is about to overwrite currently
+   * holds what the grid was showing. Two independent readings have to agree
+   * before anything is written; when they do not, the edit is refused.
+   */
+  private async updateXlsxCell(
+    table: string,
+    column: string,
+    newValue: unknown,
+    rowValues: Record<string, unknown>,
+    onStatus?: (message: string) => void
+  ): Promise<number> {
+    const sheetPath = this.xlsxSheetPaths.get(table);
+    if (!sheetPath) {
+      throw new Error(`"${table}" is not a sheet of this workbook, so it cannot be edited.`);
+    }
+
+    const whereCols = Object.keys(rowValues);
+    const whereClause = whereCols
+      .map((c, i) => `${quoteIdent(c)} is not distinct from $${i + 1}`)
+      .join(' and ');
+    const values = whereCols.map((c) => rowValues[c]) as DuckDBValue[];
+
+    // row_number() over () follows the scan, and read_xlsx scans the sheet in
+    // sheet order -- which is what makes "the Nth row DuckDB returned" mean
+    // "the Nth data row in the XML". Not trusted on its own; verified below.
+    const reader = await this.connection.runAndReadAll(
+      `select rn from (
+         select row_number() over () as rn, * from ${quoteIdent(table)}
+       ) as _rows${whereClause ? ` where ${whereClause}` : ''}`,
+      values
+    );
+    const matches = reader.getRows();
+    if (matches.length === 0) return 0;
+    if (matches.length > 1) {
+      // The same limitation the SQL path carries (identical rows update
+      // together) -- but a file rewrite cannot be half-applied, so here it is
+      // refused rather than applied to all of them.
+      throw new Error(
+        `${matches.length} rows in "${table}" are identical across every column, so there ` +
+          `is no way to tell which one you edited. The workbook was not changed.`
+      );
+    }
+
+    onStatus?.('Saving…');
+    await patchXlsxCell({
+      filePath: this.path,
+      sheetPath,
+      columnName: column,
+      columnNames: whereCols,
+      rowOrdinal: Number(matches[0][0]),
+      expectedCurrent: rowValues[column],
+      newValue,
+    });
+    // The view is `read_xlsx(...)`, re-read on every query, so the next one
+    // already sees the file as it now is. Nothing to invalidate.
+    return 1;
   }
 
   /**
