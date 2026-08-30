@@ -4,7 +4,15 @@
  * grid's.
  */
 
-import { toSeriesPoints, toCategoryLabels, toCategoryValues } from './chartSpec';
+import {
+  toSeriesPoints,
+  toCategoryLabels,
+  toCategoryValues,
+  finiteExtent,
+  padTimeRange,
+  padValueRange,
+  evenBreaks,
+} from './chartSpec';
 // Modular import rather than `from 'echarts'`: the umbrella entry point
 // registers every chart type and component and took a bundle from 468 KB to
 // 1.5 MB. This registers the line chart and the components actually used
@@ -74,6 +82,18 @@ const CHART_FONT = 'serif';
 /** The x axis these charts always have exactly one of. */
 const X_AXIS_INDEX = 0;
 
+/** y ticks per axis -- `y_ticks` in long_run_3.R. */
+const Y_TICKS = 8;
+
+/**
+ * Above this many points IN VIEW the tooltip switches itself off, and back on
+ * once a zoom brings the count down -- `zoom_threshold` in long_run_3.R, and
+ * the reason e_zoom_aware_detail exists over there. With thousands of points
+ * overplotted into the same few pixels, the value under the cursor is not the
+ * value the eye is on, so the number it reports is close to meaningless.
+ */
+const TOOLTIP_POINT_LIMIT = 3000;
+
 // A drag narrower than this is a click, not a zoom. Load-bearing for
 // double-click-to-reset: with the brush cursor active every click IS a
 // zero-width drag, so without this floor the two clicks of a double-click
@@ -128,6 +148,62 @@ function showMessage(text: string): void {
   titleEl.textContent = '';
   resetEl.hidden = true;
   canvasEl.textContent = text;
+}
+
+const MONTHS = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+];
+
+/** Axis labels: three significant digits -- .echarts_number_formatter_js, non-percent branch. */
+function formatAxisNumber(value: number): string {
+  return value.toLocaleString(undefined, { maximumSignificantDigits: 3 });
+}
+
+/** Tooltip values: four significant digits -- build_tooltip_formatter's fmtValue. */
+function formatTooltipNumber(value: number): string {
+  return Number(value).toPrecision(4);
+}
+
+/**
+ * Tooltip date header, in UTC because that is the axis the points were placed
+ * on. The R formatter picks its wording from the sheet's declared frequency
+ * ("2020 Q1", "Jan 2020"); nothing here reads sheet_metadata, so this is the
+ * daily form it uses, with the clock time appended when a point actually
+ * carries one.
+ */
+function formatTooltipDate(ms: number): string {
+  const d = new Date(ms);
+  if (!Number.isFinite(d.getTime())) return '';
+  const date = `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+  const h = d.getUTCHours();
+  const m = d.getUTCMinutes();
+  const s = d.getUTCSeconds();
+  if (h === 0 && m === 0 && s === 0) return date;
+  return `${date} ${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
+interface TooltipParam {
+  marker?: string;
+  seriesName?: string;
+  axisValueLabel?: string;
+  value?: unknown;
+}
+
+/** Bold header, then one `marker name: value` line per series -- build_tooltip_formatter's shape. */
+function formatTooltip(params: TooltipParam[], isCategory: boolean): string {
+  if (!params || params.length === 0) return '';
+  const first = params[0];
+  const header = isCategory
+    ? (first.axisValueLabel ?? '')
+    : formatTooltipDate((first.value as [number, unknown])?.[0]);
+  const lines = [`<b>${header}</b>`];
+  for (const p of params) {
+    const raw = isCategory ? p.value : (p.value as [number, unknown])?.[1];
+    if (raw === null || raw === undefined || typeof raw !== 'number') continue;
+    lines.push(`${p.marker ?? ''} ${p.seriesName ?? ''}: <b>${formatTooltipNumber(raw)}</b>`);
+  }
+  return lines.join('<br/>');
 }
 
 function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
@@ -196,6 +272,23 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
 
   chart?.dispose();
   chart = echarts.init(canvasEl, undefined, { renderer: 'canvas' });
+
+  // Axis ranges and ticks are the R helpers' numbers, not ECharts' defaults:
+  // padded either side, and the y ticks placed from the UNPADDED extent so the
+  // outermost ones sit just inside the ends of the axis.
+  const yExtent = finiteExtent(
+    series.flatMap((s) =>
+      s.data.map((point) => (Array.isArray(point) ? point[1] : (point as number | null)))
+    )
+  );
+  const yRange = yExtent ? padValueRange(yExtent) : undefined;
+  const yBreaks = yExtent ? evenBreaks(yExtent.lo, yExtent.hi, Y_TICKS) : undefined;
+  const xExtent = isCategory
+    ? undefined
+    : finiteExtent(
+        series.flatMap((s) => s.data.map((point) => (Array.isArray(point) ? point[0] : null)))
+      );
+  const xRange = xExtent ? padTimeRange(xExtent) : undefined;
   // Shared by both axes. The minor lines are the ones between the labelled
   // ticks; ECharts only draws them on value/time/log axes, which is why the
   // category axis below leaves them off rather than asking for lines that
@@ -234,6 +327,11 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
         : undefined,
     tooltip: {
       trigger: 'axis',
+      // Starts off when the opening view is already too dense to hover
+      // usefully; the datazoom handler below turns it back on. Same gate, and
+      // the same starting condition, as e_zoom_aware_detail.
+      show: drawn <= TOOLTIP_POINT_LIMIT,
+      formatter: (params: unknown) => formatTooltip(params as TooltipParam[], isCategory),
       backgroundColor: '#ffffff',
       borderColor: '#000000',
       borderWidth: 1,
@@ -259,12 +357,27 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
           type: 'time',
           ...axis,
           ...minor,
+          min: xRange?.min,
+          max: xRange?.max,
           // onZero false pins the axis to the bottom of the plot rather than
           // to y = 0 when zero happens to fall inside the range -- the same
           // correction helpers_echarts.R makes.
           axisLine: { ...axis.axisLine, onZero: false },
         },
-    yAxis: { type: 'value', scale: true, ...axis, ...minor },
+    yAxis: {
+      type: 'value',
+      ...axis,
+      ...minor,
+      min: yRange?.min,
+      max: yRange?.max,
+      // customValues pins ticks, labels and gridlines to the computed breaks
+      // instead of letting ECharts choose its own round numbers, which is how
+      // the same series ends up with a different number of gridlines here than
+      // it has in R.
+      axisLabel: { ...axis.axisLabel, customValues: yBreaks, formatter: formatAxisNumber },
+      axisTick: { ...axis.axisTick, customValues: yBreaks },
+      splitLine: { ...axis.splitLine, customValues: yBreaks },
+    },
     // Wheel/pinch zoom in place. No slider: the whole series is on screen to
     // begin with, and a strip along the bottom is a second, smaller copy of
     // the chart that has to be aimed at. Dragging on the plot itself is the
@@ -312,6 +425,19 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
       endValue: values[1],
     });
     chart?.dispatchAction({ type: 'brush', areas: [] });
+  });
+
+  // The other half of the density gate: recount what is in view after every
+  // zoom and switch the tooltip accordingly. Only the top-level `show` flag is
+  // touched, so the formatter and styling above survive the merge.
+  chart.on('datazoom', () => {
+    if (!chart) return;
+    const zooms = (chart.getOption() as { dataZoom?: { start?: number; end?: number }[] }).dataZoom;
+    const zoom = zooms?.[0];
+    const from = zoom?.start ?? 0;
+    const to = zoom?.end ?? 100;
+    const visible = (drawn * (to - from)) / 100;
+    chart.setOption({ tooltip: { show: visible <= TOOLTIP_POINT_LIMIT } });
   });
 
   // Brush mode on by default, so a drag zooms without arming anything first.

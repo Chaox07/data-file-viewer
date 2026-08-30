@@ -129,6 +129,81 @@ export function toCategoryValues(ys: unknown[]): (number | null)[] {
   return ys.map(toFiniteNumber);
 }
 
+/**
+ * Axis padding and tick placement, ported from the R plotting helpers so that
+ * a series charted here and the same series charted by long_run_3.R are the
+ * same figure rather than two charts of the same numbers.
+ *
+ * The originals live in the Kod repo, at
+ * R/Time_Series_Plotting/helpers/helpers_core.R: compute_echarts_x_range,
+ * compute_echarts_y_range and get_forced_breaks. They are pinned by tests here
+ * BECAUSE they are a port -- two codebases in two languages in two repos drift
+ * silently otherwise, and the drift shows up as "why does this look different"
+ * rather than as a failure.
+ */
+export interface Extent {
+  lo: number;
+  hi: number;
+}
+
+/** Smallest and largest finite value, ignoring gaps. */
+export function finiteExtent(values: (number | null | undefined)[]): Extent | undefined {
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const v of values) {
+    if (v === null || v === undefined || !Number.isFinite(v)) continue;
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  return Number.isFinite(lo) ? { lo, hi } : undefined;
+}
+
+/**
+ * Time axis range: 2% of the span before the first point, 4% after the last
+ * (compute_echarts_x_range). The asymmetry is deliberate over there -- the
+ * right-hand end is where the eye goes on a time series, and a line that ends
+ * flush against the axis reads as a series that was cut off.
+ */
+export function padTimeRange(extent: Extent): { min: number; max: number } {
+  const span = extent.hi - extent.lo;
+  return { min: extent.lo - span * 0.02, max: extent.hi + span * 0.04 };
+}
+
+/**
+ * Value axis range: 3% of the span either side, or -- when every value is the
+ * same and there is no span to take a share of -- 5% of the value itself, and
+ * 0.5 at zero (compute_echarts_y_range).
+ */
+export function padValueRange(extent: Extent): { min: number; max: number } {
+  const pad =
+    extent.hi === extent.lo
+      ? extent.lo === 0
+        ? 0.5
+        : Math.abs(extent.lo) * 0.05
+      : (extent.hi - extent.lo) * 0.03;
+  return { min: extent.lo - pad, max: extent.hi + pad };
+}
+
+/**
+ * `count` tick values from lo to hi inclusive -- get_forced_breaks with no
+ * forced values, which is every chart this viewer draws (forced breaks exist
+ * over there to pin a tick onto an hline or onto zero, and neither is
+ * something a click on a column header can ask for).
+ *
+ * Note these come from the UNPADDED extent while the axis range above is
+ * padded, so the outermost ticks sit just inside the axis ends. That is the R
+ * behaviour, and its helper says so explicitly rather than by accident.
+ */
+export function evenBreaks(lo: number, hi: number, count: number): number[] {
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || count < 2) return [lo];
+  if (hi === lo) return [lo];
+  const step = (hi - lo) / (count - 1);
+  const breaks: number[] = [];
+  for (let i = 0; i < count; i += 1) breaks.push(lo + step * i);
+  breaks[count - 1] = hi;
+  return breaks;
+}
+
 /** Category-axis labels, as stored. Nothing is reformatted: "1996-1Q" is shown as "1996-1Q". */
 export function toCategoryLabels(xs: unknown[]): string[] {
   return xs.map((v) => (v === null || v === undefined ? '' : String(v)));

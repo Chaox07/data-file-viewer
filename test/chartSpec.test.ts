@@ -8,6 +8,10 @@ import {
   toCategoryLabels,
   toCategoryValues,
   toEpochMs,
+  finiteExtent,
+  padTimeRange,
+  padValueRange,
+  evenBreaks,
 } from '../src/chartSpec';
 
 // ------------------------------------------------------------- picking an x
@@ -157,4 +161,53 @@ test('category values keep their positions, gaps included', () => {
   // Position IS the index on a category axis, so a dropped value would shift
   // every later point onto the wrong label.
   assert.deepEqual(toCategoryValues([1, null, '3.5', 'x']), [1, null, 3.5, null]);
+});
+
+// --------------------------------------------------- ported from the R helpers
+// These pin numbers that exist in two languages in two repos: the originals are
+// compute_echarts_x_range, compute_echarts_y_range and get_forced_breaks in
+// Kod/R/Time_Series_Plotting/helpers/helpers_core.R. A test is the only thing
+// that makes a divergence between them announce itself.
+
+test('the time axis is padded 2% before and 4% after', () => {
+  // Asymmetric on purpose over there: a line ending flush against the right
+  // edge reads as a series that was cut off.
+  assert.deepEqual(padTimeRange({ lo: 0, hi: 100 }), { min: -2, max: 104 });
+});
+
+test('the value axis is padded 3% either side', () => {
+  assert.deepEqual(padValueRange({ lo: 0, hi: 100 }), { min: -3, max: 103 });
+});
+
+test('a flat series is padded by 5% of its value, not by 3% of nothing', () => {
+  // Without this the axis collapses onto a single line with the series on it.
+  assert.deepEqual(padValueRange({ lo: 200, hi: 200 }), { min: 190, max: 210 });
+});
+
+test('a flat series at zero is padded by 0.5', () => {
+  // 5% of zero is zero, which is the case the R helper spells out separately.
+  assert.deepEqual(padValueRange({ lo: 0, hi: 0 }), { min: -0.5, max: 0.5 });
+});
+
+test('eight ticks span the extent inclusive', () => {
+  assert.deepEqual(evenBreaks(0, 70, 8), [0, 10, 20, 30, 40, 50, 60, 70]);
+});
+
+test('the last tick is exactly the maximum, not a float drifted off it', () => {
+  // Accumulated addition would land on 0.30000000000000004 and label it.
+  const breaks = evenBreaks(0, 0.3, 4);
+  assert.equal(breaks[breaks.length - 1], 0.3);
+});
+
+test('a flat extent gets one tick rather than eight of the same number', () => {
+  assert.deepEqual(evenBreaks(5, 5, 8), [5]);
+});
+
+test('the extent ignores gaps and unparseable values', () => {
+  assert.deepEqual(finiteExtent([3, null, 1, undefined, 9, NaN]), { lo: 1, hi: 9 });
+});
+
+test('an all-gap series has no extent, rather than an infinite one', () => {
+  // Infinity/-Infinity would reach the axis as min/max and draw nothing.
+  assert.equal(finiteExtent([null, undefined, NaN]), undefined);
 });
