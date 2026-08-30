@@ -3,8 +3,11 @@ import { keymap } from '@codemirror/view';
 import { sql } from '@codemirror/lang-sql';
 import { json } from '@codemirror/lang-json';
 import { oneDark } from '@codemirror/theme-one-dark';
-import { computeSortOrder } from './sortOrder';
 import { pickXAxis, plottableColumns } from './chartSpec';
+import { fmtCount, formatStat, formatValue } from './gridFormat';
+import { DisplayOrderCache } from './gridOrder';
+import { liveStatusText } from './liveStatus';
+import { computeVirtualWindow } from './virtualWindow';
 // Note what is NOT imported here: ECharts. The chart draws in its own VS Code
 // tab (see chartPanel.ts / chartView.ts), so the ~530 KB library loads the
 // first time somebody plots something rather than every time a file is opened.
@@ -273,32 +276,18 @@ function stopLiveStatusTicker(): void {
   }
 }
 
-function formatAgo(ms: number): string {
-  const seconds = Math.max(0, Math.round((Date.now() - ms) / 1000));
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes}m ${seconds % 60}s ago`;
-}
-
-/**
- * Second, independent staleness signal, computed here rather than reported by
- * the host. The host's own `stale` flag can only arrive if the host is still
- * running its scheduler at all — so a wedged extension host is precisely the
- * case it cannot report. Time since the last successful update is observable
- * from this side no matter what happened over there.
- */
-function isLocallyStale(): boolean {
-  if (liveLastUpdatedMs === undefined) return false;
-  return Date.now() - liveLastUpdatedMs > Math.max(3 * liveIntervalMs, 10_000);
-}
-
 function updateLiveStatusText(): void {
   if (!liveEnabled) return;
-  const stale = liveStale || isLocallyStale();
-  const agoText = liveLastUpdatedMs !== undefined ? `updated ${formatAgo(liveLastUpdatedMs)}` : 'waiting for first update…';
-  liveStatusEl.textContent = stale ? `Live · stale, last ${agoText}` : `Live · ${agoText}`;
-  liveStatusEl.className = `live-status ${stale ? 'live-status-stale' : 'live-status-active'}`;
-  liveStatusEl.title = stale && liveLastError ? `Last error: ${liveLastError}` : '';
+  const status = liveStatusText({
+    enabled: liveEnabled,
+    hostStale: liveStale,
+    lastUpdatedMs: liveLastUpdatedMs,
+    intervalMs: liveIntervalMs,
+    lastError: liveLastError,
+  });
+  liveStatusEl.textContent = status.text;
+  liveStatusEl.className = status.className;
+  liveStatusEl.title = status.title;
 }
 
 function startLiveStatusTicker(): void {
@@ -423,32 +412,12 @@ function applyTableChangeStatus(status: Record<string, TableStatus>): void {
  * *whether* to sort, which is webview state, and delegates *how* to sort,
  * which is pure and lives where it can be tested against DuckDB's own output.
  */
-function computeDisplayOrder(): number[] {
-  const result = lastResult!;
-  const n = result.rows.length;
-  // Already ordered by DuckDB across the full data set. Re-sorting here is not
-  // just wasted work: where the client comparator disagrees with DuckDB's
-  // ordering, it would scramble a correct top-N back into a wrong one.
-  if (!sortState || result.serverSorted) return Array.from({ length: n }, (_, i) => i);
-  return computeSortOrder(
-    result.rows,
-    sortState.columnIndex,
-    sortState.direction,
-    result.columnStatsKind[sortState.columnIndex]
-  );
-}
-
-// Sorting the same rows the same way on every render is pure waste, and
-// renderResults runs on every live tick.
-let cachedOrder: { rows: unknown[][]; key: string; order: number[] } | undefined;
+// The ordering rules and their memo now live in gridOrder.ts, where they can
+// be tested; this is the single cache instance the grid uses.
+const displayOrderCache = new DisplayOrderCache();
 
 function displayOrder(): number[] {
-  const result = lastResult!;
-  const key = sortState && !result.serverSorted ? `${sortState.columnIndex}:${sortState.direction}` : '';
-  if (cachedOrder && cachedOrder.rows === result.rows && cachedOrder.key === key) return cachedOrder.order;
-  const order = computeDisplayOrder();
-  cachedOrder = { rows: result.rows, key, order };
-  return order;
+  return displayOrderCache.order(lastResult!, sortState);
 }
 
 function renderStatsPopoverContent(container: HTMLElement, message: Extract<ExtensionMessage, { command: 'columnStatsResult' }>): void {
@@ -743,7 +712,6 @@ function openCellInspector(rowIdx: number, colIdx: number): void {
 // for a live view that can re-run every tick, and especially the combined
 // hot+cold view where the result can hold real history.
 const VIRTUALIZE_THRESHOLD = 200;
-const VIRTUAL_OVERSCAN = 8;
 let measuredRowHeight = 25; // corrected from a real rendered row below; this is just the initial estimate
 // Signature of the header currently on screen — see the reuse check in renderResults.
 let renderedHeaderKey: string | undefined;
@@ -791,18 +759,20 @@ function renderVirtualWindow(): void {
   const tbody = resultsEl.querySelector('tbody');
   if (!tbody) return;
   const { order, rowHeight } = virtualState;
-  const scrollTop = resultsEl.scrollTop;
-  const viewportH = resultsEl.clientHeight || 400;
-  const start = Math.max(0, Math.floor(scrollTop / rowHeight) - VIRTUAL_OVERSCAN);
-  const end = Math.min(order.length, Math.ceil((scrollTop + viewportH) / rowHeight) + VIRTUAL_OVERSCAN);
+  const { start, end, topSpacerPx, bottomSpacerPx } = computeVirtualWindow({
+    scrollTop: resultsEl.scrollTop,
+    viewportHeight: resultsEl.clientHeight,
+    rowHeight,
+    rowCount: order.length,
+  });
   tbody.innerHTML = '';
-  appendSpacerRow(tbody, start * rowHeight, lastResult.columns.length);
+  appendSpacerRow(tbody, topSpacerPx, lastResult.columns.length);
   const frag = document.createDocumentFragment();
   for (let displayIdx = start; displayIdx < end; displayIdx++) {
     frag.appendChild(buildRowElement(order[displayIdx], displayIdx));
   }
   tbody.appendChild(frag);
-  appendSpacerRow(tbody, (order.length - end) * rowHeight, lastResult.columns.length);
+  appendSpacerRow(tbody, bottomSpacerPx, lastResult.columns.length);
 }
 
 // Delegated cell-inspector trigger. Attached to #results, which survives every
@@ -972,10 +942,6 @@ function renderResults(preserveScroll = false): void {
 }
 
 /** Thousands separators, so a six-figure row count is readable at a glance. */
-function fmtCount(n: number): string {
-  return n.toLocaleString();
-}
-
 /** Body + footer only. Split out so a live tick can refresh the rows under an untouched header. */
 function renderRowsInto(table: HTMLTableElement, preservedScrollTop: number, wasPinnedToBottom: boolean): void {
   const { rows } = lastResult!;
@@ -1055,52 +1021,6 @@ function renderRowsInto(table: HTMLTableElement, preservedScrollTop: number, was
     }
     if (wasPinnedToBottom) resultsEl.scrollTop = resultsEl.scrollHeight;
   }
-}
-
-function addThousandsSeparators(digits: string): string {
-  return digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-}
-
-// DuckDB's node-api serializes BIGINT/HUGEINT/DECIMAL/TIMESTAMP/DATE all as
-// plain strings over the wire (only the small int types and float/double
-// come through as JS numbers) -- so a string alone can't tell numeric values
-// apart from dates. `kind` (from columnStatsKind, computed server-side from
-// the actual DuckDB type) is what disambiguates. Formatting is done by
-// string manipulation, not toLocaleString(), so it never rounds/truncates
-// the value's original precision.
-function formatValue(value: unknown, kind?: StatsKind): string {
-  if (value === null || value === undefined) return 'NULL';
-  if (typeof value === 'object') return JSON.stringify(value);
-  if (kind === 'numeric' && (typeof value === 'number' || typeof value === 'bigint' || typeof value === 'string')) {
-    const match = String(value).match(/^(-?)(\d+)(\.\d+)?$/);
-    if (match) {
-      const [, sign, intPart, fracPart = ''] = match;
-      return `${sign}${addThousandsSeparators(intPart)}${fracPart}`;
-    }
-  }
-  return String(value);
-}
-
-/**
- * A computed statistic, at no more than four decimal places.
- *
- * Display-only, and deliberately NOT part of formatValue -- that one formats
- * cell values, and its promise never to touch a value's original precision
- * has to keep holding. This applies to avg and the two percentiles, which are
- * results of avg()/approx_quantile() rather than anything present in the data.
- *
- * "At most" four: an integer stays an integer and 0.5 stays 0.5, because
- * padding them out to 0.5000 would suggest a measurement precision that is
- * not there either. Non-numeric input falls through to formatValue unchanged.
- */
-function formatStat(value: unknown): string {
-  if (value === null || value === undefined) return 'NULL';
-  const n = typeof value === 'bigint' ? Number(value) : Number(value);
-  if (!Number.isFinite(n)) return formatValue(value, 'numeric');
-  // parseFloat drops the trailing zeros toFixed adds; String() then avoids
-  // toLocaleString, so addThousandsSeparators stays the one place grouping
-  // happens.
-  return formatValue(String(parseFloat(n.toFixed(4))), 'numeric');
 }
 
 function showError(message: string): void {
@@ -1289,7 +1209,7 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
           // Edited in place, so the rows array keeps its identity — the cached
           // permutation has to be dropped explicitly or an edit to the sort
           // column would leave the row sitting in its old position.
-          cachedOrder = undefined;
+          displayOrderCache.invalidate();
           if (lastResult.cellChanged) {
             if (!lastResult.cellChanged[rowIdx]) {
               lastResult.cellChanged[rowIdx] = lastResult.columns.map(() => false);

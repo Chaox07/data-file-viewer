@@ -17,6 +17,10 @@
     "src/kdbParser.ts",
     "src/xlsxSheets.ts",
     "src/chartSpec.ts",
+    "src/gridFormat.ts",
+    "src/gridOrder.ts",
+    "src/virtualWindow.ts",
+    "src/liveStatus.ts",
     "src/xlsxWrite.ts",
     // Pulls in chartPanel.ts too, and both import `vscode`. That resolves for
     // TYPES via @types/vscode; at runtime it is satisfied by
