@@ -204,6 +204,96 @@ export function evenBreaks(lo: number, hi: number, count: number): number[] {
   return breaks;
 }
 
+/**
+ * Frequency-aware date labels -- optional, never required.
+ *
+ * ETL and macro_project both write a `frequency` into `sheet_metadata`, and
+ * the R scripts use it to word an axis as "2020 Q1" rather than "1 Jan 2020"
+ * (make_label_fn in helpers_core.R for ticks, build_tooltip_formatter's
+ * qLabel in helpers_echarts.R for the hover). A file that carries no
+ * frequency, or a word not in this list, falls back to the plain date form
+ * below and charts exactly as it did before: the frequency is a nicety about
+ * wording, and nothing about drawing a series depends on having one.
+ *
+ * The vocabulary is fixed rather than free text because these labels come
+ * from a file and end up in tooltip HTML.
+ */
+export const KNOWN_FREQUENCIES = [
+  'annual',
+  'semiannual',
+  'quarterly',
+  'monthly',
+  'weekly',
+  'daily',
+] as const;
+
+export type SeriesFrequency = (typeof KNOWN_FREQUENCIES)[number];
+
+const MONTHS = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+];
+
+/**
+ * Everything below reads the date in UTC, because that is the axis the points
+ * were placed on: toEpochMs turns a DATE into midnight UTC, and rendering it
+ * in a local timezone west of Greenwich would label it as the day before.
+ */
+function parts(ms: number): { d: Date; year: number; month: number } | undefined {
+  const d = new Date(ms);
+  if (!Number.isFinite(d.getTime())) return undefined;
+  return { d, year: d.getUTCFullYear(), month: d.getUTCMonth() };
+}
+
+/** Week of the year the way make_label_fn counts it: whole weeks since 1 January. */
+function weekOfYear(d: Date): number {
+  const jan1 = Date.UTC(d.getUTCFullYear(), 0, 1);
+  return Math.floor((d.getTime() - jan1) / (7 * 24 * 60 * 60 * 1000)) + 1;
+}
+
+/** An x-axis tick label -- make_label_fn's wording. Undefined frequency means "let ECharts label it". */
+export function axisDateLabel(ms: number, frequency?: SeriesFrequency): string | undefined {
+  if (!frequency) return undefined;
+  const p = parts(ms);
+  if (!p) return undefined;
+  switch (frequency) {
+    case 'annual':
+      return String(p.year);
+    case 'semiannual':
+      return `${p.year} H${p.month < 6 ? 1 : 2}`;
+    case 'quarterly':
+      return `${p.year} Q${Math.floor(p.month / 3) + 1}`;
+    case 'monthly':
+      return `${MONTHS[p.month]} ${p.year}`;
+    case 'weekly':
+      return `${p.year} W${weekOfYear(p.d)}`;
+    case 'daily':
+      return `${p.d.getUTCDate()} ${MONTHS[p.month]} ${p.year}`;
+  }
+}
+
+/**
+ * A tooltip's date header -- qLabel's wording, which differs from the axis on
+ * purpose for weekly (a week's tooltip names the day it starts, where the tick
+ * names the week number).
+ *
+ * With no frequency this is the daily form plus a clock time when the point
+ * carries one, which is the same fallback the R formatter uses for a cadence
+ * it does not recognise.
+ */
+export function pointDateLabel(ms: number, frequency?: SeriesFrequency): string {
+  const p = parts(ms);
+  if (!p) return '';
+  const day = `${p.d.getUTCDate()} ${MONTHS[p.month]} ${p.year}`;
+  if (frequency === 'weekly') return day;
+  if (frequency) return axisDateLabel(ms, frequency) ?? day;
+  const h = p.d.getUTCHours();
+  const m = p.d.getUTCMinutes();
+  const s = p.d.getUTCSeconds();
+  if (h === 0 && m === 0 && s === 0) return day;
+  return `${day} ${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
 /** Category-axis labels, as stored. Nothing is reformatted: "1996-1Q" is shown as "1996-1Q". */
 export function toCategoryLabels(xs: unknown[]): string[] {
   return xs.map((v) => (v === null || v === undefined ? '' : String(v)));

@@ -227,6 +227,29 @@ Every results grid — table previews and hand-written queries alike — gets:
   plotting numbers against arbitrary text draws the order the table happens
   to hold its rows in, dressed up as a chart. It is also why `sheet_metadata`
   — text columns and a count — offers nothing to plot.
+
+  **The chart is a port of the R plotting scripts** in
+  `Kod/R/Time_Series_Plotting` (`helpers_echarts.R`, `helpers_core.R`, and
+  `long_run_3.R`'s ECharts branch), so the same series read here and read
+  there is one figure rather than two charts of the same numbers. Taken from
+  them: the white ground, black axis rules, hairline gridlines with lighter
+  minor ones between them, serif labels, the white tooltip with its black
+  crosshair, 2%/4% padding on the time axis and 3% on the value axis, eight
+  pinned y ticks, three-significant-digit axis labels and four-significant-digit
+  tooltip values, and the tooltip that switches itself off above 3,000 points
+  in view and back on when you zoom in — hovering a line that has thousands of
+  points overplotted into a few pixels reports a value that isn't the one your
+  eye is on. The ported numbers are pinned by tests in
+  `test/chartSpec.test.ts`, because two implementations in two languages in
+  two repositories drift silently otherwise.
+
+  **If the table declares a frequency**, the axis and tooltip use it for
+  wording: `2020 Q1`, `2020 H2`, `Jan 2020`. It's read from `sheet_metadata`,
+  which ETL and macro_project both write, and it is entirely optional — a file
+  with no such table, no row for this table, or a cadence not in the known
+  list charts exactly the same, with plain dates. Day-to-day and weekly
+  cadences deliberately keep ECharts' own adaptive tick labels, which read
+  better across a long span than the same full date stamped onto every tick.
 - **NULL values** are shown dimmed and in italics in the results grid, so
   they're easy to tell apart from a real value like an empty string or a
   literal `0`.

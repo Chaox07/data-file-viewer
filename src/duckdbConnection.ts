@@ -13,6 +13,7 @@ import { basename, dirname, extname, join } from 'node:path';
 import { chmod, copyFile, mkdtemp, open, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
+import { KNOWN_FREQUENCIES, type SeriesFrequency } from './chartSpec';
 import { listSheets } from './xlsxSheets';
 
 export type StatsKind = 'numeric' | 'datetime' | 'other';
@@ -966,6 +967,15 @@ export class DuckDbFile {
    * must never propagate past this method as anything other than "no hint".
    */
   async getPollCadenceSeconds(table: string): Promise<number | null> {
+    for (const catalog of this.metadataCatalogs()) {
+      const value = await this.readPollCadenceFromCatalog(table, catalog);
+      if (value !== null) return value;
+    }
+    return null;
+  }
+
+  /** Catalogs to look for a sheet_metadata row in, hot side first. */
+  private metadataCatalogs(): string[] {
     const candidates: string[] = [];
     // Hot side first.
     if (this.isMainHot()) candidates.push(this.catalogName);
@@ -974,10 +984,39 @@ export class DuckDbFile {
     // future writer this wasn't designed against.
     if (!this.isMainHot()) candidates.push(this.catalogName);
     if (this.siblingCatalogName && !this.siblingIsSqlite) candidates.push(this.siblingCatalogName);
+    return candidates;
+  }
 
-    for (const catalog of candidates) {
-      const value = await this.readPollCadenceFromCatalog(table, catalog);
-      if (value !== null) return value;
+  /**
+   * Best-effort read of a table's declared frequency, used only to word a
+   * chart's tick and tooltip labels ("2020 Q1" instead of "1 Jan 2020").
+   *
+   * Entirely optional, by design: a file with no `sheet_metadata`, no row for
+   * this table, or a frequency nobody recognises charts exactly as it did
+   * before — this returns null and the chart falls back to plain dates. It is
+   * a label improvement, never a requirement for plotting.
+   *
+   * The value is matched against a fixed vocabulary rather than passed
+   * through. It comes out of a file, the chart view puts the label into
+   * tooltip HTML, and a recognised word cannot carry markup with it.
+   */
+  async getSeriesFrequency(table: string): Promise<SeriesFrequency | null> {
+    for (const catalog of this.metadataCatalogs()) {
+      try {
+        const reader = await this.connection.runAndReadAll(
+          `select frequency from ${quoteIdent(catalog)}.main.sheet_metadata where table_name = ${quoteLiteral(table)}`
+        );
+        const rows = reader.getRows();
+        if (rows.length === 0) continue;
+        const raw = rows[0][0];
+        if (typeof raw !== 'string') continue;
+        const word = raw.trim().toLowerCase();
+        const match = KNOWN_FREQUENCIES.find((f) => f === word);
+        if (match) return match;
+      } catch {
+        // No sheet_metadata here, or no frequency column on it. Try the other
+        // side, then give up quietly.
+      }
     }
     return null;
   }

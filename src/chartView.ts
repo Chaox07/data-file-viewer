@@ -12,6 +12,9 @@ import {
   padTimeRange,
   padValueRange,
   evenBreaks,
+  axisDateLabel,
+  pointDateLabel,
+  type SeriesFrequency,
 } from './chartSpec';
 // Modular import rather than `from 'echarts'`: the umbrella entry point
 // registers every chart type and component and took a bundle from 468 KB to
@@ -53,6 +56,9 @@ type ChartMessage =
       columns: string[];
       rows: unknown[][];
       xAxisMode: 'time' | 'category';
+      // Absent whenever the file does not declare one, which is most files.
+      // Wording only -- see chartSpec's KNOWN_FREQUENCIES.
+      frequency?: SeriesFrequency | null;
       truncated: boolean;
       maxPoints: number;
     }
@@ -63,16 +69,17 @@ type ChartMessage =
 // come into play when a query puts several numeric columns on one axis.
 const SERIES_COLOURS = ['#000080', '#b0532a', '#2e7d5b', '#7a3d8f', '#a3872c', '#3c6ea5'];
 
-// The chart page is white whatever the VS Code theme is, so these are stated
-// rather than read from --vscode-* variables. A chart is a figure: it gets
-// screenshotted, pasted into a document and printed, and a dark-theme one
-// arrives everywhere else as a negative of itself. Only this tab is white --
-// the grid still follows the theme.
-// The values are the ones helpers_echarts.R draws with, so a chart opened here
-// and the same series opened from long_run_3.R look like the same figure:
-// black axis rules at 1.5, gridlines at rgb(229,229,229) hairline-width, serif
-// labels at 10. MINOR_SPLIT_LINE is the one addition -- a lighter line between
-// the labelled ones, for reading a value off the chart without a tooltip.
+// Stated, not read from --vscode-* variables: the chart page is white whatever
+// the editor theme is, because a chart is a figure -- it gets screenshotted,
+// pasted into a document and printed, and a dark-theme one arrives everywhere
+// else as a negative of itself. Only this tab is white; the grid still follows
+// the theme.
+//
+// The values are the ones helpers_echarts.R draws with, so a series opened
+// here and the same series opened from long_run_3.R are one figure: black axis
+// rules at 1.5, gridlines at rgb(229,229,229) hairline-width, serif labels at
+// 10. MINOR_SPLIT_LINE is the one addition -- a lighter line between the
+// labelled ones, for reading a level off the chart without hovering.
 const INK = '#1f1f1f';
 const AXIS_LINE = '#000000';
 const SPLIT_LINE = '#e5e5e5';
@@ -150,11 +157,6 @@ function showMessage(text: string): void {
   canvasEl.textContent = text;
 }
 
-const MONTHS = [
-  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
-];
-
 /** Axis labels: three significant digits -- .echarts_number_formatter_js, non-percent branch. */
 function formatAxisNumber(value: number): string {
   return value.toLocaleString(undefined, { maximumSignificantDigits: 3 });
@@ -165,24 +167,6 @@ function formatTooltipNumber(value: number): string {
   return Number(value).toPrecision(4);
 }
 
-/**
- * Tooltip date header, in UTC because that is the axis the points were placed
- * on. The R formatter picks its wording from the sheet's declared frequency
- * ("2020 Q1", "Jan 2020"); nothing here reads sheet_metadata, so this is the
- * daily form it uses, with the clock time appended when a point actually
- * carries one.
- */
-function formatTooltipDate(ms: number): string {
-  const d = new Date(ms);
-  if (!Number.isFinite(d.getTime())) return '';
-  const date = `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
-  const h = d.getUTCHours();
-  const m = d.getUTCMinutes();
-  const s = d.getUTCSeconds();
-  if (h === 0 && m === 0 && s === 0) return date;
-  return `${date} ${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-}
-
 interface TooltipParam {
   marker?: string;
   seriesName?: string;
@@ -191,12 +175,16 @@ interface TooltipParam {
 }
 
 /** Bold header, then one `marker name: value` line per series -- build_tooltip_formatter's shape. */
-function formatTooltip(params: TooltipParam[], isCategory: boolean): string {
+function formatTooltip(
+  params: TooltipParam[],
+  isCategory: boolean,
+  frequency?: SeriesFrequency
+): string {
   if (!params || params.length === 0) return '';
   const first = params[0];
   const header = isCategory
     ? (first.axisValueLabel ?? '')
-    : formatTooltipDate((first.value as [number, unknown])?.[0]);
+    : pointDateLabel((first.value as [number, unknown])?.[0], frequency);
   const lines = [`<b>${header}</b>`];
   for (const p of params) {
     const raw = isCategory ? p.value : (p.value as [number, unknown])?.[1];
@@ -225,6 +213,32 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
     return;
   }
   const isCategory = message.xAxisMode === 'category';
+  // Optional throughout: undefined means every date label falls back to its
+  // plain form, and nothing else about the chart changes.
+  const frequency = message.frequency ?? undefined;
+  // Only the cadences ECharts cannot express take over the axis. Its own time
+  // labels already read well day to day and adapt as you zoom, and forcing
+  // "14 Jun 1961" onto every tick of a 60-year daily series is worse than what
+  // it does unaided; what it has no idea about is that a point stands for a
+  // quarter or a half-year. The tooltip takes the frequency either way, since
+  // there it names one point rather than crowding an axis.
+  const axisFrequency =
+    frequency && frequency !== 'daily' && frequency !== 'weekly' ? frequency : undefined;
+  // Ticks are labelled in order and the run starts again at index 0 on every
+  // repaint, so a tick whose label repeats the one before it is blanked rather
+  // than drawing "2020 Q1" three times where ECharts placed three ticks inside
+  // one quarter.
+  let previousLabel = '';
+  const labelTick = (value: number, index: number): string => {
+    const label = axisDateLabel(value, axisFrequency) ?? '';
+    if (index === 0) {
+      previousLabel = label;
+      return label;
+    }
+    if (label === previousLabel) return '';
+    previousLabel = label;
+    return label;
+  };
   const xs = message.rows.map((row) => row[xIndex]);
   const labels = isCategory ? toCategoryLabels(xs) : [];
 
@@ -331,7 +345,7 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
       // usefully; the datazoom handler below turns it back on. Same gate, and
       // the same starting condition, as e_zoom_aware_detail.
       show: drawn <= TOOLTIP_POINT_LIMIT,
-      formatter: (params: unknown) => formatTooltip(params as TooltipParam[], isCategory),
+      formatter: (params: unknown) => formatTooltip(params as TooltipParam[], isCategory, frequency),
       backgroundColor: '#ffffff',
       borderColor: '#000000',
       borderWidth: 1,
@@ -359,6 +373,14 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
           ...minor,
           min: xRange?.min,
           max: xRange?.max,
+          // Tick PLACEMENT stays ECharts' own, deliberately: the R script pins
+          // six of them, which reads well on a fixed view and empties the axis
+          // as soon as you drag-zoom inside them. Only the wording comes from
+          // the frequency, so a zoomed-in view still labels itself.
+          axisLabel: {
+            ...axis.axisLabel,
+            formatter: axisFrequency ? labelTick : undefined,
+          },
           // onZero false pins the axis to the bottom of the plot rather than
           // to y = 0 when zero happens to fall inside the range -- the same
           // correction helpers_echarts.R makes.

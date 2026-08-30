@@ -12,6 +12,8 @@ import {
   padTimeRange,
   padValueRange,
   evenBreaks,
+  axisDateLabel,
+  pointDateLabel,
 } from '../src/chartSpec';
 
 // ------------------------------------------------------------- picking an x
@@ -210,4 +212,58 @@ test('the extent ignores gaps and unparseable values', () => {
 test('an all-gap series has no extent, rather than an infinite one', () => {
   // Infinity/-Infinity would reach the axis as min/max and draw nothing.
   assert.equal(finiteExtent([null, undefined, NaN]), undefined);
+});
+
+// -------------------------------------------------- frequency-aware wording
+// Optional everywhere: a file that declares no frequency still charts, with
+// plain dates. These pin the wording against make_label_fn (ticks) and
+// qLabel (tooltip) in the R helpers.
+
+const Q1 = Date.UTC(2020, 0, 15);
+
+test('no frequency means no axis label of our own -- ECharts labels the tick', () => {
+  assert.equal(axisDateLabel(Q1, undefined), undefined);
+});
+
+test('a quarterly axis reads as a quarter', () => {
+  assert.equal(axisDateLabel(Date.UTC(2020, 7, 1), 'quarterly'), '2020 Q3');
+});
+
+test('a semiannual axis reads as a half', () => {
+  assert.equal(axisDateLabel(Date.UTC(2020, 5, 30), 'semiannual'), '2020 H1');
+  assert.equal(axisDateLabel(Date.UTC(2020, 6, 1), 'semiannual'), '2020 H2');
+});
+
+test('monthly and annual axes drop the parts they do not resolve', () => {
+  assert.equal(axisDateLabel(Q1, 'monthly'), 'Jan 2020');
+  assert.equal(axisDateLabel(Q1, 'annual'), '2020');
+});
+
+test('a weekly axis counts whole weeks from 1 January, as make_label_fn does', () => {
+  assert.equal(axisDateLabel(Date.UTC(2020, 0, 1), 'weekly'), '2020 W1');
+  assert.equal(axisDateLabel(Date.UTC(2020, 0, 8), 'weekly'), '2020 W2');
+});
+
+test('a weekly tooltip names the day, where the tick names the week', () => {
+  // Deliberate difference, and qLabel has the same one: a week number is
+  // useful on a crowded axis and useless when you are pointing at a value.
+  assert.equal(pointDateLabel(Date.UTC(2020, 0, 8), 'weekly'), '8 Jan 2020');
+});
+
+test('with no frequency a tooltip shows the plain date', () => {
+  assert.equal(pointDateLabel(Q1, undefined), '15 Jan 2020');
+});
+
+test('a time of day is kept, so an intraday point is not labelled as a whole day', () => {
+  assert.equal(pointDateLabel(Date.UTC(2020, 0, 15, 9, 30), undefined), '15 Jan 2020 09:30');
+});
+
+test('dates are read in UTC, not in the viewer timezone', () => {
+  // Midnight UTC is the previous evening in the Americas; a local read would
+  // label a DATE as the day before it.
+  assert.equal(pointDateLabel(Date.UTC(2020, 0, 1), undefined), '1 Jan 2020');
+});
+
+test('an unparseable instant labels as empty rather than "Invalid Date"', () => {
+  assert.equal(pointDateLabel(Number.NaN, undefined), '');
 });

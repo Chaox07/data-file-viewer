@@ -1161,8 +1161,20 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
               cap
             )
           );
+          // Read after the chart query, and never allowed to fail the chart:
+          // a file with no sheet_metadata plots with plain dates, which is the
+          // whole point of the frequency being optional. Not cached -- it is
+          // one row, read once per click on a plot button.
+          const frequency = document.lastQueriedBaseTable
+            ? await document
+                .runExclusive(() =>
+                  document.file.getSeriesFrequency(document.lastQueriedBaseTable!)
+                )
+                .catch(() => null)
+            : null;
           chartPanel.reveal(label, {
             command: 'chart',
+            frequency,
             xColumn: message.xColumn,
             yColumns: message.yColumns,
             columns: result.columns,
