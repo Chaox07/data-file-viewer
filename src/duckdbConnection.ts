@@ -1584,13 +1584,21 @@ export class DuckDbFile {
       // Backup already succeeded above; permission mirroring is a nice-to-have.
     }
 
-    // A repeat createBackup() (Safe Mode toggled off more than once) must
-    // swap the attached catalog, not stack a second backup_cmp — DuckDB
-    // won't allow re-attaching an alias that's already attached.
-    if (this.backupAttached) {
-      await this.detachBackupCatalog();
-      this.backupAttached = false;
-    }
+    // A repeat createBackup() (Safe Mode toggled off more than once) must swap
+    // the attached catalog, not stack a second backup_cmp — DuckDB won't allow
+    // re-attaching an alias that's already attached.
+    //
+    // Detached unconditionally rather than only when `backupAttached` says so.
+    // That flag is set AFTER attachBackupCatalog returns, so any failure in
+    // between leaves the alias attached with the flag still false — and then
+    // every later attempt fails with "database with name backup_cmp already
+    // exists", which is a different error, in a different place, with nothing
+    // pointing back at the attempt that actually went wrong. That is not
+    // hypothetical: it is what the xlsx backup bug did in the field, and the
+    // second error is what the user saw. The state on the connection is the
+    // truth here; the flag is only a hint.
+    await this.detachBackupCatalog().catch(() => undefined);
+    this.backupAttached = false;
     this.lastBackupPath = backupPath;
     await this.attachBackupCatalog();
     this.backupAttached = true;

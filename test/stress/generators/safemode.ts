@@ -211,3 +211,58 @@ registerCase({
     }
   },
 });
+
+/**
+ * A leaked `backup_cmp` alias must not disable Safe Mode for the session.
+ *
+ * The second error the user saw, and the more confusing of the two:
+ *
+ *   Could not create backup — Safe Mode stays on: Binder Error: Failed to
+ *   attach database: database with name "backup_cmp" already exists
+ *
+ * It has nothing to do with the workbook. It is the AFTERMATH of the first
+ * failure: `backupAttached` is set only after attachBackupCatalog returns, so
+ * a throw inside it leaves the alias attached with the flag still false. Every
+ * later attempt then fails on the attach, with an error that points at nothing
+ * and never mentions the attempt that actually went wrong.
+ *
+ * Reproduced by attaching the alias behind the code's back, which is exactly
+ * the state the old bug left the connection in. A detach-before-attach that
+ * trusts the connection rather than the flag is what makes this recoverable.
+ */
+registerCase({
+  name: 'safemode_recovers_from_a_leaked_backup_alias',
+  family: 'safemode',
+  expect: { note: 'Safe Mode still works when a previous failure left backup_cmp attached' },
+  build: async (ctx) => ({
+    path: await w.xlsxFile(join(ctx.dir, 'leaked.xlsx'), [
+      { name: 'data', rows: [['id', 'label'], [1, 'alpha']] },
+    ]),
+  }),
+  check: async (file, ctx) => {
+    // Put the connection into the state the old failure left it in.
+    await file.runQuery(`attach ':memory:' as backup_cmp`);
+
+    try {
+      await file.createBackup();
+    } catch (err) {
+      const message = err instanceof Error ? err.message.split('\n')[0] : String(err);
+      ctx.fail(
+        'crash',
+        `a leaked alias made Safe Mode permanently unavailable: ${message}`
+      );
+      return;
+    }
+
+    try {
+      await readTable(file, 'data');
+    } catch (err) {
+      ctx.fail(
+        'crash',
+        `the session was unusable after recovering: ${
+          err instanceof Error ? err.message.split('\n')[0] : String(err)
+        }`
+      );
+    }
+  },
+});
