@@ -1,56 +1,96 @@
 /**
- * Deciding what, if anything, a result can be charted as.
+ * Deciding what, if anything, a result can be charted against.
  *
- * Kept apart from webview.ts so it is testable: everything here is a pure
+ * Kept apart from the webviews so it is testable: everything here is a pure
  * function over the column names and type kinds a query already returns, with
  * no DOM, no vscode and no ECharts. The rendering is the easy half; choosing
- * the axes -- and knowing when NOT to offer a chart -- is where this gets a
+ * the axis -- and knowing when NOT to offer a chart -- is where this gets a
  * result wrong.
  */
 
 export type StatsKind = 'numeric' | 'datetime' | 'other';
 
-export interface TimeSeriesSpec {
-  /** The column to put on the x axis. */
-  x: string;
-  /** Every numeric column, in result order. */
-  y: string[];
+/**
+ * What the x column is made of, which is NOT the same question as what the
+ * axis will be.
+ *
+ * `datetime` is a real DATE/TIMESTAMP and always draws a time axis.  `text`
+ * is a column that merely claims to be one by its name, and whether it can be
+ * a time axis depends on what the strings actually parse to -- a question only
+ * the database can answer, so it is settled host-side at chart time (see
+ * runChartQuery) rather than guessed here.
+ */
+export type XAxisKind = 'datetime' | 'text';
+
+export interface XAxis {
+  column: string;
+  kind: XAxisKind;
 }
 
 /**
- * The time-series reading of a result, or undefined if it has not got one.
+ * The column names a text x axis is allowed to come from, lowercased.
  *
- * A chart needs an ordered x and something to plot against it, so this asks
- * for one datetime column and at least one numeric column. The FIRST datetime
- * column wins: a table with two of them (a period and a revision stamp, say)
- * is plotted against the one that came first, which is the writer's own
- * ordering and the same rule the R scripts' .resolve_date_col() follows.
+ * This list is the whole reason a text column can be an axis at all, and it
+ * is deliberately tiny. Plotting numbers against arbitrary text draws the
+ * order the table happens to hold its rows in, dressed up as a chart -- so a
+ * text column has to *say* it is the axis before it is treated as one.
  *
- * Deliberately NOT falling back to "any column" for x. A line joining rows in
- * whatever order the table happens to hold them is a picture of the storage
- * order, not of the data, and it looks exactly like a real chart.
+ * `sheet_metadata` is the case that makes this concrete: its first column is
+ * text and its last is a count, and under a looser rule every macro and ETL
+ * export in existence would offer to plot row counts against table names.
+ *
+ * The two names are the ones ETL and macro_project actually write, and the
+ * same two the R scripts accept -- helpers_core.R's .resolve_date_col checks
+ * "Datetime" then "Date" and nothing else.
  */
-export function pickTimeSeries(columns: string[], kinds: StatsKind[]): TimeSeriesSpec | undefined {
+const TEXT_AXIS_NAMES = ['datetime', 'date'];
+
+/**
+ * The x axis for this result, or undefined if it has not got one.
+ *
+ * Resolution order, and the reason for it:
+ *
+ *   1. The first DATE/TIMESTAMP column. macro_project writes native dates
+ *      (rformat.normalise_dates), so this is the path its files take. Where a
+ *      table has two -- a period and a revision stamp, say -- the first wins,
+ *      which is the writer's own ordering.
+ *   2. A text column NAMED as a date. **ETL writes every date column as
+ *      VARCHAR holding ISO text**, always, in every output format: _dt_to_iso
+ *      plus `pl.Series(..., dtype=pl.Utf8)`, with no setting that changes it.
+ *      A type-only rule therefore finds an axis in macro files and never in
+ *      ETL ones, which is the bug this ordering exists to fix.
+ *
+ * Anything else has no axis and gets no chart.
+ */
+export function pickXAxis(columns: string[], kinds: StatsKind[]): XAxis | undefined {
   if (columns.length !== kinds.length) return undefined;
-  const x = columns.find((_, i) => kinds[i] === 'datetime');
-  if (x === undefined) return undefined;
-  const y = columns.filter((name, i) => kinds[i] === 'numeric' && name !== x);
-  return y.length > 0 ? { x, y } : undefined;
+
+  const nativeIndex = kinds.indexOf('datetime');
+  if (nativeIndex >= 0) return { column: columns[nativeIndex], kind: 'datetime' };
+
+  // "Datetime" before "Date" regardless of position, matching
+  // helpers_core.R's .resolve_date_col rather than merely resembling it.
+  for (const wanted of TEXT_AXIS_NAMES) {
+    const i = columns.findIndex(
+      (name, idx) => kinds[idx] === 'other' && name.trim().toLowerCase() === wanted
+    );
+    if (i >= 0) return { column: columns[i], kind: 'text' };
+  }
+  return undefined;
 }
 
 /**
- * Whether this result is one series and nothing else -- exactly one datetime
- * column and exactly one numeric column, with no third column of any kind.
+ * The columns worth offering a plot button on: every numeric one, provided
+ * the result has an axis to plot it against.
  *
- * This is the case worth opening a chart for without being asked: there is
- * only one thing the table can be a picture of, so the chart is not a guess.
- * Two numeric columns on a shared axis is a decision (which scale? which one
- * gets flattened?) and it should be made by whoever clicks the button.
+ * One button per column rather than one for the table. A wide ETL table like
+ * Raw_Data has 40-odd numeric columns and "plot all of them" was never the
+ * useful reading -- 40 series sharing one linear axis is a picture of the
+ * largest one and a flat line for everything else.
  */
-export function isSingleSeries(columns: string[], kinds: StatsKind[]): boolean {
-  if (columns.length !== 2 || kinds.length !== 2) return false;
-  const spec = pickTimeSeries(columns, kinds);
-  return spec !== undefined && spec.y.length === 1;
+export function plottableColumns(columns: string[], kinds: StatsKind[]): string[] {
+  if (pickXAxis(columns, kinds) === undefined) return [];
+  return columns.filter((_, i) => kinds[i] === 'numeric');
 }
 
 /**
@@ -74,6 +114,24 @@ export function toSeriesPoints(xs: unknown[], ys: unknown[]): [number, number | 
     points.push([at, toFiniteNumber(ys[i])]);
   }
   return points;
+}
+
+/**
+ * Values for a category axis: the y column alone, positionally aligned with
+ * the labels, with the same null-is-a-gap rule as above.
+ *
+ * No pairing with x here, because on a category axis the position IS the
+ * index -- which is exactly why a category axis is only ever drawn over
+ * labels the writer named as an axis, and why the rows are left in the
+ * table's own order rather than sorted into one that would imply a sequence.
+ */
+export function toCategoryValues(ys: unknown[]): (number | null)[] {
+  return ys.map(toFiniteNumber);
+}
+
+/** Category-axis labels, as stored. Nothing is reformatted: "1996-1Q" is shown as "1996-1Q". */
+export function toCategoryLabels(xs: unknown[]): string[] {
+  return xs.map((v) => (v === null || v === undefined ? '' : String(v)));
 }
 
 /**

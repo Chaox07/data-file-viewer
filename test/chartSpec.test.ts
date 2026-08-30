@@ -1,82 +1,100 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 
-import { pickTimeSeries, isSingleSeries, toSeriesPoints, toEpochMs } from '../src/chartSpec';
+import {
+  pickXAxis,
+  plottableColumns,
+  toSeriesPoints,
+  toCategoryLabels,
+  toCategoryValues,
+  toEpochMs,
+} from '../src/chartSpec';
 
-// ------------------------------------------------------------ picking axes
+// ------------------------------------------------------------- picking an x
 
-test('a date column and a numeric column are a time series', () => {
-  assert.deepEqual(
-    pickTimeSeries(['Date', 'Rate'], ['datetime', 'numeric']),
-    { x: 'Date', y: ['Rate'] }
-  );
+test('a native DATE column is the axis', () => {
+  assert.deepEqual(pickXAxis(['Date', 'Rate'], ['datetime', 'numeric']), {
+    column: 'Date',
+    kind: 'datetime',
+  });
 });
 
-test('every numeric column goes on the y axis, in result order', () => {
-  assert.deepEqual(
-    pickTimeSeries(['Date', 'B', 'A'], ['datetime', 'numeric', 'numeric']),
-    { x: 'Date', y: ['B', 'A'] }
-  );
+test('the first native date column wins when a table has two', () => {
+  // A period column and a revision stamp, say. The writer's own order decides.
+  const x = pickXAxis(['Period', 'Revised', 'Rate'], ['datetime', 'datetime', 'numeric']);
+  assert.equal(x?.column, 'Period');
 });
 
-test('text columns are ignored rather than plotted', () => {
-  assert.deepEqual(
-    pickTimeSeries(['Date', 'Rate', 'Note'], ['datetime', 'numeric', 'other']),
-    { x: 'Date', y: ['Rate'] }
-  );
+test('a VARCHAR column NAMED Date is the axis — this is every ETL file', () => {
+  // ETL writes dates as VARCHAR ISO text in every output format, so the type
+  // says 'other' and the name is the only thing left to go on. Without this
+  // branch the entire ETL toolchain is unchartable.
+  assert.deepEqual(pickXAxis(['Date', 'SVENF01'], ['other', 'numeric']), {
+    column: 'Date',
+    kind: 'text',
+  });
 });
 
-test('the first date column wins when a table has two', () => {
-  // A period column and a revision stamp, say. The writer's own order decides,
-  // which is the same rule the R scripts' .resolve_date_col follows.
-  const spec = pickTimeSeries(['Period', 'Revised', 'Rate'], ['datetime', 'datetime', 'numeric']);
-  assert.equal(spec?.x, 'Period');
+test('Datetime beats Date, matching helpers_core.R .resolve_date_col', () => {
+  const x = pickXAxis(['Date', 'Datetime', 'Rate'], ['other', 'other', 'numeric']);
+  assert.equal(x?.column, 'Datetime');
 });
 
-test('a table with no date column is not chartable', () => {
-  // This is the one that matters. Plotting numbers against their row position
-  // draws the storage order and looks exactly like a real chart.
-  assert.equal(pickTimeSeries(['A', 'B'], ['numeric', 'numeric']), undefined);
+test('a native date beats a text column named Date', () => {
+  const x = pickXAxis(['Date', 'Stamp', 'Rate'], ['other', 'datetime', 'numeric']);
+  assert.deepEqual(x, { column: 'Stamp', kind: 'datetime' });
 });
 
-test('a date column with nothing numeric beside it is not chartable', () => {
-  assert.equal(pickTimeSeries(['Date', 'Note'], ['datetime', 'other']), undefined);
+test('the name match ignores case and surrounding space', () => {
+  assert.equal(pickXAxis([' DATE ', 'Rate'], ['other', 'numeric'])?.kind, 'text');
 });
 
-test('sheet_metadata is not chartable', () => {
-  // All text plus a couple of counts, and no date column: the auxiliary table
-  // sitting beside every macro export must never be mistaken for a series.
+test('a text column NOT named as a date is never an axis', () => {
+  // This is the rule that matters. Plotting numbers against arbitrary labels
+  // draws the order the table happens to hold its rows in, dressed up as a
+  // chart.
+  assert.equal(pickXAxis(['Country', 'Rate'], ['other', 'numeric']), undefined);
+});
+
+test('sheet_metadata has no axis', () => {
+  // Text columns plus a count. The auxiliary table sitting beside every macro
+  // and ETL export must never offer to plot row counts against table names.
   assert.equal(
-    pickTimeSeries(['table_name', 'source', 'n_obs'], ['other', 'other', 'numeric']),
+    pickXAxis(['table_name', 'source', 'n_obs'], ['other', 'other', 'numeric']),
     undefined
   );
 });
 
+test('a table with only numbers has no axis', () => {
+  assert.equal(pickXAxis(['A', 'B'], ['numeric', 'numeric']), undefined);
+});
+
 test('mismatched columns and kinds produce nothing rather than guessing', () => {
-  assert.equal(pickTimeSeries(['Date', 'Rate'], ['datetime']), undefined);
+  assert.equal(pickXAxis(['Date', 'Rate'], ['datetime']), undefined);
 });
 
-// -------------------------------------------------- the auto-open condition
+// ------------------------------------------------------------ plot buttons
 
-test('exactly one date and one number is a single series', () => {
-  assert.equal(isSingleSeries(['Date', 'Rate'], ['datetime', 'numeric']), true);
+test('every numeric column is plottable when there is an axis', () => {
+  assert.deepEqual(
+    plottableColumns(['Date', 'B', 'A', 'Note'], ['datetime', 'numeric', 'numeric', 'other']),
+    ['B', 'A']
+  );
 });
 
-test('two numeric columns are NOT a single series', () => {
-  // Chartable, but which scale? That is a decision, and it belongs to whoever
-  // clicks the button rather than to the file opening.
-  assert.equal(isSingleSeries(['Date', 'A', 'B'], ['datetime', 'numeric', 'numeric']), false);
+test('no axis means no plottable columns, however many numbers there are', () => {
+  assert.deepEqual(plottableColumns(['A', 'B'], ['numeric', 'numeric']), []);
 });
 
-test('a date, a number and a note are NOT a single series', () => {
-  assert.equal(isSingleSeries(['Date', 'Rate', 'Note'], ['datetime', 'numeric', 'other']), false);
+test('the x column is never offered as its own y', () => {
+  assert.deepEqual(plottableColumns(['Date', 'Rate'], ['datetime', 'numeric']), ['Rate']);
 });
 
-test('a two-column table with no date is not a single series', () => {
-  assert.equal(isSingleSeries(['A', 'B'], ['numeric', 'numeric']), false);
+test('a date column with nothing numeric beside it offers no button', () => {
+  assert.deepEqual(plottableColumns(['Date', 'Note'], ['datetime', 'other']), []);
 });
 
-// ----------------------------------------------------------- point building
+// -------------------------------------------------- time-axis point building
 
 test('dates become epoch milliseconds', () => {
   const points = toSeriesPoints([new Date('1982-01-01T00:00:00Z')], [2.5]);
@@ -121,4 +139,22 @@ test('a non-numeric y is a gap rather than a crash', () => {
 
 test('an invalid Date is refused', () => {
   assert.equal(toEpochMs(new Date('nonsense')), undefined);
+});
+
+// ------------------------------------------------------- category-axis rows
+
+test('category labels are shown exactly as stored', () => {
+  // The whole point of the category axis: "1996-1Q" is a label DuckDB could
+  // not cast, and reformatting it would be inventing a reading of it.
+  assert.deepEqual(toCategoryLabels(['1996-1Q', '1996-2Q']), ['1996-1Q', '1996-2Q']);
+});
+
+test('a null label renders as empty rather than the word null', () => {
+  assert.deepEqual(toCategoryLabels([null, undefined]), ['', '']);
+});
+
+test('category values keep their positions, gaps included', () => {
+  // Position IS the index on a category axis, so a dropped value would shift
+  // every later point onto the wrong label.
+  assert.deepEqual(toCategoryValues([1, null, '3.5', 'x']), [1, null, 3.5, null]);
 });

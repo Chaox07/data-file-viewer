@@ -210,7 +210,7 @@ html, body {
   flex-shrink: 0;
 }
 
-.th-sort-btn, .th-stats-btn {
+.th-sort-btn, .th-stats-btn, .th-plot-btn {
   background: none;
   border: none;
   color: #7d8493;
@@ -221,7 +221,7 @@ html, body {
   border-radius: 2px;
 }
 
-.th-sort-btn:hover, .th-stats-btn:hover {
+.th-sort-btn:hover, .th-stats-btn:hover, .th-plot-btn:hover {
   background: #3a3f4b;
   color: #abb2bf;
 }
@@ -233,6 +233,18 @@ html, body {
 .th-stats-btn {
   font-size: 11px;
   font-weight: 600;
+}
+
+/* An emoji glyph is drawn by the font at its own weight, so the greying that
+   works on ≡ and ⇅ does nothing here -- dim it instead, and bring it back on
+   hover like the others. */
+.th-plot-btn {
+  font-size: 11px;
+  opacity: 0.55;
+}
+
+.th-plot-btn:hover {
+  opacity: 1;
 }
 
 /* Disables sort/stats/cell-edit affordances while a query is in flight, so a
@@ -519,33 +531,26 @@ html, body {
   font-size: 12px;
 }
 
-/* ---- chart panel -------------------------------------------------------
-   Sits where the results grid does and replaces it, rather than splitting the
-   pane: a chart of a series and a table of the same rows are two readings of
-   one thing, and half a grid under half a chart is worse at both. */
-.chart-panel {
-  flex: 1;
+/* ---- chart tab ---------------------------------------------------------
+   The chart has its own VS Code tab (chartPanel.ts), so this styles a whole
+   page rather than a panel inside the grid's. An earlier version DID sit
+   inside the grid pane, and its `.chart-panel { display: flex }` silently
+   defeated `hidden` for exactly the reason spelled out at .th-inner /
+   #unlock-options above -- the empty panel stayed visible and squeezed the
+   table into the bottom of the pane. Nothing here is toggled with `hidden`,
+   which is the cleanest way for that not to happen twice. */
+.chart-root {
   display: flex;
   flex-direction: column;
-  min-height: 0;
-  background: #282c34;
-}
-
-.chart-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+  height: 100vh;
+  box-sizing: border-box;
 }
 
 .chart-title {
+  padding: 6px 10px;
   font-size: 12px;
   opacity: 0.85;
-}
-
-.chart-close {
-  margin-left: auto;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.25);
 }
 
 /* ECharts measures its container on init, so this needs a real height rather

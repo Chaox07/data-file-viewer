@@ -13,6 +13,7 @@ import {
   fnv1aFold,
   hasTrailingLimit,
 } from './duckdbConnection';
+import { ChartPanel } from './chartPanel';
 import { destructiveReason, hasMultipleStatements } from './sqlSafety';
 import { LiveRefreshController, LiveStatus } from './liveRefresh';
 
@@ -47,10 +48,6 @@ function isPreviewFirstTableEnabled(): boolean {
 function getChartMaxPoints(): number {
   const value = vscode.workspace.getConfiguration('dataFileViewer').get<number>('chartMaxPoints', 200_000);
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 200_000;
-}
-
-function isAutoChartEnabled(): boolean {
-  return vscode.workspace.getConfiguration('dataFileViewer').get<boolean>('autoChartSingleSeries', true) !== false;
 }
 
 function getGlobalLiveRefreshIntervalMs(): number {
@@ -885,7 +882,10 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
       | { command: 'toggleLiveRefresh'; enabled: boolean; intervalMs?: number }
       | { command: 'setLiveRefreshInterval'; intervalMs: number }
       | { command: 'runCombinedQuery'; table: string }
-      | { command: 'chartQuery'; xColumn: string; yColumns: string[] };
+      | { command: 'chartQuery'; xColumn: string; xIsText: boolean; yColumns: string[] };
+
+    // Created on the first plot click and reused after that; see ChartPanel.
+    let chartPanel: ChartPanel | undefined;
 
     const messageSub = webview.onDidReceiveMessage(async (message: IncomingMessage) => {
       if (message.command === 'ready') {
@@ -896,7 +896,6 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             tables,
             combinedTableNames: [...document.combinedQueryMap.values()].map((table) => `${table}_combined`),
             previewFirst: isPreviewFirstTableEnabled(),
-            autoChart: isAutoChartEnabled(),
           });
         } catch (err) {
           webview.postMessage({ command: 'error', message: (err as Error).message });
@@ -1150,23 +1149,35 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
         // of it rather than a replacement.
         if (!document.lastSql) return;
         const cap = getChartMaxPoints();
+        const label = message.yColumns.length === 1 ? message.yColumns[0] : `${message.yColumns.length} series`;
+        chartPanel ??= new ChartPanel(this.context.extensionUri, basename(document.uri.fsPath));
         try {
           const result = await document.runExclusive(() =>
-            document.file.runChartQuery(document.lastSql!, message.xColumn, message.yColumns, cap)
+            document.file.runChartQuery(
+              document.lastSql!,
+              message.xColumn,
+              message.yColumns,
+              message.xIsText === true,
+              cap
+            )
           );
-          webview.postMessage({
-            command: 'chartResult',
+          chartPanel.reveal(label, {
+            command: 'chart',
             xColumn: message.xColumn,
             yColumns: message.yColumns,
             columns: result.columns,
             rows: result.rows,
-            // `truncated` means the cap actually bit. The webview reports the
-            // refusal instead of drawing a prefix of the series.
+            xAxisMode: result.xAxisMode,
+            // `truncated` means the cap actually bit. The chart view reports
+            // the refusal instead of drawing a prefix of the series.
             truncated: result.truncated === true,
             maxPoints: cap,
           });
         } catch (err) {
-          webview.postMessage({ command: 'chartError', message: (err as Error).message });
+          // In the chart's own tab, not the grid's status line: the tab is
+          // where the user is looking, and a chart that silently never appears
+          // is the failure worth avoiding.
+          chartPanel.reveal(label, { command: 'chartError', message: (err as Error).message });
         }
         return;
       }
@@ -1336,6 +1347,9 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
 
     webviewPanel.onDidDispose(() => {
       messageSub.dispose();
+      // A chart of a document nobody has open is furniture.
+      chartPanel?.dispose();
+      chartPanel = undefined;
       // The panel going away is the end of anyone being able to see a tick's
       // result, so stop scheduling them. Document disposal usually follows
       // immediately, but nothing guarantees it happens first.

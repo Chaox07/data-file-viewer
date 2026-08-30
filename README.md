@@ -185,6 +185,39 @@ Every results grid — table previews and hand-written queries alike — gets:
   the *entire* column (not just the visible rows): for numeric/date columns,
   the minimum, maximum, average, and 5th/95th percentiles; for everything
   else, null count, distinct count, and the 20 most frequent values.
+
+  The average and the two percentiles are shown to at most four decimal
+  places. The minimum and maximum are not rounded: those two are values that
+  are actually in the data, while the other three are computed (and the
+  percentiles are approximate to begin with — the label says so).
+- **Plot**: a 📈 button appears in the header of every numeric column that
+  the result has an x axis for, and clicking it opens that column as a line
+  chart in its own VS Code tab beside the grid. Plotting a second column
+  redraws the same tab rather than opening another one.
+
+  The chart is always of the **whole** series. A preview runs `LIMIT 100`,
+  and charting those hundred rows of a longer series would draw a line that
+  stops early and looks exactly like a series that ends early — so the
+  trailing `LIMIT` is stripped for the chart. Past
+  `dataFileViewer.chartMaxPoints` (200,000 by default) it refuses and tells
+  you the real count instead of drawing a prefix.
+
+  Which column becomes the x axis, in order:
+
+  1. the first `DATE`/`TIMESTAMP` column;
+  2. otherwise a text column *named* `Date` or `Datetime` — this is what
+     makes ETL output chartable, since ETL stores dates as `VARCHAR` ISO
+     text in every one of its output formats. If those strings parse as
+     timestamps they become a real time axis; if they do not (period labels
+     like `1996-1Q`) they become a **category** axis, drawn with the labels
+     exactly as stored and the rows in the table's own order — no sorting,
+     because sorting `1996-1Q` strings would produce an order that merely
+     looks chronological.
+
+  A result with neither gets no plot buttons at all. That is deliberate:
+  plotting numbers against arbitrary text draws the order the table happens
+  to hold its rows in, dressed up as a chart. It is also why `sheet_metadata`
+  — text columns and a count — offers nothing to plot.
 - **NULL values** are shown dimmed and in italics in the results grid, so
   they're easy to tell apart from a real value like an empty string or a
   literal `0`.
