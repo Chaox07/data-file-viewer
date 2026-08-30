@@ -3,6 +3,7 @@
  * of families that exist. Anything not imported here does not run.
  */
 import './arrowZoo';
+import './concurrency';
 import './consistency';
 import './damage';
 import './identifiers';

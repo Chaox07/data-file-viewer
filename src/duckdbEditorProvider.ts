@@ -299,7 +299,11 @@ async function acquireFileLock(path: string): Promise<() => void> {
   return () => releaseFileLockSync(lockPath);
 }
 
-class DuckDBDocument implements vscode.CustomDocument {
+// Exported for the stress suite, which drives the document directly rather
+// than through the extension host: the connection lock, the stats cache and
+// the sibling resolution below are the parts with no coverage, and they are
+// all reachable from an instance. Nothing outside this file constructs one.
+export class DuckDBDocument implements vscode.CustomDocument {
   private tablesCache: string[] | undefined;
   // name (e.g. "orders_combined") -> the synthesized SQL that entry runs.
   combinedQueryMap = new Map<string, string>();
