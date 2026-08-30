@@ -3,4 +3,5 @@
  * of families that exist. Anything not imported here does not run.
  */
 import './roundtrip';
+import './safemode';
 import './shapes';

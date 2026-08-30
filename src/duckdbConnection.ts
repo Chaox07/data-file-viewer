@@ -621,6 +621,8 @@ const FORBIDDEN_KEYWORDS_RE = /\b(join|group\s+by|distinct|union|intersect|excep
 export class DuckDbFile {
   private lastBackupPath: string | undefined;
   private backupAttached = false;
+  /** Temp dir holding a Feather backup's stream conversion, if any. */
+  private backupTempDir: string | undefined;
   private materialized = false;
   /** Set once this workbook's views have been re-created with ignore_errors. */
   private xlsxErrorsTolerated = false;
@@ -1580,38 +1582,114 @@ export class DuckDbFile {
     if (!this.lastBackupPath) throw new Error('No backup available to compare against');
     if (this.kind === 'duckdb') {
       await this.connection.run(`attach ${quoteLiteral(this.lastBackupPath)} as backup_cmp (read_only)`);
-    } else if (this.kind === 'sqlite') {
+      return;
+    }
+    if (this.kind === 'sqlite') {
       await this.connection.run(
         `attach ${quoteLiteral(this.lastBackupPath)} as backup_cmp (type sqlite, read_only)`
       );
-    } else {
-      // Parquet/CSV: mirror the same view name inside a fresh in-memory
-      // catalog, so unqualified SQL resolves against it once USEd, same as
-      // the others. (If this document's own file was already materialized
-      // into a table via an edit, the backup itself is still the original
-      // pre-edit flat file on disk — read back with the same read_* function
-      // used to open it in the first place, regardless of materialization.)
-      const readFn =
-        this.kind === 'parquet'
-          ? 'read_parquet'
-          : this.kind === 'dta'
-            ? 'read_dta'
-            : this.kind === 'arrow'
-              ? 'read_arrow'
-              : 'read_csv_auto';
-      await this.connection.run(`attach ':memory:' as backup_cmp`);
-      await this.connection.run('use backup_cmp');
-      await this.connection.run(
-        `create view ${quoteIdent(this.mainObjectName)} as select * from ${readFn}(${quoteLiteral(
-          this.lastBackupPath
-        )})`
-      );
-      await this.connection.run(`use ${quoteIdent(this.catalogName)}`);
+      return;
     }
+
+    // Every other kind: mirror the live view names inside a fresh in-memory
+    // catalog, so unqualified SQL resolves against it once USEd, same as the
+    // others. (If this document's own file was already materialized into a
+    // table via an edit, the backup itself is still the original pre-edit flat
+    // file on disk — read back the same way it was opened in the first place,
+    // regardless of materialization.)
+    await this.connection.run(`attach ':memory:' as backup_cmp`);
+    try {
+      await this.connection.run('use backup_cmp');
+      try {
+        await this.createBackupViews();
+      } finally {
+        // Non-negotiable, and the reason this is a finally rather than a
+        // trailing statement: while the connection points at backup_cmp, every
+        // unqualified query in the session resolves against it. A throw between
+        // the USE above and this line used to strand the connection there, so
+        // one failed backup turned into "Table with name X does not exist" for
+        // every query afterwards — the file looked fine, and nothing about the
+        // error mentioned Safe Mode.
+        await this.connection.run(`use ${quoteIdent(this.catalogName)}`);
+      }
+    } catch (err) {
+      // The alias is attached even though the views are not, and DuckDB refuses
+      // to re-attach a name already in use — so without this, a retry fails
+      // with a second, more confusing error than the first.
+      await this.connection.run('detach backup_cmp').catch(() => undefined);
+      await this.clearBackupTempDir();
+      throw err;
+    }
+  }
+
+  /** The backup's views, in whatever shape this kind reads. Runs inside backup_cmp. */
+  private async createBackupViews(): Promise<void> {
+    const backupPath = this.lastBackupPath!;
+
+    if (this.kind === 'xlsx') {
+      // A workbook is the one flat kind that is genuinely multi-table, so the
+      // backup needs one view per sheet under the same names the live catalog
+      // uses -- the diff pairs the two catalogs up by table name. Reading a
+      // workbook with read_csv_auto, which is what the old fallback did, fails
+      // on the ZIP header and takes Safe Mode down with it.
+      const literalPath = quoteLiteral(backupPath);
+      // If this workbook already needed ignore_errors to be readable, its
+      // backup needs it too -- otherwise the diff throws on the same
+      // uncomputable cell that the live side is already tolerating.
+      const tolerate = this.xlsxErrorsTolerated ? ', ignore_errors = true' : '';
+      let created = 0;
+      for (const name of this.xlsxSheetPaths.keys()) {
+        const asLiteral = name.replace(/'/g, "''");
+        const asIdent = name.replace(/"/g, '""');
+        try {
+          await this.connection.run(
+            `create view "${asIdent}" as select * from read_xlsx(${literalPath}, sheet = '${asLiteral}'${tolerate})`
+          );
+          created++;
+        } catch {
+          // One unreadable sheet must not cost the user Safe Mode on the rest,
+          // exactly as at open time.
+        }
+      }
+      if (created === 0) {
+        throw new Error('None of the workbook\'s sheets could be read from the backup copy.');
+      }
+      return;
+    }
+
+    let readPath = backupPath;
+    if (this.kind === 'feather') {
+      // read_arrow cannot read the Feather file encoding at all -- converting
+      // is the entire reason this kind exists -- so the backup copy has to go
+      // through the same conversion the original did.
+      const converted = await convertFeatherToStream(backupPath);
+      readPath = converted.streamPath;
+      this.backupTempDir = converted.tempDir;
+    }
+
+    const readFn =
+      this.kind === 'parquet'
+        ? 'read_parquet'
+        : this.kind === 'dta'
+          ? 'read_dta'
+          : this.kind === 'arrow' || this.kind === 'feather'
+            ? 'read_arrow'
+            : 'read_csv_auto';
+    await this.connection.run(
+      `create view ${quoteIdent(this.mainObjectName)} as select * from ${readFn}(${quoteLiteral(readPath)})`
+    );
+  }
+
+  private async clearBackupTempDir(): Promise<void> {
+    if (!this.backupTempDir) return;
+    const dir = this.backupTempDir;
+    this.backupTempDir = undefined;
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
   }
 
   private async detachBackupCatalog(): Promise<void> {
     await this.connection.run('detach backup_cmp');
+    await this.clearBackupTempDir();
   }
 
   /** Table-level "did anything in this table change since the backup" summary for the sidebar. */
@@ -2064,6 +2142,10 @@ export class DuckDbFile {
 
   dispose(): void {
     this.connection.closeSync();
+    if (this.backupTempDir) {
+      void rm(this.backupTempDir, { recursive: true, force: true }).catch(() => undefined);
+      this.backupTempDir = undefined;
+    }
     if (this.featherTempDir) {
       // Fire-and-forget: dispose() is synchronous by contract, and a temp file
       // left behind on a failed unlink is a far smaller problem than a throw
