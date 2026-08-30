@@ -41,10 +41,11 @@ function isPreviewFirstTableEnabled(): boolean {
   return vscode.workspace.getConfiguration('dataFileViewer').get<boolean>('previewFirstTableOnOpen', true) !== false;
 }
 
-// Most points a chart will draw. A chart is a picture of the whole series --
-// runChartQuery strips the preview's LIMIT for exactly that reason -- so a cap
-// here is refused rather than applied, with the true count reported. Silently
-// drawing the first N would put the lie back.
+// Most points a chart will draw. This is the viewer's OWN ceiling, not the
+// query's: a LIMIT you typed is honoured by runChartQuery and plotted in full.
+// This cap exists for the query that has no limit and matches ten million rows,
+// and it is refused rather than applied, with the true count reported --
+// silently drawing the first N would be a chart of a query nobody wrote.
 function getChartMaxPoints(): number {
   const value = vscode.workspace.getConfiguration('dataFileViewer').get<number>('chartMaxPoints', 200_000);
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 200_000;
@@ -820,6 +821,12 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
         vscode.window.showWarningMessage(
           `${basename(uri.fsPath)}: opened read-only — this file is already open elsewhere. Edits will fail until the other handle is released.`
         );
+      }
+      // Said at open, once, rather than left for the user to notice as a blank
+      // cell and wonder about. The file is fine and usable — this is about
+      // what is IN it.
+      for (const warning of file.openWarnings) {
+        vscode.window.showWarningMessage(`${basename(uri.fsPath)}: ${warning}`);
       }
       if (isFlatFile) this.openFlatFilePaths.add(uri.fsPath);
       return new DuckDBDocument(

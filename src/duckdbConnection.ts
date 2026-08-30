@@ -11,6 +11,7 @@ import {
 } from '@duckdb/node-api';
 import { basename, dirname, extname, join } from 'node:path';
 import { chmod, copyFile, mkdtemp, open, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
 import { KNOWN_FREQUENCIES, type SeriesFrequency } from './chartSpec';
@@ -130,6 +131,19 @@ async function assertArrowStreamComplete(path: string): Promise<void> {
 const ARROW_FILE_MAGIC = Buffer.from('ARROW1', 'ascii');
 const FEATHER_V1_MAGIC = Buffer.from('FEA1', 'ascii');
 
+/**
+ * Whether an error is read_xlsx refusing a single cell's value, not the file.
+ *
+ * Matched on the message because that is all the extension gives: there is no
+ * error code, and the two failures have to be told apart -- a cell that will
+ * not parse is recoverable by reading it as NULL, while a sheet that is not a
+ * worksheet at all is not.
+ */
+function isCellParseError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /Failed to parse cell|Could not convert string/i.test(message);
+}
+
 async function isFeatherEncoding(path: string): Promise<boolean> {
   const head = Buffer.alloc(ARROW_FILE_MAGIC.length);
   let bytesRead = 0;
@@ -157,10 +171,20 @@ async function isFeatherEncoding(path: string): Promise<boolean> {
  * apache-arrow JS library is here for: tableFromIPC() reads BOTH encodings,
  * tableToIPC(t, 'stream') writes the one read_arrow wants.
  *
- * The whole table goes through memory, unlike every other format here, which
- * DuckDB streams off disk. That is inherent to converting rather than reading,
- * and it is the reason .feather is worth having as its own kind rather than
- * being treated as just another Arrow file.
+ * Converted a RECORD BATCH AT A TIME, not as a whole table. The Feather file
+ * encoding puts its footer at the end and is therefore random-access, which is
+ * exactly what apache-arrow's AsyncRecordBatchFileReader wants: handed a
+ * FileHandle it seeks to the footer, reads the batch index, and yields batches
+ * on demand. Each one is re-encoded and written straight out to the stream, so
+ * peak memory is one batch rather than the entire dataset — measured at 59 MB
+ * on a 12 MB / 400,000-row polars file that previously had to hold the whole
+ * decoded table, its re-encoded copy, and the file's own Buffer at once.
+ *
+ * A conversion still happens; that part is not avoidable while DuckDB has no
+ * Feather reader (re-verified against duckdb 1.5.5 + the arrow community
+ * extension: read_arrow fails on the file encoding, compressed or not, and
+ * nothing else in that extension takes one). What is avoidable is doing it in
+ * one bite, and that is what this does.
  *
  * COMPRESSED Feather cannot be handled and is refused with a message saying
  * so. apache-arrow JS has no IPC codecs at all — it throws "Record batch is
@@ -170,44 +194,12 @@ async function isFeatherEncoding(path: string): Promise<boolean> {
  * DuckDB's.
  */
 async function convertFeatherToStream(path: string): Promise<{ streamPath: string; tempDir: string }> {
-  const arrow = await import('apache-arrow');
-  const { tableFromIPC, tableToIPC, Table, Type, Utf8, vectorFromArray } = arrow;
-
-  /**
-   * Re-encode Utf8View columns as plain Utf8.
-   *
-   * polars writes strings as Arrow Utf8View by DEFAULT, and read_arrow rejects
-   * that type outright: "Unrecognized Field type with value 24" -- 24 being
-   * Type.Utf8View exactly. Converting the container is therefore not enough on
-   * its own; the string columns have to be brought down to a type DuckDB knows,
-   * or every file polars wrote fails after a successful conversion.
-   *
-   * This is the same hazard `compat_level=oldest` exists for on the write side,
-   * arriving from the other direction. It is worth knowing that this was missed
-   * by a green test suite: the fixtures were built from DuckDB's own output,
-   * which is plain Utf8, so the corpus agreed with the code and both were wrong
-   * about real polars files.
-   */
-  const downcastViews = (t: InstanceType<typeof Table>): InstanceType<typeof Table> => {
-    const columns: Record<string, unknown> = {};
-    let changed = false;
-    for (const field of t.schema.fields) {
-      const vector = t.getChild(field.name);
-      if (!vector) continue;
-      if (field.type.typeId === Type.Utf8View) {
-        columns[field.name] = vectorFromArray(vector.toJSON() as (string | null)[], new Utf8());
-        changed = true;
-      } else {
-        columns[field.name] = vector;
-      }
-    }
-    return changed ? new Table(columns as never) : t;
-  };
-
-  let table;
+  const tempDir = await mkdtemp(join(tmpdir(), 'dfv-feather-'));
+  const streamPath = join(tempDir, `${basename(path, extname(path))}.arrows`);
   try {
-    table = downcastViews(tableFromIPC(await readFile(path)));
+    await streamFeatherToArrowStream(path, streamPath);
   } catch (err) {
+    await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
     const message = err instanceof Error ? err.message : String(err);
     if (/compress/i.test(message)) {
       throw new Error(
@@ -220,11 +212,134 @@ async function convertFeatherToStream(path: string): Promise<{ streamPath: strin
     }
     throw new Error(`"${basename(path)}" could not be read as a Feather / Arrow IPC file: ${message}`);
   }
-
-  const tempDir = await mkdtemp(join(tmpdir(), 'dfv-feather-'));
-  const streamPath = join(tempDir, `${basename(path, extname(path))}.arrows`);
-  await writeFile(streamPath, Buffer.from(tableToIPC(table, 'stream')));
   return { streamPath, tempDir };
+}
+
+/**
+ * Re-encode a batch's Utf8View columns as plain Utf8, leaving the rest alone.
+ *
+ * polars writes strings as Arrow Utf8View by DEFAULT, and read_arrow rejects
+ * that type outright: "Unrecognized Field type with value 24" -- 24 being
+ * Type.Utf8View exactly. Converting the container is therefore not enough on
+ * its own; the string columns have to be brought down to a type DuckDB knows,
+ * or every file polars wrote fails after a successful conversion.
+ *
+ * This is the same hazard `compat_level=oldest` exists for on the write side,
+ * arriving from the other direction. It is worth knowing that this was missed
+ * by a green test suite: the fixtures were built from DuckDB's own output,
+ * which is plain Utf8, so the corpus agreed with the code and both were wrong
+ * about real polars files.
+ */
+async function downcastViewsInBatch(batch: unknown): Promise<unknown> {
+  const { Table, Type, Utf8, vectorFromArray } = await import('apache-arrow');
+  const source = batch as { schema: { fields: { name: string; type: { typeId: number } }[] };
+                            getChild(name: string): unknown };
+  const columns: Record<string, unknown> = {};
+  let changed = false;
+  for (const field of source.schema.fields) {
+    const vector = source.getChild(field.name);
+    if (!vector) continue;
+    if (field.type.typeId === Type.Utf8View) {
+      columns[field.name] = vectorFromArray(
+        (vector as { toJSON(): (string | null)[] }).toJSON(),
+        new Utf8()
+      );
+      changed = true;
+    } else {
+      columns[field.name] = vector;
+    }
+  }
+  // A Table built from one batch's vectors has exactly one batch back out.
+  return changed ? new Table(columns as never).batches[0] : batch;
+}
+
+/**
+ * Arrow IPC stream at `from` -> Feather file at `to`, one record batch at a time.
+ *
+ * The save-side mirror of streamFeatherToArrowStream, and the reason .feather
+ * can be edited at all: DuckDB's `COPY ... (FORMAT arrow)` writes the stream
+ * encoding, and this turns that into the file encoding the original had, with
+ * the same one-batch memory ceiling as the read side.
+ *
+ * No Utf8View downcast on this side. These batches came out of DuckDB, which
+ * writes plain Utf8 -- the downcast exists for what polars WROTE, not for what
+ * this viewer writes.
+ */
+async function streamArrowStreamToFeather(from: string, to: string): Promise<void> {
+  const { RecordBatchReader, RecordBatchFileWriter } = await import('apache-arrow');
+  const handle = await open(from, 'r');
+  try {
+    // apache-arrow's typings do not list FileHandle among RecordBatchReader.from's
+    // overloads, though it accepts one at runtime and returns the async
+    // random-access reader the file encoding needs -- which is the whole point
+    // here. Typed at the call rather than cast at the argument: `handle as never`
+    // collapses the return type to `never` and takes `open()` with it.
+    const openReader = RecordBatchReader.from as unknown as (
+      source: unknown
+    ) => Promise<{ open(): Promise<void> } & AsyncIterable<unknown>>;
+    const reader = await openReader(handle);
+    await reader.open();
+
+    const out = createWriteStream(to);
+    const writer = new RecordBatchFileWriter();
+    const done = new Promise<void>((resolve, reject) => {
+      out.on('finish', resolve);
+      out.on('error', reject);
+    });
+    writer.toNodeStream().pipe(out);
+    try {
+      for await (const batch of reader) writer.write(batch as never);
+      writer.finish();
+    } catch (err) {
+      writer.close();
+      out.destroy();
+      throw err;
+    }
+    await done;
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Feather file at `from` -> Arrow IPC stream at `to`, one record batch at a time. */
+async function streamFeatherToArrowStream(from: string, to: string): Promise<void> {
+  const { RecordBatchReader, RecordBatchStreamWriter } = await import('apache-arrow');
+  const handle = await open(from, 'r');
+  try {
+    // apache-arrow's typings do not list FileHandle among RecordBatchReader.from's
+    // overloads, though it accepts one at runtime and returns the async
+    // random-access reader the file encoding needs -- which is the whole point
+    // here. Typed at the call rather than cast at the argument: `handle as never`
+    // collapses the return type to `never` and takes `open()` with it.
+    const openReader = RecordBatchReader.from as unknown as (
+      source: unknown
+    ) => Promise<{ open(): Promise<void> } & AsyncIterable<unknown>>;
+    const reader = await openReader(handle);
+    await reader.open();
+
+    const out = createWriteStream(to);
+    const writer = new RecordBatchStreamWriter();
+    const done = new Promise<void>((resolve, reject) => {
+      out.on('finish', resolve);
+      out.on('error', reject);
+    });
+    writer.toNodeStream().pipe(out);
+    try {
+      for await (const batch of reader) {
+        writer.write((await downcastViewsInBatch(batch)) as never);
+      }
+      writer.finish();
+    } catch (err) {
+      // Close the sink before rethrowing, or a failed conversion leaves the
+      // write stream open and the temp file undeleteable on Windows.
+      writer.close();
+      out.destroy();
+      throw err;
+    }
+    await done;
+  } finally {
+    await handle.close();
+  }
 }
 
 function quoteIdent(name: string): string {
@@ -520,7 +635,9 @@ export class DuckDbFile {
     private readonly rootCatalogName: string = 'memory',
     private readonly siblingPath: string | undefined = undefined,
     /** Temp dir holding the stream a .feather file was converted into, if any. */
-    private readonly featherTempDir: string | undefined = undefined
+    private readonly featherTempDir: string | undefined = undefined,
+    /** Notices about a file that opened successfully; see openWarnings in open(). */
+    readonly openWarnings: readonly string[] = []
   ) {}
 
   isReadOnly(): boolean {
@@ -532,7 +649,18 @@ export class DuckDbFile {
   }
 
   private isFlatFileKind(): boolean {
-    return this.kind === 'parquet' || this.kind === 'csv' || this.kind === 'dta' || this.kind === 'arrow';
+    return (
+      this.kind === 'parquet' ||
+      this.kind === 'csv' ||
+      this.kind === 'dta' ||
+      this.kind === 'arrow' ||
+      // Feather earns its place here now that writeBackFlatFile can produce the
+      // FILE encoding. It was excluded for one reason only -- `COPY ... (FORMAT
+      // arrow)` writes a STREAM, so saving through DuckDB alone would have put
+      // stream bytes inside a .feather file and quietly changed its format out
+      // from under whatever reads it next.
+      this.kind === 'feather'
+    );
   }
 
   static async open(path: string, forceKind?: FileKind, options?: DuckDbFileOpenOptions): Promise<DuckDbFile> {
@@ -555,6 +683,11 @@ export class DuckDbFile {
     // Set when a Feather file is converted; the instance owns it and removes
     // it on dispose(), so a session leaves nothing behind in the temp dir.
     let featherTempDir: string | undefined;
+    // Things the user should be told about a file that DID open. Not errors --
+    // an error stops the open -- but facts about what they are now looking at
+    // that are not visible in the grid, such as a cell shown as empty because
+    // the workbook holds #DIV/0! there.
+    const openWarnings: string[] = [];
     const looksArrow = /\.(arrows?|feather)$/i.test(path);
     const isFeather = looksArrow && (await isFeatherEncoding(path));
     const isArrow = looksArrow && !isFeather;
@@ -726,11 +859,44 @@ export class DuckDbFile {
         // O'Brien's Data breaks the whole workbook.
         const asLiteral = sheet.name.replace(/'/g, "''");
         const asIdent = sheet.name.replace(/"/g, '""');
+        const view = (options: string) =>
+          `create view "${asIdent}" as select * from read_xlsx('${filePath}', sheet = '${asLiteral}'${options})`;
         try {
-          await connection.run(
-            `create view "${asIdent}" as select * from read_xlsx('${filePath}', sheet = '${asLiteral}')`
-          );
+          await connection.run(view(''));
         } catch (err) {
+          // An Excel ERROR VALUE in an otherwise numeric column -- #DIV/0!,
+          // #N/A, #REF!, #VALUE! -- is the common case here, and read_xlsx
+          // refuses the whole sheet over it: "Failed to parse cell 'E122':
+          // Could not convert string '#DIV/0!' to DOUBLE". One broken formula
+          // in one cell, and a 121-row sheet will not open at all.
+          //
+          // ignore_errors reads that cell as NULL and keeps every column's
+          // real type, which is what the value MEANS: #DIV/0! is Excel saying
+          // it has no number here. Measured on the sheet this was reported
+          // from, it changes exactly the one offending cell and nothing else.
+          //
+          // all_varchar would also open the sheet, and is the wrong trade --
+          // it turns every column in the sheet into text to rescue one cell,
+          // which costs sorting, stats and charting on all of them.
+          //
+          // Retried rather than used first, so a clean sheet is still read
+          // with read_xlsx's own type inference and nothing is quietly
+          // tolerated that did not need to be. The sheet is named in
+          // `openWarnings` afterwards: a cell silently becoming NULL is
+          // exactly the kind of thing that has to be said out loud.
+          if (isCellParseError(err)) {
+            try {
+              await connection.run(view(', ignore_errors = true'));
+              openWarnings.push(
+                `Sheet "${sheet.name}" contains cell values Excel could not compute ` +
+                  `(#DIV/0!, #N/A, #REF! and the like). They are shown as empty cells; ` +
+                  `every other value in the sheet is unchanged.`
+              );
+              continue;
+            } catch {
+              // fall through to the failure list below
+            }
+          }
           // One unreadable sheet (a chart sheet, a macro sheet, an empty one)
           // must not cost the user the rest of the workbook.
           failures.push(sheet.name);
@@ -804,7 +970,8 @@ export class DuckDbFile {
       siblingIsSqlite,
       rootCatalogName,
       options?.siblingPath,
-      featherTempDir
+      featherTempDir,
+      openWarnings
     );
   }
 
@@ -1207,7 +1374,19 @@ export class DuckDbFile {
   ): Promise<QueryResult & { xAxisMode: 'time' | 'category' }> {
     const stripped = stripTrailingSemicolon(baseSql);
     const extracted = extractTrailingLimit(stripped);
-    const inner = extracted ? extracted.withoutLimit : stripped;
+    // The LIMIT is KEPT, not stripped. It used to be stripped, on the argument
+    // that a chart is a picture of the whole series -- but that makes the chart
+    // a picture of a different query than the one on screen, and silently: a
+    // grid showing `... limit 100` plots twenty years of daily data. Every
+    // other clause of the query was already honoured, so LIMIT was the one part
+    // of "what you asked for" the chart overrode.
+    //
+    // Kept as a SUBQUERY rather than re-appended after the ordering below,
+    // which matters: `select ... from (inner limit 100) order by 1` plots the
+    // hundred rows the grid shows, while `select ... from inner order by 1
+    // limit 100` would plot the earliest hundred rows of the whole table --
+    // the same count, a different hundred, and not the ones on screen.
+    const inner = extracted ? `${extracted.withoutLimit} ${extracted.limitClause}` : stripped;
     const x = quoteIdent(xColumn);
     const ys = yColumns.map(quoteIdent).join(', ');
 
@@ -1648,6 +1827,30 @@ export class DuckDbFile {
       await this.connection.run(`copy ${table} to '${filePath}' (format dta)`);
     } else if (this.kind === 'arrow') {
       await this.connection.run(`copy ${table} to '${filePath}' (format arrow)`);
+    } else if (this.kind === 'feather') {
+      // Two steps, because DuckDB writes only the stream encoding and the file
+      // this came from is the file encoding. Writing the stream bytes straight
+      // into the .feather path would "work" -- the viewer would even reopen it,
+      // since the kind is sniffed from magic bytes rather than the extension --
+      // and would hand every OTHER reader a file whose contents no longer match
+      // its name. pyarrow.feather.read_feather() and pandas.read_feather() both
+      // refuse it.
+      //
+      // Written to a temp file and moved into place, so an interrupted save
+      // leaves the original intact rather than half a table.
+      const tempDir = await mkdtemp(join(tmpdir(), 'dfv-feather-save-'));
+      try {
+        const streamPath = join(tempDir, 'out.arrows');
+        const featherPath = join(tempDir, 'out.feather');
+        await this.connection.run(`copy ${table} to '${streamPath.replace(/'/g, "''")}' (format arrow)`);
+        await streamArrowStreamToFeather(streamPath, featherPath);
+        // copyFile rather than rename: the temp dir is in the OS temp location,
+        // which is routinely a different filesystem from the user's file, and
+        // rename across devices fails with EXDEV.
+        await copyFile(featherPath, this.path);
+      } finally {
+        await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+      }
     }
   }
 
