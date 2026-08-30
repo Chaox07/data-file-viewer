@@ -3,3 +3,4 @@ dist/
 *.vsix
 *.vsix.map
 out-test/
+test/stress/_work/

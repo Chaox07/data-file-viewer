@@ -16,6 +16,8 @@
     "src/duckdbConnection.ts",
     "src/kdbParser.ts",
     "src/xlsxSheets.ts",
+    "src/chartSpec.ts",
+    "src/xlsxWrite.ts",
     "test/**/*.ts"
   ]
 }

@@ -141,6 +141,7 @@
     "watch": "node esbuild.js --watch",
     "typecheck": "tsc --noEmit",
     "test": "tsc -p tsconfig.test.json && node --test \"out-test/test/*.test.js\"",
+    "stress": "tsc -p tsconfig.test.json && node out-test/test/stress/run_stress.js",
     "package": "npm run build && npx vsce package"
   },
   "devDependencies": {
