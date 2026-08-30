@@ -60,9 +60,16 @@ const SERIES_COLOURS = ['#000080', '#b0532a', '#2e7d5b', '#7a3d8f', '#a3872c', '
 // screenshotted, pasted into a document and printed, and a dark-theme one
 // arrives everywhere else as a negative of itself. Only this tab is white --
 // the grid still follows the theme.
+// The values are the ones helpers_echarts.R draws with, so a chart opened here
+// and the same series opened from long_run_3.R look like the same figure:
+// black axis rules at 1.5, gridlines at rgb(229,229,229) hairline-width, serif
+// labels at 10. MINOR_SPLIT_LINE is the one addition -- a lighter line between
+// the labelled ones, for reading a value off the chart without a tooltip.
 const INK = '#1f1f1f';
-const AXIS_LINE = '#8a8a8a';
-const SPLIT_LINE = '#e8e8e8';
+const AXIS_LINE = '#000000';
+const SPLIT_LINE = '#e5e5e5';
+const MINOR_SPLIT_LINE = '#f2f2f2';
+const CHART_FONT = 'serif';
 
 /** The x axis these charts always have exactly one of. */
 const X_AXIS_INDEX = 0;
@@ -189,10 +196,19 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
 
   chart?.dispose();
   chart = echarts.init(canvasEl, undefined, { renderer: 'canvas' });
+  // Shared by both axes. The minor lines are the ones between the labelled
+  // ticks; ECharts only draws them on value/time/log axes, which is why the
+  // category axis below leaves them off rather than asking for lines that
+  // would silently not appear.
   const axis = {
-    axisLabel: { color: INK },
-    axisLine: { lineStyle: { color: AXIS_LINE } },
+    axisLabel: { color: INK, fontFamily: CHART_FONT, fontSize: 10 },
+    axisLine: { show: true, lineStyle: { color: AXIS_LINE, width: 1.5 } },
     axisTick: { lineStyle: { color: AXIS_LINE } },
+    splitLine: { show: true, lineStyle: { color: SPLIT_LINE, width: 0.5 } },
+  };
+  const minor = {
+    minorTick: { show: true, splitNumber: 2, lineStyle: { color: SPLIT_LINE } },
+    minorSplitLine: { show: true, lineStyle: { color: MINOR_SPLIT_LINE, width: 0.5 } },
   };
   chart.setOption({
     animation: false,
@@ -200,12 +216,36 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
     // ECharts image export captures, and a transparent one picks up whatever
     // is behind it.
     backgroundColor: '#ffffff',
-    textStyle: { color: INK },
-    grid: { left: 64, right: 24, top: 16, bottom: message.yColumns.length > 1 ? 46 : 28 },
+    textStyle: { color: INK, fontFamily: CHART_FONT },
+    // containLabel, so the left margin follows the width of the numbers
+    // actually on the axis instead of a guess that clips six-figure ones.
+    grid: {
+      left: 10,
+      right: 10,
+      top: 16,
+      bottom: message.yColumns.length > 1 ? 34 : 10,
+      containLabel: true,
+    },
     // A single series has nothing to be told apart from, so its legend would
     // be a caption in the wrong place.
-    legend: message.yColumns.length > 1 ? { bottom: 0, textStyle: { color: INK } } : undefined,
-    tooltip: { trigger: 'axis' },
+    legend:
+      message.yColumns.length > 1
+        ? { bottom: 0, textStyle: { color: INK, fontFamily: CHART_FONT, fontSize: 11 } }
+        : undefined,
+    tooltip: {
+      trigger: 'axis',
+      backgroundColor: '#ffffff',
+      borderColor: '#000000',
+      borderWidth: 1,
+      textStyle: { color: INK, fontFamily: CHART_FONT, fontSize: 11 },
+      // Crosshair rather than a vertical rule alone: reading a level off the y
+      // axis is half of what a hover is for.
+      axisPointer: {
+        type: 'cross',
+        crossStyle: { color: '#000000', width: 1, type: 'solid' },
+        label: { show: false },
+      },
+    },
     xAxis: isCategory
       ? {
           type: 'category',
@@ -215,13 +255,16 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
           data: labels,
           ...axis,
         }
-      : { type: 'time', ...axis },
-    yAxis: {
-      type: 'value',
-      scale: true,
-      ...axis,
-      splitLine: { show: true, lineStyle: { color: SPLIT_LINE } },
-    },
+      : {
+          type: 'time',
+          ...axis,
+          ...minor,
+          // onZero false pins the axis to the bottom of the plot rather than
+          // to y = 0 when zero happens to fall inside the range -- the same
+          // correction helpers_echarts.R makes.
+          axisLine: { ...axis.axisLine, onZero: false },
+        },
+    yAxis: { type: 'value', scale: true, ...axis, ...minor },
     // Wheel/pinch zoom in place. No slider: the whole series is on screen to
     // begin with, and a strip along the bottom is a second, smaller copy of
     // the chart that has to be aimed at. Dragging on the plot itself is the
