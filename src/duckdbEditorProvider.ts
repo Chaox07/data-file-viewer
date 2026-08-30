@@ -13,6 +13,7 @@ import {
   fnv1aFold,
   hasTrailingLimit,
 } from './duckdbConnection';
+import { ChartPanel } from './chartPanel';
 import { destructiveReason, hasMultipleStatements } from './sqlSafety';
 import { LiveRefreshController, LiveStatus } from './liveRefresh';
 
@@ -31,6 +32,22 @@ function isDebugLiveRefreshEnabled(): boolean {
 function logLive(message: string): void {
   if (!isDebugLiveRefreshEnabled()) return;
   liveRefreshChannel.appendLine(`[${new Date().toISOString()}] ${message}`);
+}
+
+// Whether opening a file should also preview its first table, rather than
+// leaving an empty grid until something is clicked. Read per message rather
+// than cached so toggling the setting takes effect on the next file opened.
+function isPreviewFirstTableEnabled(): boolean {
+  return vscode.workspace.getConfiguration('dataFileViewer').get<boolean>('previewFirstTableOnOpen', true) !== false;
+}
+
+// Most points a chart will draw. A chart is a picture of the whole series --
+// runChartQuery strips the preview's LIMIT for exactly that reason -- so a cap
+// here is refused rather than applied, with the true count reported. Silently
+// drawing the first N would put the lie back.
+function getChartMaxPoints(): number {
+  const value = vscode.workspace.getConfiguration('dataFileViewer').get<number>('chartMaxPoints', 200_000);
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 200_000;
 }
 
 function getGlobalLiveRefreshIntervalMs(): number {
@@ -864,7 +881,11 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
       | { command: 'updateCell'; column: string; newValue: unknown; rowValues: Record<string, unknown> }
       | { command: 'toggleLiveRefresh'; enabled: boolean; intervalMs?: number }
       | { command: 'setLiveRefreshInterval'; intervalMs: number }
-      | { command: 'runCombinedQuery'; table: string };
+      | { command: 'runCombinedQuery'; table: string }
+      | { command: 'chartQuery'; xColumn: string; xIsText: boolean; yColumns: string[] };
+
+    // Created on the first plot click and reused after that; see ChartPanel.
+    let chartPanel: ChartPanel | undefined;
 
     const messageSub = webview.onDidReceiveMessage(async (message: IncomingMessage) => {
       if (message.command === 'ready') {
@@ -874,6 +895,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             command: 'tables',
             tables,
             combinedTableNames: [...document.combinedQueryMap.values()].map((table) => `${table}_combined`),
+            previewFirst: isPreviewFirstTableEnabled(),
           });
         } catch (err) {
           webview.postMessage({ command: 'error', message: (err as Error).message });
@@ -1119,6 +1141,59 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
         return;
       }
 
+      if (message.command === 'chartQuery') {
+        // Runs against document.lastSql, so the chart follows whatever is on
+        // screen -- a table preview, or a query somebody wrote. lastSql is
+        // deliberately not overwritten: the grid, editability and stats keep
+        // describing the user's own query, and the chart is a second reading
+        // of it rather than a replacement.
+        if (!document.lastSql) return;
+        const cap = getChartMaxPoints();
+        const label = message.yColumns.length === 1 ? message.yColumns[0] : `${message.yColumns.length} series`;
+        chartPanel ??= new ChartPanel(this.context.extensionUri, basename(document.uri.fsPath));
+        try {
+          const result = await document.runExclusive(() =>
+            document.file.runChartQuery(
+              document.lastSql!,
+              message.xColumn,
+              message.yColumns,
+              message.xIsText === true,
+              cap
+            )
+          );
+          // Read after the chart query, and never allowed to fail the chart:
+          // a file with no sheet_metadata plots with plain dates, which is the
+          // whole point of the frequency being optional. Not cached -- it is
+          // one row, read once per click on a plot button.
+          const frequency = document.lastQueriedBaseTable
+            ? await document
+                .runExclusive(() =>
+                  document.file.getSeriesFrequency(document.lastQueriedBaseTable!)
+                )
+                .catch(() => null)
+            : null;
+          chartPanel.reveal(label, {
+            command: 'chart',
+            frequency,
+            xColumn: message.xColumn,
+            yColumns: message.yColumns,
+            columns: result.columns,
+            rows: result.rows,
+            xAxisMode: result.xAxisMode,
+            // `truncated` means the cap actually bit. The chart view reports
+            // the refusal instead of drawing a prefix of the series.
+            truncated: result.truncated === true,
+            maxPoints: cap,
+          });
+        } catch (err) {
+          // In the chart's own tab, not the grid's status line: the tab is
+          // where the user is looking, and a chart that silently never appears
+          // is the failure worth avoiding.
+          chartPanel.reveal(label, { command: 'chartError', message: (err as Error).message });
+        }
+        return;
+      }
+
       if (message.command === 'sortQuery') {
         // Only reachable when the base query has a trailing LIMIT (the
         // webview only sends this then — see hasLimit in queryResult) — a
@@ -1284,6 +1359,9 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
 
     webviewPanel.onDidDispose(() => {
       messageSub.dispose();
+      // A chart of a document nobody has open is furniture.
+      chartPanel?.dispose();
+      chartPanel = undefined;
       // The panel going away is the end of anyone being able to see a tick's
       // result, so stop scheduling them. Document disposal usually follows
       // immediately, but nothing guarantees it happens first.

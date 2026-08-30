@@ -4,6 +4,10 @@ import { sql } from '@codemirror/lang-sql';
 import { json } from '@codemirror/lang-json';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { computeSortOrder } from './sortOrder';
+import { pickXAxis, plottableColumns } from './chartSpec';
+// Note what is NOT imported here: ECharts. The chart draws in its own VS Code
+// tab (see chartPanel.ts / chartView.ts), so the ~530 KB library loads the
+// first time somebody plots something rather than every time a file is opened.
 
 interface VsCodeApi {
   postMessage(message: unknown): void;
@@ -33,7 +37,7 @@ interface QueryResultFields {
 }
 
 type ExtensionMessage =
-  | { command: 'tables'; tables: string[]; combinedTableNames: string[] }
+  | { command: 'tables'; tables: string[]; combinedTableNames: string[]; previewFirst?: boolean }
   | ({ command: 'queryResult' } & QueryResultFields)
   | ({ command: 'sortQueryResult' } & QueryResultFields)
   | { command: 'rowTotal'; sql: string; total: number }
@@ -327,7 +331,52 @@ liveIntervalInput.addEventListener('change', () => {
   vscode.postMessage({ command: 'setLiveRefreshInterval', intervalMs });
 });
 
-function renderTables(tables: string[], combined: string[]): void {
+// What clicking a table in the sidebar does. Named, rather than living inline
+// in the click handler, so opening a file can run the SAME thing — an
+// auto-preview that built its own query would be a second code path to keep in
+// step with this one for no reason.
+function previewTable(name: string): void {
+  if (combinedTableNames.has(name)) {
+    // Not a real table — a synthesized hot+cold union built server-side
+    // (see duckdbConnection.ts's buildCombinedQuery); the extension
+    // rebuilds and runs it directly rather than the usual
+    // `SELECT * FROM "<name>"`, which wouldn't resolve to anything.
+    const baseTable = name.slice(0, -'_combined'.length);
+    runCombinedQuery(baseTable);
+    return;
+  }
+  const sqlText = `SELECT * FROM "${name}" LIMIT 100;`;
+  setEditorText(sqlText);
+  runQuery(sqlText);
+}
+
+// ------------------------------------------------------------------- charts
+//
+// The drawing happens in the chart's own VS Code tab (chartPanel.ts +
+// chartView.ts). All this half does is decide which columns are worth
+// offering a button for, and ask the host to plot one.
+
+/** The x axis for what is currently on screen, or undefined if it has not got one. */
+function chartXAxis(): { column: string; kind: 'datetime' | 'text' } | undefined {
+  if (!lastResult) return undefined;
+  return pickXAxis(lastResult.columns, lastResult.columnStatsKind);
+}
+
+function requestChart(yColumn: string): void {
+  const x = chartXAxis();
+  if (!x) return;
+  vscode.postMessage({
+    command: 'chartQuery',
+    xColumn: x.column,
+    // Whether the x column is a VARCHAR that merely claims to be a date. The
+    // host is what settles time-axis-vs-category, since only it can ask the
+    // database whether the strings parse.
+    xIsText: x.kind === 'text',
+    yColumns: [yColumn],
+  });
+}
+
+function renderTables(tables: string[], combined: string[], previewFirst = false): void {
   combinedTableNames = new Set(combined);
   tableListEl.innerHTML = '';
   for (const name of tables) {
@@ -335,24 +384,24 @@ function renderTables(tables: string[], combined: string[]): void {
     item.className = 'table-item';
     item.textContent = name;
     item.dataset.table = name;
-    item.addEventListener('click', () => {
-      if (combinedTableNames.has(name)) {
-        // Not a real table — a synthesized hot+cold union built server-side
-        // (see duckdbConnection.ts's buildCombinedQuery); the extension
-        // rebuilds and runs it directly rather than the usual
-        // `SELECT * FROM "<name>"`, which wouldn't resolve to anything.
-        const baseTable = name.slice(0, -'_combined'.length);
-        runCombinedQuery(baseTable);
-        return;
-      }
-      const sqlText = `SELECT * FROM "${name}" LIMIT 100;`;
-      setEditorText(sqlText);
-      runQuery(sqlText);
-    });
+    item.addEventListener('click', () => previewTable(name));
     tableListEl.appendChild(item);
   }
   if (tables.length === 0) {
     tableListEl.innerHTML = '<div class="empty">No tables found.</div>';
+  }
+  // Show the first table straight away. For the single-table formats
+  // (.parquet/.csv/.dta/.arrow/.arrows/.feather) there is exactly one entry
+  // and clicking it was the only thing left to do; for a .duckdb or .xlsx the
+  // first entry is the one the writer put first, which is the data rather than
+  // its metadata.
+  //
+  // Safe to do unconditionally when enabled: this webview keeps no state
+  // across reloads (there is no getState/setState anywhere in this file), so
+  // there is never a hand-written query here to overwrite — the editor is
+  // empty every time this message arrives.
+  if (previewFirst && tables.length > 0) {
+    previewTable(tables[0]);
   }
 }
 
@@ -452,16 +501,21 @@ function renderStatsPopoverContent(container: HTMLElement, message: Extract<Exte
     }
     container.appendChild(list);
   } else {
-    const rows: [string, unknown][] = [
-      ['min', message.min],
-      ['max', message.max],
-      ['avg', message.mean],
-      ['p5 (approx.)', message.p5],
-      ['p95 (approx.)', message.p95],
+    // `rounded` marks the three that are COMPUTED rather than observed. min
+    // and max are values that are actually in the data, and shortening one is
+    // shortening an observation; avg is an average and p5/p95 already say
+    // "approx." on the label, so the seventeenth decimal of either was never
+    // telling anyone anything.
+    const rows: [string, unknown, boolean][] = [
+      ['min', message.min, false],
+      ['max', message.max, false],
+      ['avg', message.mean, true],
+      ['p5 (approx.)', message.p5, true],
+      ['p95 (approx.)', message.p95, true],
     ];
     const table = document.createElement('div');
     table.className = 'stats-descriptive';
-    for (const [label, value] of rows) {
+    for (const [label, value, rounded] of rows) {
       const row = document.createElement('div');
       row.className = 'stats-descriptive-row';
       const l = document.createElement('span');
@@ -469,7 +523,10 @@ function renderStatsPopoverContent(container: HTMLElement, message: Extract<Exte
       l.textContent = label;
       const v = document.createElement('span');
       v.className = 'stats-descriptive-value';
-      v.textContent = formatValue(value, message.statsKind);
+      v.textContent =
+        rounded && message.statsKind === 'numeric'
+          ? formatStat(value)
+          : formatValue(value, message.statsKind);
       row.appendChild(l);
       row.appendChild(v);
       table.appendChild(row);
@@ -823,6 +880,9 @@ function renderResults(preserveScroll = false): void {
 
   const table = document.createElement('table');
 
+  const plottable = new Set(plottableColumns(columns, columnStatsKind));
+  const xAxisColumn = chartXAxis()?.column;
+
   const thead = document.createElement('thead');
   const headRow = document.createElement('tr');
   columns.forEach((col, colIdx) => {
@@ -881,6 +941,25 @@ function renderResults(preserveScroll = false): void {
 
     controls.appendChild(sortBtn);
     controls.appendChild(statsBtn);
+
+    // Only on the columns that can actually be drawn, and only when this
+    // result has an axis to draw them against -- an offer to plot something
+    // that cannot be plotted is worse than no offer. plottable is computed
+    // once per render rather than per column, since pickXAxis scans the whole
+    // header each time.
+    if (plottable.has(col)) {
+      const plotBtn = document.createElement('button');
+      plotBtn.className = 'th-plot-btn';
+      plotBtn.textContent = '📈';
+      plotBtn.title = `Plot ${col} against ${xAxisColumn} — the whole series, not just this page`;
+      plotBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (running) return;
+        requestChart(col);
+      });
+      controls.appendChild(plotBtn);
+    }
+
     inner.appendChild(controls);
     th.appendChild(inner);
     headRow.appendChild(th);
@@ -1002,6 +1081,28 @@ function formatValue(value: unknown, kind?: StatsKind): string {
   return String(value);
 }
 
+/**
+ * A computed statistic, at no more than four decimal places.
+ *
+ * Display-only, and deliberately NOT part of formatValue -- that one formats
+ * cell values, and its promise never to touch a value's original precision
+ * has to keep holding. This applies to avg and the two percentiles, which are
+ * results of avg()/approx_quantile() rather than anything present in the data.
+ *
+ * "At most" four: an integer stays an integer and 0.5 stays 0.5, because
+ * padding them out to 0.5000 would suggest a measurement precision that is
+ * not there either. Non-numeric input falls through to formatValue unchanged.
+ */
+function formatStat(value: unknown): string {
+  if (value === null || value === undefined) return 'NULL';
+  const n = typeof value === 'bigint' ? Number(value) : Number(value);
+  if (!Number.isFinite(n)) return formatValue(value, 'numeric');
+  // parseFloat drops the trailing zeros toFixed adds; String() then avoids
+  // toLocaleString, so addThousandsSeparators stays the one place grouping
+  // happens.
+  return formatValue(String(parseFloat(n.toFixed(4))), 'numeric');
+}
+
 function showError(message: string): void {
   resultsEl.innerHTML = '';
   lastResult = undefined;
@@ -1015,7 +1116,7 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
   const message = event.data;
   switch (message.command) {
     case 'tables':
-      renderTables(message.tables, message.combinedTableNames);
+      renderTables(message.tables, message.combinedTableNames, message.previewFirst === true);
       break;
     case 'queryResult':
       setRunning(false);

@@ -146,6 +146,19 @@ Two things are different for kdb+ compared to every other format here:
   export is regenerated) — dragging the file onto VS Code's Dock icon works
   just as well and needs no setup at all.
 
+### Opening a file
+
+The first table is previewed as soon as a file opens — the sidebar's top entry
+is selected and `SELECT * FROM "<table>" LIMIT 100` runs against it, exactly as
+if you had clicked it. For the single-table formats there is only ever one
+entry, so that click was the last thing standing between opening a file and
+seeing it; for a `.duckdb` or `.xlsx` the first entry is whatever the writer put
+first, which is normally the data rather than a metadata table.
+
+Turn it off with `dataFileViewer.previewFirstTableOnOpen` (in Settings) if
+opening a very large file should stay instant — a preview is a query, and on a
+big enough table that is a wait rather than a blink.
+
 ### Sorting, stats, and cell editing
 
 Every results grid — table previews and hand-written queries alike — gets:
@@ -172,6 +185,71 @@ Every results grid — table previews and hand-written queries alike — gets:
   the *entire* column (not just the visible rows): for numeric/date columns,
   the minimum, maximum, average, and 5th/95th percentiles; for everything
   else, null count, distinct count, and the 20 most frequent values.
+
+  The average and the two percentiles are shown to at most four decimal
+  places. The minimum and maximum are not rounded: those two are values that
+  are actually in the data, while the other three are computed (and the
+  percentiles are approximate to begin with — the label says so).
+- **Plot**: a 📈 button appears in the header of every numeric column that
+  the result has an x axis for, and clicking it opens that column as a line
+  chart in its own VS Code tab beside the grid. Plotting a second column
+  redraws the same tab rather than opening another one.
+
+  The chart opens showing the whole series, and you **drag across the plot**
+  to zoom into a range — the scroll wheel zooms too, and **double-clicking**
+  the plot (or ⟲ in the top right) puts it back. There is no slider along the
+  bottom: that is a second, smaller
+  copy of the chart you have to aim at before you can look at the real one.
+  The tab is white whatever your editor theme is, since a chart is a figure —
+  it ends up in screenshots and documents, where a dark one reads as a
+  negative of itself.
+
+  The chart is always of the **whole** series. A preview runs `LIMIT 100`,
+  and charting those hundred rows of a longer series would draw a line that
+  stops early and looks exactly like a series that ends early — so the
+  trailing `LIMIT` is stripped for the chart. Past
+  `dataFileViewer.chartMaxPoints` (200,000 by default) it refuses and tells
+  you the real count instead of drawing a prefix.
+
+  Which column becomes the x axis, in order:
+
+  1. the first `DATE`/`TIMESTAMP` column;
+  2. otherwise a text column *named* `Date` or `Datetime` — this is what
+     makes ETL output chartable, since ETL stores dates as `VARCHAR` ISO
+     text in every one of its output formats. If those strings parse as
+     timestamps they become a real time axis; if they do not (period labels
+     like `1996-1Q`) they become a **category** axis, drawn with the labels
+     exactly as stored and the rows in the table's own order — no sorting,
+     because sorting `1996-1Q` strings would produce an order that merely
+     looks chronological.
+
+  A result with neither gets no plot buttons at all. That is deliberate:
+  plotting numbers against arbitrary text draws the order the table happens
+  to hold its rows in, dressed up as a chart. It is also why `sheet_metadata`
+  — text columns and a count — offers nothing to plot.
+
+  **The chart is a port of the R plotting scripts** in
+  `Kod/R/Time_Series_Plotting` (`helpers_echarts.R`, `helpers_core.R`, and
+  `long_run_3.R`'s ECharts branch), so the same series read here and read
+  there is one figure rather than two charts of the same numbers. Taken from
+  them: the white ground, black axis rules, hairline gridlines with lighter
+  minor ones between them, serif labels, the white tooltip with its black
+  crosshair, 2%/4% padding on the time axis and 3% on the value axis, eight
+  pinned y ticks, three-significant-digit axis labels and four-significant-digit
+  tooltip values, and the tooltip that switches itself off above 3,000 points
+  in view and back on when you zoom in — hovering a line that has thousands of
+  points overplotted into a few pixels reports a value that isn't the one your
+  eye is on. The ported numbers are pinned by tests in
+  `test/chartSpec.test.ts`, because two implementations in two languages in
+  two repositories drift silently otherwise.
+
+  **If the table declares a frequency**, the axis and tooltip use it for
+  wording: `2020 Q1`, `2020 H2`, `Jan 2020`. It's read from `sheet_metadata`,
+  which ETL and macro_project both write, and it is entirely optional — a file
+  with no such table, no row for this table, or a cadence not in the known
+  list charts exactly the same, with plain dates. Day-to-day and weekly
+  cadences deliberately keep ECharts' own adaptive tick labels, which read
+  better across a long span than the same full date stamped onto every tick.
 - **NULL values** are shown dimmed and in italics in the results grid, so
   they're easy to tell apart from a real value like an empty string or a
   literal `0`.

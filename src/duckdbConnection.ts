@@ -13,6 +13,7 @@ import { basename, dirname, extname, join } from 'node:path';
 import { chmod, copyFile, mkdtemp, open, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
+import { KNOWN_FREQUENCIES, type SeriesFrequency } from './chartSpec';
 import { listSheets } from './xlsxSheets';
 
 export type StatsKind = 'numeric' | 'datetime' | 'other';
@@ -326,6 +327,11 @@ const TRAILING_LIMIT_RE = /\s+limit\s+\d+(?:\s+offset\s+\d+)?\s*;?\s*$/i;
 export function hasTrailingLimit(sql: string): boolean {
   return TRAILING_LIMIT_RE.test(sql);
 }
+
+// How many non-null values runChartQuery samples before deciding whether a
+// text column can be a time axis, and how many of them have to parse.
+const TEXT_AXIS_PROBE_ROWS = 5000;
+const TEXT_AXIS_MIN_PARSE_RATE = 0.95;
 
 function extractTrailingLimit(sql: string): { withoutLimit: string; limitClause: string } | null {
   const match = sql.match(TRAILING_LIMIT_RE);
@@ -961,6 +967,15 @@ export class DuckDbFile {
    * must never propagate past this method as anything other than "no hint".
    */
   async getPollCadenceSeconds(table: string): Promise<number | null> {
+    for (const catalog of this.metadataCatalogs()) {
+      const value = await this.readPollCadenceFromCatalog(table, catalog);
+      if (value !== null) return value;
+    }
+    return null;
+  }
+
+  /** Catalogs to look for a sheet_metadata row in, hot side first. */
+  private metadataCatalogs(): string[] {
     const candidates: string[] = [];
     // Hot side first.
     if (this.isMainHot()) candidates.push(this.catalogName);
@@ -969,10 +984,39 @@ export class DuckDbFile {
     // future writer this wasn't designed against.
     if (!this.isMainHot()) candidates.push(this.catalogName);
     if (this.siblingCatalogName && !this.siblingIsSqlite) candidates.push(this.siblingCatalogName);
+    return candidates;
+  }
 
-    for (const catalog of candidates) {
-      const value = await this.readPollCadenceFromCatalog(table, catalog);
-      if (value !== null) return value;
+  /**
+   * Best-effort read of a table's declared frequency, used only to word a
+   * chart's tick and tooltip labels ("2020 Q1" instead of "1 Jan 2020").
+   *
+   * Entirely optional, by design: a file with no `sheet_metadata`, no row for
+   * this table, or a frequency nobody recognises charts exactly as it did
+   * before — this returns null and the chart falls back to plain dates. It is
+   * a label improvement, never a requirement for plotting.
+   *
+   * The value is matched against a fixed vocabulary rather than passed
+   * through. It comes out of a file, the chart view puts the label into
+   * tooltip HTML, and a recognised word cannot carry markup with it.
+   */
+  async getSeriesFrequency(table: string): Promise<SeriesFrequency | null> {
+    for (const catalog of this.metadataCatalogs()) {
+      try {
+        const reader = await this.connection.runAndReadAll(
+          `select frequency from ${quoteIdent(catalog)}.main.sheet_metadata where table_name = ${quoteLiteral(table)}`
+        );
+        const rows = reader.getRows();
+        if (rows.length === 0) continue;
+        const raw = rows[0][0];
+        if (typeof raw !== 'string') continue;
+        const word = raw.trim().toLowerCase();
+        const match = KNOWN_FREQUENCIES.find((f) => f === word);
+        if (match) return match;
+      } catch {
+        // No sheet_metadata here, or no frequency column on it. Try the other
+        // side, then give up quietly.
+      }
     }
     return null;
   }
@@ -1101,6 +1145,91 @@ export class DuckDbFile {
    * outside, so "sorted" always means sorted across the whole matching
    * data set, not just whatever happened to already be in memory.
    */
+  /**
+   * How much of a text column try_casts to a timestamp, judged on a bounded
+   * sample rather than the whole table.
+   *
+   * Bounded because this runs before every chart of a text axis and the answer
+   * does not get truer past a few thousand rows: a column of ISO dates is
+   * uniform, and a column of period labels ("1996-1Q") fails on the first row
+   * as surely as on the millionth. `TEXT_AXIS_PROBE_ROWS` rows is enough to
+   * tell those two apart and cheap enough not to be noticed.
+   *
+   * Returns the share of NON-NULL values that parsed, so a column that is
+   * mostly null does not read as mostly unparseable.
+   */
+  private async textAxisParseRate(inner: string, xColumn: string): Promise<number> {
+    const x = quoteIdent(xColumn);
+    const sample = `select ${x} from ${wrapAsSubquery(inner)} as _probe where ${x} is not null limit ${TEXT_AXIS_PROBE_ROWS}`;
+    const reader = await this.connection.runAndReadAll(
+      `select count(*) as n, count(try_cast(${x} as timestamp)) as ok from ${wrapAsSubquery(sample)} as _probe_rows`
+    );
+    const [n, ok] = (reader.getRowsJson()[0] as unknown[]).map(Number);
+    return n > 0 ? ok / n : 0;
+  }
+
+  /**
+   * The x and y columns of `baseSql`, across the WHOLE data set.
+   *
+   * The trailing LIMIT is stripped rather than kept, and that is the point of
+   * this method existing. A table preview runs `LIMIT 100`; charting those 100
+   * rows of a 178-row series draws a line that stops in 2006 and says nothing
+   * about it. A chart of an arbitrary prefix is worse than no chart, because
+   * it looks exactly like a complete one.
+   *
+   * `xIsText` says the x column is a VARCHAR that was named as an axis rather
+   * than typed as one (see chartSpec.pickXAxis). This is the ETL case and it
+   * splits two ways, decided here because only the database can decide it:
+   *
+   *   - the strings parse as timestamps -> a real time axis over the cast,
+   *     ordered by it. `Raw_Data.Date` in a live ETL file parses 16,803 of
+   *     16,803, so this is what an ordinary ETL export gets;
+   *   - they do not ("1996-1Q", from UNPARSEABLE_DATE_POLICY = "keep" or from
+   *     output predating the parser's quarter support) -> a category axis over
+   *     the labels EXACTLY as stored, and deliberately **no ORDER BY**.
+   *     Sorting "1996-1Q" strings lexically would arrange them into an order
+   *     that looks chronological and sometimes is not; the table's own order
+   *     is the one the writer chose, and it is the only one we can stand
+   *     behind.
+   *
+   * `maxPoints` is a real cap and is reported, not hidden -- see the caller,
+   * which refuses to draw rather than silently truncating. Rows whose x is
+   * null are dropped in SQL: they have no position on any axis, and leaving
+   * them to be dropped client-side means the cap counts rows that were never
+   * going to be drawn.
+   */
+  async runChartQuery(
+    baseSql: string,
+    xColumn: string,
+    yColumns: string[],
+    xIsText = false,
+    maxPoints = 0
+  ): Promise<QueryResult & { xAxisMode: 'time' | 'category' }> {
+    const stripped = stripTrailingSemicolon(baseSql);
+    const extracted = extractTrailingLimit(stripped);
+    const inner = extracted ? extracted.withoutLimit : stripped;
+    const x = quoteIdent(xColumn);
+    const ys = yColumns.map(quoteIdent).join(', ');
+
+    // A handful of junk rows in an otherwise real date column must not
+    // downgrade the whole axis, so this is a high bar rather than a perfect
+    // one -- and try_cast returning NULL for the failures means they simply
+    // drop out of the time-axis query below.
+    const asTime = !xIsText || (await this.textAxisParseRate(inner, xColumn)) >= TEXT_AXIS_MIN_PARSE_RATE;
+
+    if (asTime) {
+      const xExpr = xIsText ? `try_cast(${x} as timestamp)` : x;
+      const sql =
+        `select ${xExpr} as ${x}, ${ys} from ${wrapAsSubquery(inner)} as _chart ` +
+        `where ${xExpr} is not null order by 1 asc`;
+      return { ...(await this.runQuery(sql, maxPoints)), xAxisMode: 'time' };
+    }
+
+    const sql =
+      `select ${x}, ${ys} from ${wrapAsSubquery(inner)} as _chart where ${x} is not null`;
+    return { ...(await this.runQuery(sql, maxPoints)), xAxisMode: 'category' };
+  }
+
   async runSortedQuery(
     baseSql: string,
     column: string,

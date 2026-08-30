@@ -210,7 +210,7 @@ html, body {
   flex-shrink: 0;
 }
 
-.th-sort-btn, .th-stats-btn {
+.th-sort-btn, .th-stats-btn, .th-plot-btn {
   background: none;
   border: none;
   color: #7d8493;
@@ -221,7 +221,7 @@ html, body {
   border-radius: 2px;
 }
 
-.th-sort-btn:hover, .th-stats-btn:hover {
+.th-sort-btn:hover, .th-stats-btn:hover, .th-plot-btn:hover {
   background: #3a3f4b;
   color: #abb2bf;
 }
@@ -233,6 +233,18 @@ html, body {
 .th-stats-btn {
   font-size: 11px;
   font-weight: 600;
+}
+
+/* An emoji glyph is drawn by the font at its own weight, so the greying that
+   works on ≡ and ⇅ does nothing here -- dim it instead, and bring it back on
+   hover like the others. */
+.th-plot-btn {
+  font-size: 11px;
+  opacity: 0.55;
+}
+
+.th-plot-btn:hover {
+  opacity: 1;
 }
 
 /* Disables sort/stats/cell-edit affordances while a query is in flight, so a
@@ -517,4 +529,90 @@ html, body {
 .cell-inspector-status, .cell-inspector-note {
   color: #7d8493;
   font-size: 12px;
+}
+
+/* ---- chart tab ---------------------------------------------------------
+   The chart has its own VS Code tab (chartPanel.ts), so this styles a whole
+   page rather than a panel inside the grid's. An earlier version DID sit
+   inside the grid pane, and its `.chart-panel { display: flex }` silently
+   defeated `hidden` for exactly the reason spelled out at .th-inner /
+   #unlock-options above -- the empty panel stayed visible and squeezed the
+   table into the bottom of the pane. Exactly one thing here is toggled with
+   `hidden` (.chart-reset), and it carries the `:not([hidden])` guard. */
+/* White whatever the editor theme is, and deliberately so: this tab is a
+   figure. It gets screenshotted, pasted into a document and printed, and a
+   dark-theme chart arrives everywhere else as a negative of itself. The
+   colours ECharts draws with are stated to match, in chartView.ts. Scoped to
+   this class, so the grid keeps following the theme. */
+.chart-root {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  box-sizing: border-box;
+  background: #ffffff;
+  color: #1f1f1f;
+}
+
+.chart-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding: 6px 10px;
+  font-size: 12px;
+  border-bottom: 1px solid #e8e8e8;
+}
+
+.chart-hint {
+  color: #8a8a8a;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* Holds the canvas and the reset button on top of it, so the button needs a
+   positioned ancestor that is not the canvas ECharts writes into. */
+.chart-plot {
+  position: relative;
+  flex: 1;
+  min-height: 240px;
+}
+
+/* ECharts measures its container on init, so this needs a real height rather
+   than one that collapses to its (empty) content. */
+.chart-canvas {
+  height: 100%;
+  box-sizing: border-box;
+  padding: 8px;
+  font-size: 12px;
+}
+
+/* `:not([hidden])` is load-bearing -- see .th-inner / #unlock-options above.
+   This button IS toggled with `hidden`, and a bare `display` here would beat
+   the UA rule and pin it on screen. */
+.chart-reset:not([hidden]) {
+  display: flex;
+}
+
+.chart-reset {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid #d0d0d0;
+  border-radius: 3px;
+  background: #ffffff;
+  color: #6578ba;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity 0.15s;
+}
+
+.chart-reset:hover {
+  opacity: 1;
 }
