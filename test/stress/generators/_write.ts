@@ -184,7 +184,15 @@ export async function jsonFile(path: string, spec: TableSpec): Promise<string> {
  * polars writes `Utf8View` where DuckDB writes `Utf8`, and a corpus that cannot
  * say which one it means cannot express that difference.
  */
-export type ArrowEncoding = 'int32' | 'int64' | 'float64' | 'utf8' | 'largeUtf8' | 'bool';
+export type ArrowEncoding =
+  | 'int32'
+  | 'int64'
+  | 'float64'
+  | 'utf8'
+  | 'largeUtf8'
+  | 'bool'
+  /** Dictionary-encoded strings — what a pandas categorical, an R factor or a polars Categorical becomes. */
+  | 'dictionary';
 
 export interface ArrowColumn {
   name: string;
@@ -208,10 +216,16 @@ async function arrowTable(columns: ArrowColumn[], batchSize?: number) {
         return vectorFromArray(values as string[], new LargeUtf8());
       case 'bool':
         return vectorFromArray(values as boolean[], new Bool());
+      case 'dictionary':
+        // No explicit type: vectorFromArray dictionary-encodes strings by
+        // default, which is exactly the encoding wanted here. read_arrow
+        // refuses these at the schema, so the conversion has to decode them.
+        return vectorFromArray(values as string[]);
       case 'utf8':
       default:
-        // Explicitly Utf8, never inferred: tableFromArrays dictionary-encodes
-        // strings, which is a different file and a different code path.
+        // Explicitly Utf8, never inferred: an inferred string vector is
+        // dictionary-encoded, which is a different file and a different code
+        // path -- see the 'dictionary' case above.
         return vectorFromArray(values as string[], new Utf8());
     }
   };

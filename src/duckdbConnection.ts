@@ -233,14 +233,34 @@ async function convertFeatherToStream(path: string): Promise<{ streamPath: strin
  */
 async function downcastViewsInBatch(batch: unknown): Promise<unknown> {
   const { Table, Type, Utf8, vectorFromArray } = await import('apache-arrow');
-  const source = batch as { schema: { fields: { name: string; type: { typeId: number } }[] };
-                            getChild(name: string): unknown };
+  const source = batch as {
+    schema: { fields: { name: string; type: { typeId: number; dictionary?: { typeId: number } } }[] };
+    getChild(name: string): unknown;
+  };
+
+  // Dictionary-encoded strings are the same hazard as Utf8View, from a
+  // different writer. read_arrow refuses them at the schema -- "Schema message
+  // field with DictionaryEncoding not supported" -- and they are not exotic:
+  // a pandas categorical, an R factor and a polars Categorical all become one.
+  // Found by the Tier B corpus, which is the only part of the suite that can
+  // produce a file this repo's own writers never emit.
+  //
+  // Only STRING dictionaries are decoded. A dictionary over some other value
+  // type is left as it was, so this widens what opens without quietly changing
+  // what a numeric column means.
+  const STRING_TYPES = new Set<number>([Type.Utf8, Type.LargeUtf8, Type.Utf8View]);
+  const isStringDictionary = (type: { typeId: number; dictionary?: { typeId: number } }): boolean =>
+    type.typeId === Type.Dictionary && type.dictionary !== undefined && STRING_TYPES.has(type.dictionary.typeId);
+
   const columns: Record<string, unknown> = {};
   let changed = false;
   for (const field of source.schema.fields) {
     const vector = source.getChild(field.name);
     if (!vector) continue;
-    if (field.type.typeId === Type.Utf8View) {
+    if (field.type.typeId === Type.Utf8View || isStringDictionary(field.type)) {
+      // toJSON() reads through the encoding in both cases: a dictionary
+      // vector's get() resolves the index against its dictionary, so this is
+      // the decoded value either way.
       columns[field.name] = vectorFromArray(
         (vector as { toJSON(): (string | null)[] }).toJSON(),
         new Utf8()

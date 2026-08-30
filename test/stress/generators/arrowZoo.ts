@@ -65,11 +65,16 @@ for (const [encodingName, write] of [
  * `Utf8View` is the one that mattered: polars' default, and rejected by
  * read_arrow as "Unrecognized Field type with value 24", so converting the
  * container is not enough -- the string columns have to be brought down to
- * plain Utf8 as well. `LargeUtf8` is the same question with a different answer
- * required, and apache-arrow can write it, so it is checked rather than
- * assumed.
+ * plain Utf8 as well.
+ *
+ * `dictionary` is the same hazard from a different writer, and was found by
+ * the Tier B corpus: read_arrow refuses a dictionary-encoded column at the
+ * schema ("Schema message field with DictionaryEncoding not supported"), and
+ * a pandas categorical, an R factor and a polars Categorical all produce one.
+ * It is covered here as well as in Tier B so CI catches a regression without
+ * needing Python.
  */
-for (const encoding of ['utf8', 'largeUtf8'] as const) {
+for (const encoding of ['utf8', 'largeUtf8', 'dictionary'] as const) {
   registerCase({
     name: `arrow_strings_${encoding}`,
     family: 'arrowZoo',

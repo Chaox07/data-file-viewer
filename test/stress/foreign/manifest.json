@@ -1,0 +1,768 @@
+{
+  "generated": "2026-08-31T00:36:34",
+  "command": "conda run -n myproject python test/stress/foreign/build_corpus.py",
+  "files": [
+    {
+      "file": "duckdb-python.duckdb",
+      "writer": "duckdb-python",
+      "note": "a database written by the Python bindings, read by the Node ones",
+      "expected": {
+        "columns": [
+          "id",
+          "label",
+          "amount",
+          "day",
+          "flag"
+        ],
+        "rows": [
+          [
+            1,
+            "alpha",
+            1.5,
+            "2020-01-31",
+            true
+          ],
+          [
+            2,
+            "beta",
+            2.5,
+            "2020-02-29",
+            false
+          ],
+          [
+            3,
+            null,
+            3.5,
+            "2020-03-31",
+            true
+          ],
+          [
+            4,
+            "İstanbul ısı",
+            -4.5,
+            "2020-04-30",
+            false
+          ],
+          [
+            5,
+            "has, comma",
+            0.0,
+            "2020-05-31",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "file": "openpyxl-merged-title.xlsx",
+      "writer": "openpyxl",
+      "note": "a merged title banner above the header",
+      "expected": null
+    },
+    {
+      "file": "openpyxl-trailing-notes.xlsx",
+      "writer": "openpyxl",
+      "note": "notes below the table, written by a real library rather than by hand",
+      "expected": null
+    },
+    {
+      "file": "openpyxl.xlsx",
+      "writer": "openpyxl",
+      "note": "a workbook laid out by openpyxl: shared strings, a real styles part, a dimension element",
+      "expected": null
+    },
+    {
+      "file": "pandas.csv",
+      "writer": "pandas",
+      "note": "csv written by pandas, including its own NA spelling",
+      "expected": null
+    },
+    {
+      "file": "pandas.dta",
+      "writer": "pandas",
+      "note": "Stata .dta — DuckDB's dta extension reads but cannot write, so there is no Tier A source at all",
+      "expected": null
+    },
+    {
+      "file": "polars-default.feather",
+      "writer": "polars",
+      "note": "default compat level: Utf8View strings",
+      "expected": {
+        "columns": [
+          "id",
+          "label",
+          "amount",
+          "day",
+          "flag"
+        ],
+        "rows": [
+          [
+            1,
+            "alpha",
+            1.5,
+            "2020-01-31",
+            true
+          ],
+          [
+            2,
+            "beta",
+            2.5,
+            "2020-02-29",
+            false
+          ],
+          [
+            3,
+            null,
+            3.5,
+            "2020-03-31",
+            true
+          ],
+          [
+            4,
+            "İstanbul ısı",
+            -4.5,
+            "2020-04-30",
+            false
+          ],
+          [
+            5,
+            "has, comma",
+            0.0,
+            "2020-05-31",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "file": "polars-lz4.feather",
+      "writer": "polars",
+      "note": "lz4-compressed Feather, which must be refused clearly",
+      "expected": null
+    },
+    {
+      "file": "polars-oldest.feather",
+      "writer": "polars",
+      "note": "oldest compat level: plain Utf8 strings",
+      "expected": {
+        "columns": [
+          "id",
+          "label",
+          "amount",
+          "day",
+          "flag"
+        ],
+        "rows": [
+          [
+            1,
+            "alpha",
+            1.5,
+            "2020-01-31",
+            true
+          ],
+          [
+            2,
+            "beta",
+            2.5,
+            "2020-02-29",
+            false
+          ],
+          [
+            3,
+            null,
+            3.5,
+            "2020-03-31",
+            true
+          ],
+          [
+            4,
+            "İstanbul ısı",
+            -4.5,
+            "2020-04-30",
+            false
+          ],
+          [
+            5,
+            "has, comma",
+            0.0,
+            "2020-05-31",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "file": "polars-stream.arrows",
+      "writer": "polars",
+      "note": "IPC stream, the encoding the R/Python pipelines emit",
+      "expected": {
+        "columns": [
+          "id",
+          "label",
+          "amount",
+          "day",
+          "flag"
+        ],
+        "rows": [
+          [
+            1,
+            "alpha",
+            1.5,
+            "2020-01-31",
+            true
+          ],
+          [
+            2,
+            "beta",
+            2.5,
+            "2020-02-29",
+            false
+          ],
+          [
+            3,
+            null,
+            3.5,
+            "2020-03-31",
+            true
+          ],
+          [
+            4,
+            "İstanbul ısı",
+            -4.5,
+            "2020-04-30",
+            false
+          ],
+          [
+            5,
+            "has, comma",
+            0.0,
+            "2020-05-31",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "file": "polars-zstd.feather",
+      "writer": "polars",
+      "note": "zstd-compressed Feather, which must be refused clearly",
+      "expected": null
+    },
+    {
+      "file": "polars.csv",
+      "writer": "polars",
+      "note": "csv written by polars",
+      "expected": {
+        "columns": [
+          "id",
+          "label",
+          "amount",
+          "day",
+          "flag"
+        ],
+        "rows": [
+          [
+            1,
+            "alpha",
+            1.5,
+            "2020-01-31",
+            true
+          ],
+          [
+            2,
+            "beta",
+            2.5,
+            "2020-02-29",
+            false
+          ],
+          [
+            3,
+            null,
+            3.5,
+            "2020-03-31",
+            true
+          ],
+          [
+            4,
+            "İstanbul ısı",
+            -4.5,
+            "2020-04-30",
+            false
+          ],
+          [
+            5,
+            "has, comma",
+            0.0,
+            "2020-05-31",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "file": "polars.parquet",
+      "writer": "polars",
+      "note": "parquet written by polars rather than DuckDB",
+      "expected": {
+        "columns": [
+          "id",
+          "label",
+          "amount",
+          "day",
+          "flag"
+        ],
+        "rows": [
+          [
+            1,
+            "alpha",
+            1.5,
+            "2020-01-31",
+            true
+          ],
+          [
+            2,
+            "beta",
+            2.5,
+            "2020-02-29",
+            false
+          ],
+          [
+            3,
+            null,
+            3.5,
+            "2020-03-31",
+            true
+          ],
+          [
+            4,
+            "İstanbul ısı",
+            -4.5,
+            "2020-04-30",
+            false
+          ],
+          [
+            5,
+            "has, comma",
+            0.0,
+            "2020-05-31",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "file": "pyarrow-batched.feather",
+      "writer": "pyarrow",
+      "note": "one row per record batch",
+      "expected": {
+        "columns": [
+          "id",
+          "label",
+          "amount",
+          "day",
+          "flag"
+        ],
+        "rows": [
+          [
+            1,
+            "alpha",
+            1.5,
+            "2020-01-31",
+            true
+          ],
+          [
+            2,
+            "beta",
+            2.5,
+            "2020-02-29",
+            false
+          ],
+          [
+            3,
+            null,
+            3.5,
+            "2020-03-31",
+            true
+          ],
+          [
+            4,
+            "İstanbul ısı",
+            -4.5,
+            "2020-04-30",
+            false
+          ],
+          [
+            5,
+            "has, comma",
+            0.0,
+            "2020-05-31",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "file": "pyarrow-brotli.parquet",
+      "writer": "pyarrow",
+      "note": "brotli-compressed parquet",
+      "expected": {
+        "columns": [
+          "id",
+          "label",
+          "amount",
+          "day",
+          "flag"
+        ],
+        "rows": [
+          [
+            1,
+            "alpha",
+            1.5,
+            "2020-01-31",
+            true
+          ],
+          [
+            2,
+            "beta",
+            2.5,
+            "2020-02-29",
+            false
+          ],
+          [
+            3,
+            null,
+            3.5,
+            "2020-03-31",
+            true
+          ],
+          [
+            4,
+            "İstanbul ısı",
+            -4.5,
+            "2020-04-30",
+            false
+          ],
+          [
+            5,
+            "has, comma",
+            0.0,
+            "2020-05-31",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "file": "pyarrow-dictionary.feather",
+      "writer": "pyarrow",
+      "note": "dictionary-encoded string column",
+      "expected": {
+        "columns": [
+          "id",
+          "label",
+          "amount",
+          "day",
+          "flag"
+        ],
+        "rows": [
+          [
+            1,
+            "alpha",
+            1.5,
+            "2020-01-31",
+            true
+          ],
+          [
+            2,
+            "beta",
+            2.5,
+            "2020-02-29",
+            false
+          ],
+          [
+            3,
+            null,
+            3.5,
+            "2020-03-31",
+            true
+          ],
+          [
+            4,
+            "İstanbul ısı",
+            -4.5,
+            "2020-04-30",
+            false
+          ],
+          [
+            5,
+            "has, comma",
+            0.0,
+            "2020-05-31",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "file": "pyarrow-gzip.parquet",
+      "writer": "pyarrow",
+      "note": "gzip-compressed parquet",
+      "expected": {
+        "columns": [
+          "id",
+          "label",
+          "amount",
+          "day",
+          "flag"
+        ],
+        "rows": [
+          [
+            1,
+            "alpha",
+            1.5,
+            "2020-01-31",
+            true
+          ],
+          [
+            2,
+            "beta",
+            2.5,
+            "2020-02-29",
+            false
+          ],
+          [
+            3,
+            null,
+            3.5,
+            "2020-03-31",
+            true
+          ],
+          [
+            4,
+            "İstanbul ısı",
+            -4.5,
+            "2020-04-30",
+            false
+          ],
+          [
+            5,
+            "has, comma",
+            0.0,
+            "2020-05-31",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "file": "pyarrow-snappy.parquet",
+      "writer": "pyarrow",
+      "note": "snappy-compressed parquet",
+      "expected": {
+        "columns": [
+          "id",
+          "label",
+          "amount",
+          "day",
+          "flag"
+        ],
+        "rows": [
+          [
+            1,
+            "alpha",
+            1.5,
+            "2020-01-31",
+            true
+          ],
+          [
+            2,
+            "beta",
+            2.5,
+            "2020-02-29",
+            false
+          ],
+          [
+            3,
+            null,
+            3.5,
+            "2020-03-31",
+            true
+          ],
+          [
+            4,
+            "İstanbul ısı",
+            -4.5,
+            "2020-04-30",
+            false
+          ],
+          [
+            5,
+            "has, comma",
+            0.0,
+            "2020-05-31",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "file": "pyarrow-v1.feather",
+      "writer": "pyarrow",
+      "note": "Feather V1, a different container entirely; refused or read, never half-read",
+      "expected": null
+    },
+    {
+      "file": "pyarrow-v2.feather",
+      "writer": "pyarrow",
+      "note": "Feather V2, uncompressed",
+      "expected": {
+        "columns": [
+          "id",
+          "label",
+          "amount",
+          "day",
+          "flag"
+        ],
+        "rows": [
+          [
+            1,
+            "alpha",
+            1.5,
+            "2020-01-31",
+            true
+          ],
+          [
+            2,
+            "beta",
+            2.5,
+            "2020-02-29",
+            false
+          ],
+          [
+            3,
+            null,
+            3.5,
+            "2020-03-31",
+            true
+          ],
+          [
+            4,
+            "İstanbul ısı",
+            -4.5,
+            "2020-04-30",
+            false
+          ],
+          [
+            5,
+            "has, comma",
+            0.0,
+            "2020-05-31",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "file": "pyarrow-zstd.parquet",
+      "writer": "pyarrow",
+      "note": "zstd-compressed parquet",
+      "expected": {
+        "columns": [
+          "id",
+          "label",
+          "amount",
+          "day",
+          "flag"
+        ],
+        "rows": [
+          [
+            1,
+            "alpha",
+            1.5,
+            "2020-01-31",
+            true
+          ],
+          [
+            2,
+            "beta",
+            2.5,
+            "2020-02-29",
+            false
+          ],
+          [
+            3,
+            null,
+            3.5,
+            "2020-03-31",
+            true
+          ],
+          [
+            4,
+            "İstanbul ısı",
+            -4.5,
+            "2020-04-30",
+            false
+          ],
+          [
+            5,
+            "has, comma",
+            0.0,
+            "2020-05-31",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "file": "pyarrow.parquet",
+      "writer": "pyarrow",
+      "note": "parquet written by pyarrow",
+      "expected": {
+        "columns": [
+          "id",
+          "label",
+          "amount",
+          "day",
+          "flag"
+        ],
+        "rows": [
+          [
+            1,
+            "alpha",
+            1.5,
+            "2020-01-31",
+            true
+          ],
+          [
+            2,
+            "beta",
+            2.5,
+            "2020-02-29",
+            false
+          ],
+          [
+            3,
+            null,
+            3.5,
+            "2020-03-31",
+            true
+          ],
+          [
+            4,
+            "İstanbul ısı",
+            -4.5,
+            "2020-04-30",
+            false
+          ],
+          [
+            5,
+            "has, comma",
+            0.0,
+            "2020-05-31",
+            null
+          ]
+        ]
+      }
+    }
+  ]
+}

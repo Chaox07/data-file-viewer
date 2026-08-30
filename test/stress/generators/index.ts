@@ -6,6 +6,7 @@ import './arrowZoo';
 import './concurrency';
 import './consistency';
 import './damage';
+import './foreign';
 import './identifiers';
 import './roundtrip';
 import './safemode';

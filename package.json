@@ -111,7 +111,7 @@
           "type": "number",
           "default": 200000,
           "minimum": 1,
-          "description": "Most points a chart will draw. A chart covers the whole series (the preview's LIMIT is stripped for it), so going over this refuses to draw and reports the real count rather than plotting a prefix that would look like a complete series."
+          "description": "Most points a chart will draw. A chart plots the rows your query returns, including its LIMIT, so going over this refuses to draw and reports the real count rather than plotting a prefix that would look like a complete series."
         },
     "dataFileViewer.debugLiveRefresh": {
           "type": "boolean",
@@ -142,6 +142,7 @@
     "typecheck": "tsc --noEmit",
     "test": "tsc -p tsconfig.test.json && node --test \"out-test/test/*.test.js\"",
     "stress": "tsc -p tsconfig.test.json && node out-test/test/stress/run_stress.js",
+    "stress:foreign": "python3 test/stress/foreign/build_corpus.py",
     "package": "npm run build && npx vsce package"
   },
   "devDependencies": {
