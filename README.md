@@ -50,13 +50,24 @@ produced by `pyarrow.feather.write_feather()`, `polars.DataFrame.write_ipc()`
 and `pandas.DataFrame.to_feather()` — DuckDB cannot read at all. There is no
 `read_feather`, and `read_arrow()` fails on it whether or not it is compressed.
 So the viewer converts it to a stream first, using the `apache-arrow` library,
-and opens the conversion. Two consequences worth knowing:
+and opens the conversion.
 
-- **The whole table goes through memory**, unlike every other format here.
-  Fine for a search-result export; not what you want for something enormous.
-- **`.feather` files are view-only.** Writing an edit back would mean
-  re-encoding the other way, and `COPY … (FORMAT arrow)` would silently put a
-  *stream* inside a file named `.feather`.
+**The conversion is a record batch at a time**, in both directions. The file
+encoding puts its footer at the end and is therefore random-access, which is
+exactly what `apache-arrow`'s `AsyncRecordBatchFileReader` wants: handed a file
+handle it seeks to the footer, reads the batch index, and yields batches on
+demand, each one re-encoded and written straight out. Peak memory is one batch
+rather than the whole dataset — measured at 59 MB on a 12 MB / 400,000-row
+polars file that previously had to hold the decoded table, its re-encoded copy
+and the file's own buffer at once.
+
+**`.feather` files are editable.** Saving goes the other way through the same
+machinery: DuckDB writes an Arrow *stream* to a temp file, that stream is
+re-encoded batch-by-batch into the *file* encoding, and the result is moved into
+place. The two-step matters — writing `COPY … (FORMAT arrow)` straight into the
+path would put stream bytes inside a file named `.feather`. This viewer would
+reopen it (it sniffs magic bytes, not the extension) and `pyarrow` and `pandas`
+would both refuse it.
 
 Which encoding a file actually is comes from its first six bytes, not its
 name — both turn up under both extensions in the wild, and guessing wrong is
@@ -114,12 +125,52 @@ offers no way to ask which names exist. A sheet that can't be read — a chart
 sheet, a macro sheet, an empty one — is skipped rather than failing the whole
 workbook; the file only errors if *none* of its sheets can be read.
 
-**Workbooks are view-only.** DuckDB can write an `.xlsx`, but a workbook is many
-sheets and that writes a file containing one — saving an edit to a single sheet
-would silently destroy every other sheet in the book. (Excel also has no integer
-type, so a round trip turns `1` into `1.0` throughout.) Rather than do either
-quietly behind a double-click, cell editing is simply not offered for `.xlsx`,
-the same as for kdb+ tables.
+**Cells Excel could not compute** — `#DIV/0!`, `#N/A`, `#REF!`, `#VALUE!` — used
+to cost you the whole sheet. `read_xlsx()` types a column from its values and
+then refuses the lot over one of them: *"Failed to parse cell 'E122': Could not
+convert string '#DIV/0!' to DOUBLE"*, and a 121-row sheet would not open. Such a
+sheet is now retried with `ignore_errors`, which reads that cell as empty and
+keeps every column's real type — which is what the value means: Excel saying it
+has no number there. The sheet is named in a warning when the file opens, since
+a cell quietly becoming blank is exactly the kind of thing worth saying out loud.
+(`all_varchar` would also have opened it, and is the wrong trade: it turns every
+column in the sheet into text to rescue one cell, costing sorting, stats and
+charting on all of them.)
+
+**Workbooks are editable, one cell at a time.** Nothing is regenerated. DuckDB
+*can* write an `.xlsx`, and saving through it was never an option: it writes a
+file containing one sheet, so an edit would have destroyed every other sheet in
+the book, along with the edited sheet's formulas and number formats — and Excel
+having no integer type, `1` would have come back as `1.0` throughout.
+
+Instead the workbook is unzipped, the single `<c>` element the edit targets is
+rewritten inside the worksheet XML, and the package is zipped back up. Measured
+on a real ten-sheet workbook: one part changed, one row in it, one cell in that
+row; all 242 formulas (including an external reference and a shared formula) and
+all 640 style attributes byte-identical.
+
+Finding which cell is the hard half, because an edit identifies its row by the
+row's *values* — DuckDB has no stable rowid across the shapes this viewer opens
+— while the file needs a row *number*. Comparing DuckDB's typed values against
+raw XML in JS would mean re-implementing its comparison against dates stored as
+serial numbers and floats stored at Excel's precision; getting that subtly wrong
+is not an error, it is an edit to the wrong cell of your workbook. So DuckDB
+does the matching in its own types and reports the row's ordinal, the header row
+is *found* (the first row carrying every column name) rather than counted to,
+and the cell about to be overwritten must currently hold what the grid was
+showing. Two independent readings have to agree; when they do not, the edit is
+refused and the file is untouched.
+
+Counting to the header is the mistake worth naming, since it looks correct:
+rows-in-file minus rows-in-table is right only for a sheet with nothing below
+its data. The first real workbook this ran against had 136 rows for 121 rows of
+data — notes underneath — which put the "header" fourteen rows into the data.
+
+Two things it does not preserve, both deliberate. A formula in the edited cell
+is replaced by the value you typed (keeping it would mean Excel recomputing your
+edit away on the next open), and a string is written as an inline string rather
+than appended to the shared-string table, which every sheet in the book points
+into.
 
 ### kdb+ tables
 
@@ -204,12 +255,22 @@ Every results grid — table previews and hand-written queries alike — gets:
   it ends up in screenshots and documents, where a dark one reads as a
   negative of itself.
 
-  The chart is always of the **whole** series. A preview runs `LIMIT 100`,
-  and charting those hundred rows of a longer series would draw a line that
-  stops early and looks exactly like a series that ends early — so the
-  trailing `LIMIT` is stripped for the chart. Past
-  `dataFileViewer.chartMaxPoints` (200,000 by default) it refuses and tells
-  you the real count instead of drawing a prefix.
+  **The chart is of the query on screen**, whole and unedited — its `WHERE`,
+  its joins, and its `LIMIT`. The `LIMIT` used to be stripped, on the argument
+  that a chart should be of the entire series; that made the chart a picture of
+  a query nobody had written, and silently, since a grid showing `limit 100`
+  plotted twenty years of daily data. Every other clause was already honoured,
+  so `LIMIT` was the one part of what you asked for that the chart overrode.
+
+  The limit is applied *inside* the chart's subquery, which is what makes the
+  plotted rows the rows in the grid: `select … from (your query limit 100)
+  order by date` draws the hundred rows on screen, while re-appending the limit
+  after the ordering would draw the earliest hundred rows of the whole table —
+  the same count, a different hundred.
+
+  `dataFileViewer.chartMaxPoints` (200,000 by default) is the viewer's own
+  ceiling for a query with no limit of its own. Past it the chart refuses and
+  tells you the real count, rather than drawing a prefix.
 
   Which column becomes the x axis, in order:
 

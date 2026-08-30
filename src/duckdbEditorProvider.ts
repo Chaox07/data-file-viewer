@@ -41,10 +41,11 @@ function isPreviewFirstTableEnabled(): boolean {
   return vscode.workspace.getConfiguration('dataFileViewer').get<boolean>('previewFirstTableOnOpen', true) !== false;
 }
 
-// Most points a chart will draw. A chart is a picture of the whole series --
-// runChartQuery strips the preview's LIMIT for exactly that reason -- so a cap
-// here is refused rather than applied, with the true count reported. Silently
-// drawing the first N would put the lie back.
+// Most points a chart will draw. This is the viewer's OWN ceiling, not the
+// query's: a LIMIT you typed is honoured by runChartQuery and plotted in full.
+// This cap exists for the query that has no limit and matches ten million rows,
+// and it is refused rather than applied, with the true count reported --
+// silently drawing the first N would be a chart of a query nobody wrote.
 function getChartMaxPoints(): number {
   const value = vscode.workspace.getConfiguration('dataFileViewer').get<number>('chartMaxPoints', 200_000);
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 200_000;
@@ -298,7 +299,11 @@ async function acquireFileLock(path: string): Promise<() => void> {
   return () => releaseFileLockSync(lockPath);
 }
 
-class DuckDBDocument implements vscode.CustomDocument {
+// Exported for the stress suite, which drives the document directly rather
+// than through the extension host: the connection lock, the stats cache and
+// the sibling resolution below are the parts with no coverage, and they are
+// all reachable from an instance. Nothing outside this file constructs one.
+export class DuckDBDocument implements vscode.CustomDocument {
   private tablesCache: string[] | undefined;
   // name (e.g. "orders_combined") -> the synthesized SQL that entry runs.
   combinedQueryMap = new Map<string, string>();
@@ -821,6 +826,12 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
           `${basename(uri.fsPath)}: opened read-only — this file is already open elsewhere. Edits will fail until the other handle is released.`
         );
       }
+      // Said at open, once, rather than left for the user to notice as a blank
+      // cell and wonder about. The file is fine and usable — this is about
+      // what is IN it.
+      for (const warning of file.openWarnings) {
+        vscode.window.showWarningMessage(`${basename(uri.fsPath)}: ${warning}`);
+      }
       if (isFlatFile) this.openFlatFilePaths.add(uri.fsPath);
       return new DuckDBDocument(
         uri,
@@ -1084,6 +1095,13 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
               editability: destructive ? { editable: false as const } : await document.file.checkEditableSelect(sql),
             };
           });
+
+          // Raised by the query rather than by opening the file — a workbook
+          // whose sheets had to be re-read tolerating uncomputable cells. Said
+          // once, when it first becomes true, rather than on every run.
+          for (const warning of document.file.takeLateWarnings()) {
+            vscode.window.showWarningMessage(`${basename(document.uri.fsPath)}: ${warning}`);
+          }
 
           document.lastEditableTable = editability.editable ? editability.table : undefined;
           document.lastEditableColumns = editability.editable ? editability.columns : undefined;

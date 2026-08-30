@@ -3,8 +3,20 @@ import { keymap } from '@codemirror/view';
 import { sql } from '@codemirror/lang-sql';
 import { json } from '@codemirror/lang-json';
 import { oneDark } from '@codemirror/theme-one-dark';
-import { computeSortOrder } from './sortOrder';
 import { pickXAxis, plottableColumns } from './chartSpec';
+import { fmtCount, formatStat, formatValue } from './gridFormat';
+import { DisplayOrderCache } from './gridOrder';
+import { liveStatusText } from './liveStatus';
+import { computeVirtualWindow } from './virtualWindow';
+import {
+  type Effect,
+  type ExtensionMessage,
+  type LastResult,
+  type QueryResultFields,
+  type TableStatus,
+  initialState,
+  reduce,
+} from './webviewState';
 // Note what is NOT imported here: ECharts. The chart draws in its own VS Code
 // tab (see chartPanel.ts / chartView.ts), so the ~530 KB library loads the
 // first time somebody plots something rather than every time a file is opened.
@@ -14,74 +26,9 @@ interface VsCodeApi {
 }
 declare function acquireVsCodeApi(): VsCodeApi;
 
-type TableStatus = 'unchanged' | 'changed' | 'new';
 type StatsKind = 'numeric' | 'datetime' | 'other';
 
-interface QueryResultFields {
-  columns: string[];
-  rows: unknown[][];
-  columnStatsKind: StatsKind[];
-  cellChanged?: boolean[][];
-  rowIsNew?: boolean[];
-  renamedColumns?: Record<string, string>;
-  diffSkipped: boolean;
-  hasLimit: boolean;
-  truncated?: boolean;
-  /** Rows the query matches ignoring its trailing LIMIT. Arrives after the rows. */
-  totalRows?: number;
-  editable: boolean;
-  editableTable?: string;
-  timeColumnWarning?: string;
-  /** DuckDB already ordered these rows — see computeDisplayOrder, which must not re-sort them. */
-  serverSorted?: boolean;
-}
 
-type ExtensionMessage =
-  | { command: 'tables'; tables: string[]; combinedTableNames: string[]; previewFirst?: boolean }
-  | ({ command: 'queryResult' } & QueryResultFields)
-  | ({ command: 'sortQueryResult' } & QueryResultFields)
-  | { command: 'rowTotal'; sql: string; total: number }
-  | { command: 'error'; message: string }
-  | { command: 'backupStatus'; message: string }
-  | { command: 'tableChangeStatus'; status: Record<string, TableStatus> }
-  | { command: 'safeModeState'; safeMode: boolean }
-  | { command: 'liveRefreshStarted'; intervalMs: number; suggestedIntervalSeconds: number | null }
-  | { command: 'liveRefreshStopped'; readOnly?: boolean }
-  | { command: 'liveRefreshRejected'; reason: string }
-  | { command: 'liveRefreshIntervalSet'; intervalMs: number }
-  | ({ command: 'liveTick'; lastUpdatedMs: number; unchanged: boolean } & { result?: QueryResultFields })
-  // Pushed on every transition by the host's scheduler, independent of whether
-  // a tick produced anything. A failing tick posts no liveTick at all, so
-  // carrying staleness on that message meant the flag was unreachable during
-  // exactly the outage it describes.
-  | {
-      command: 'liveStatus';
-      stale: boolean;
-      failureCount: number;
-      lastError?: string;
-      lastSuccessMs?: number;
-    }
-  | {
-      command: 'columnStatsResult';
-      column: string;
-      statsKind: StatsKind;
-      totalRows: number;
-      nonNullRows: number;
-      nullCount: number;
-      distinctCount?: number;
-      topValues?: { value: unknown; frequency: number }[];
-      min?: unknown;
-      max?: unknown;
-      mean?: unknown;
-      p5?: unknown;
-      p95?: unknown;
-    }
-  | { command: 'columnStatsError'; column: string; message: string }
-  | { command: 'cellUpdated'; column: string; newValue: unknown; rowValues: Record<string, unknown>; rowsMatched: number }
-  | { command: 'cellUpdateError'; column: string; message: string }
-  | { command: 'editStatus'; message: string };
-
-type LastResult = QueryResultFields;
 
 const vscode = acquireVsCodeApi();
 
@@ -144,22 +91,18 @@ const liveIntervalInput = document.getElementById('live-interval-input') as HTML
 const liveStatusEl = document.getElementById('live-status') as HTMLSpanElement;
 
 let running = false;
-let lastResult: LastResult | undefined;
+
+// Every data-carrying global the message handler used to mutate, in one place.
+// The transitions live in webviewState.ts; this is the single instance they
+// are applied to.
+let state = initialState();
 /** The query whose row total is still in flight; see runQuery and the 'rowTotal' case. */
-let awaitingTotalForSql: string | undefined;
-let sortState: { columnIndex: number; direction: 'asc' | 'desc' } | undefined;
 let combinedTableNames = new Set<string>();
-let liveEnabled = false;
-let liveLastUpdatedMs: number | undefined;
-let liveStale = false;
-let liveLastError: string | undefined;
-let liveIntervalMs = 2000;
 let liveStatusTicker: number | undefined;
 // Sliding-tail scroll behavior for live combined views: only auto-follow
 // new rows in (log-tail style) when the user was already at the bottom —
 // otherwise a live tick would repeatedly yank someone inspecting history
 // back down to the newest row.
-let pinnedToBottom = true;
 
 function setRunning(value: boolean): void {
   running = value;
@@ -214,7 +157,7 @@ function runQuery(sqlText: string): void {
   // Remembered so a 'rowTotal' arriving late can be matched to the query it
   // counted -- it is computed after the rows are already on screen, and by
   // then the user may have run something else.
-  awaitingTotalForSql = trimmed;
+  state.awaitingTotalForSql = trimmed;
   vscode.postMessage({ command: 'runQuery', sql: trimmed });
 }
 
@@ -249,7 +192,7 @@ backupCheck.addEventListener('change', sendToggleSafeMode);
 checkChangesCheck.addEventListener('change', sendToggleSafeMode);
 
 function setLiveUiEnabled(enabled: boolean): void {
-  liveEnabled = enabled;
+  state.liveEnabled = enabled;
   modeLiveRadio.checked = enabled;
   modeStaticRadio.checked = !enabled;
   liveOptionsEl.hidden = !enabled;
@@ -273,32 +216,18 @@ function stopLiveStatusTicker(): void {
   }
 }
 
-function formatAgo(ms: number): string {
-  const seconds = Math.max(0, Math.round((Date.now() - ms) / 1000));
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes}m ${seconds % 60}s ago`;
-}
-
-/**
- * Second, independent staleness signal, computed here rather than reported by
- * the host. The host's own `stale` flag can only arrive if the host is still
- * running its scheduler at all — so a wedged extension host is precisely the
- * case it cannot report. Time since the last successful update is observable
- * from this side no matter what happened over there.
- */
-function isLocallyStale(): boolean {
-  if (liveLastUpdatedMs === undefined) return false;
-  return Date.now() - liveLastUpdatedMs > Math.max(3 * liveIntervalMs, 10_000);
-}
-
 function updateLiveStatusText(): void {
-  if (!liveEnabled) return;
-  const stale = liveStale || isLocallyStale();
-  const agoText = liveLastUpdatedMs !== undefined ? `updated ${formatAgo(liveLastUpdatedMs)}` : 'waiting for first update…';
-  liveStatusEl.textContent = stale ? `Live · stale, last ${agoText}` : `Live · ${agoText}`;
-  liveStatusEl.className = `live-status ${stale ? 'live-status-stale' : 'live-status-active'}`;
-  liveStatusEl.title = stale && liveLastError ? `Last error: ${liveLastError}` : '';
+  if (!state.liveEnabled) return;
+  const status = liveStatusText({
+    enabled: state.liveEnabled,
+    hostStale: state.liveStale,
+    lastUpdatedMs: state.liveLastUpdatedMs,
+    intervalMs: state.liveIntervalMs,
+    lastError: state.liveLastError,
+  });
+  liveStatusEl.textContent = status.text;
+  liveStatusEl.className = status.className;
+  liveStatusEl.title = status.title;
 }
 
 function startLiveStatusTicker(): void {
@@ -326,7 +255,7 @@ modeStaticRadio.addEventListener('change', () => {
 });
 
 liveIntervalInput.addEventListener('change', () => {
-  if (!liveEnabled) return;
+  if (!state.liveEnabled) return;
   const intervalMs = Math.round(Number(liveIntervalInput.value || '2') * 1000);
   vscode.postMessage({ command: 'setLiveRefreshInterval', intervalMs });
 });
@@ -358,8 +287,8 @@ function previewTable(name: string): void {
 
 /** The x axis for what is currently on screen, or undefined if it has not got one. */
 function chartXAxis(): { column: string; kind: 'datetime' | 'text' } | undefined {
-  if (!lastResult) return undefined;
-  return pickXAxis(lastResult.columns, lastResult.columnStatsKind);
+  if (!state.lastResult) return undefined;
+  return pickXAxis(state.lastResult.columns, state.lastResult.columnStatsKind);
 }
 
 function requestChart(yColumn: string): void {
@@ -423,32 +352,12 @@ function applyTableChangeStatus(status: Record<string, TableStatus>): void {
  * *whether* to sort, which is webview state, and delegates *how* to sort,
  * which is pure and lives where it can be tested against DuckDB's own output.
  */
-function computeDisplayOrder(): number[] {
-  const result = lastResult!;
-  const n = result.rows.length;
-  // Already ordered by DuckDB across the full data set. Re-sorting here is not
-  // just wasted work: where the client comparator disagrees with DuckDB's
-  // ordering, it would scramble a correct top-N back into a wrong one.
-  if (!sortState || result.serverSorted) return Array.from({ length: n }, (_, i) => i);
-  return computeSortOrder(
-    result.rows,
-    sortState.columnIndex,
-    sortState.direction,
-    result.columnStatsKind[sortState.columnIndex]
-  );
-}
-
-// Sorting the same rows the same way on every render is pure waste, and
-// renderResults runs on every live tick.
-let cachedOrder: { rows: unknown[][]; key: string; order: number[] } | undefined;
+// The ordering rules and their memo now live in gridOrder.ts, where they can
+// be tested; this is the single cache instance the grid uses.
+const displayOrderCache = new DisplayOrderCache();
 
 function displayOrder(): number[] {
-  const result = lastResult!;
-  const key = sortState && !result.serverSorted ? `${sortState.columnIndex}:${sortState.direction}` : '';
-  if (cachedOrder && cachedOrder.rows === result.rows && cachedOrder.key === key) return cachedOrder.order;
-  const order = computeDisplayOrder();
-  cachedOrder = { rows: result.rows, key, order };
-  return order;
+  return displayOrderCache.order(state.lastResult!, state.sortState);
 }
 
 function renderStatsPopoverContent(container: HTMLElement, message: Extract<ExtensionMessage, { command: 'columnStatsResult' }>): void {
@@ -612,13 +521,13 @@ function closeCellInspector(): void {
 }
 
 function openCellInspector(rowIdx: number, colIdx: number): void {
-  if (!lastResult || running) return;
+  if (!state.lastResult || running) return;
   closeStatsPopover();
   closeCellInspector();
 
-  const column = lastResult.columns[colIdx];
-  const value = lastResult.rows[rowIdx][colIdx];
-  const canEdit = lastResult.editable && !safeModeCheck.checked;
+  const column = state.lastResult.columns[colIdx];
+  const value = state.lastResult.rows[rowIdx][colIdx];
+  const canEdit = state.lastResult.editable && !safeModeCheck.checked;
 
   const isObjectValue = typeof value === 'object' && value !== null;
   let jsonParsed: unknown;
@@ -696,15 +605,15 @@ function openCellInspector(rowIdx: number, colIdx: number): void {
       // The host serializes edits rather than dropping a second one, so a
       // double-click would otherwise send two updates and the second would
       // come back as "no matching row" against the row the first just changed.
-      if (running || !lastResult || saveBtn.disabled) return;
+      if (running || !state.lastResult || saveBtn.disabled) return;
       saveBtn.disabled = true;
       const text = inspectorEditor.state.doc.toString();
       // Empty input means NULL, not the literal empty string — matches how
       // NULL is already shown as literal text "NULL" elsewhere in the grid.
       const newValue = text === '' ? null : text;
       const rowValues: Record<string, unknown> = {};
-      lastResult.columns.forEach((c, j) => {
-        rowValues[c] = lastResult!.rows[rowIdx][j];
+      state.lastResult.columns.forEach((c, j) => {
+        rowValues[c] = state.lastResult!.rows[rowIdx][j];
       });
       pendingCellEdit = { rowIdx, colIdx, column, statusEl: statusSpan, saveBtn };
       statusSpan.textContent = 'Saving…';
@@ -717,7 +626,7 @@ function openCellInspector(rowIdx: number, colIdx: number): void {
   } else {
     const note = document.createElement('span');
     note.className = 'cell-inspector-note';
-    note.textContent = !lastResult.editable
+    note.textContent = !state.lastResult.editable
       ? "View only — this result isn't a plain single-table SELECT, so it can't be edited."
       : 'View only — uncheck Safe Mode to edit.';
     footer.appendChild(note);
@@ -743,7 +652,6 @@ function openCellInspector(rowIdx: number, colIdx: number): void {
 // for a live view that can re-run every tick, and especially the combined
 // hot+cold view where the result can hold real history.
 const VIRTUALIZE_THRESHOLD = 200;
-const VIRTUAL_OVERSCAN = 8;
 let measuredRowHeight = 25; // corrected from a real rendered row below; this is just the initial estimate
 // Signature of the header currently on screen — see the reuse check in renderResults.
 let renderedHeaderKey: string | undefined;
@@ -751,7 +659,7 @@ let virtualState: { order: number[]; rowHeight: number } | undefined;
 let virtualRenderScheduled = false;
 
 function buildRowElement(i: number, displayIdx: number): HTMLTableRowElement {
-  const { rows, cellChanged, rowIsNew, columnStatsKind } = lastResult!;
+  const { rows, cellChanged, rowIsNew, columnStatsKind } = state.lastResult!;
   const row = rows[i];
   const tr = document.createElement('tr');
   tr.className = displayIdx % 2 === 0 ? 'even' : 'odd';
@@ -787,22 +695,24 @@ function appendSpacerRow(tbody: HTMLTableSectionElement, heightPx: number, colCo
 }
 
 function renderVirtualWindow(): void {
-  if (!virtualState || !lastResult) return;
+  if (!virtualState || !state.lastResult) return;
   const tbody = resultsEl.querySelector('tbody');
   if (!tbody) return;
   const { order, rowHeight } = virtualState;
-  const scrollTop = resultsEl.scrollTop;
-  const viewportH = resultsEl.clientHeight || 400;
-  const start = Math.max(0, Math.floor(scrollTop / rowHeight) - VIRTUAL_OVERSCAN);
-  const end = Math.min(order.length, Math.ceil((scrollTop + viewportH) / rowHeight) + VIRTUAL_OVERSCAN);
+  const { start, end, topSpacerPx, bottomSpacerPx } = computeVirtualWindow({
+    scrollTop: resultsEl.scrollTop,
+    viewportHeight: resultsEl.clientHeight,
+    rowHeight,
+    rowCount: order.length,
+  });
   tbody.innerHTML = '';
-  appendSpacerRow(tbody, start * rowHeight, lastResult.columns.length);
+  appendSpacerRow(tbody, topSpacerPx, state.lastResult.columns.length);
   const frag = document.createDocumentFragment();
   for (let displayIdx = start; displayIdx < end; displayIdx++) {
     frag.appendChild(buildRowElement(order[displayIdx], displayIdx));
   }
   tbody.appendChild(frag);
-  appendSpacerRow(tbody, (order.length - end) * rowHeight, lastResult.columns.length);
+  appendSpacerRow(tbody, bottomSpacerPx, state.lastResult.columns.length);
 }
 
 // Delegated cell-inspector trigger. Attached to #results, which survives every
@@ -818,13 +728,13 @@ resultsEl.addEventListener('dblclick', (e) => {
 
 // Attached once, not per-render — renderResults() below fully rebuilds
 // #results' contents on every call, which would orphan a listener declared
-// there. Reads whatever `virtualState`/`lastResult` currently hold instead.
+// there. Reads whatever `virtualState`/`state.lastResult` currently hold instead.
 resultsEl.addEventListener('scroll', () => {
   // Pinned-to-bottom tracking for live mode's sliding tail window: only
   // auto-follow new rows in when the user was already at the bottom (log
   // tail/chat-scroll convention) — otherwise a live tick would repeatedly
   // yank someone inspecting history back down to the newest row.
-  pinnedToBottom = resultsEl.scrollTop + resultsEl.clientHeight >= resultsEl.scrollHeight - 4;
+  state.pinnedToBottom = resultsEl.scrollTop + resultsEl.clientHeight >= resultsEl.scrollHeight - 4;
   if (virtualRenderScheduled) return;
   virtualRenderScheduled = true;
   requestAnimationFrame(() => {
@@ -846,15 +756,15 @@ resultsEl.addEventListener('scroll', () => {
  */
 function renderResults(preserveScroll = false): void {
   const preservedScrollTop = preserveScroll ? resultsEl.scrollTop : 0;
-  const wasPinnedToBottom = preserveScroll && pinnedToBottom;
+  const wasPinnedToBottom = preserveScroll && state.pinnedToBottom;
 
   virtualState = undefined;
-  if (!lastResult) {
+  if (!state.lastResult) {
     resultsEl.innerHTML = '';
     renderedHeaderKey = undefined;
     return;
   }
-  const { columns, rows, cellChanged, rowIsNew, renamedColumns, columnStatsKind } = lastResult;
+  const { columns, rows, cellChanged, rowIsNew, renamedColumns, columnStatsKind } = state.lastResult;
 
   if (columns.length === 0) {
     resultsEl.innerHTML = '<div class="empty">Query returned no columns.</div>';
@@ -866,7 +776,7 @@ function renderResults(preserveScroll = false): void {
   // identical to the one already on screen. Rebuilding it anyway threw away
   // the sort/stats buttons several times a second — and with them the anchor
   // element an open stats popover positions against.
-  const headerKey = JSON.stringify([columns, renamedColumns ?? null, sortState ?? null, columnStatsKind]);
+  const headerKey = JSON.stringify([columns, renamedColumns ?? null, state.sortState ?? null, columnStatsKind]);
   const existingTable = resultsEl.querySelector('table');
   const reuseHeader = preserveScroll && existingTable !== null && headerKey === renderedHeaderKey;
 
@@ -904,21 +814,21 @@ function renderResults(preserveScroll = false): void {
     const controls = document.createElement('span');
     controls.className = 'th-controls';
 
-    const isActiveSort = sortState?.columnIndex === colIdx;
+    const isActiveSort = state.sortState?.columnIndex === colIdx;
     const sortBtn = document.createElement('button');
     sortBtn.className = 'th-sort-btn';
     sortBtn.classList.toggle('th-sort-btn-active', isActiveSort);
-    sortBtn.textContent = isActiveSort ? (sortState!.direction === 'asc' ? '▲' : '▼') : '⇅';
+    sortBtn.textContent = isActiveSort ? (state.sortState!.direction === 'asc' ? '▲' : '▼') : '⇅';
     sortBtn.title = isActiveSort
-      ? `Sorted ${sortState!.direction === 'asc' ? 'ascending' : 'descending'} — click to reverse`
+      ? `Sorted ${state.sortState!.direction === 'asc' ? 'ascending' : 'descending'} — click to reverse`
       : 'Sort ascending';
     sortBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       if (running) return;
-      const direction = isActiveSort && sortState!.direction === 'asc' ? 'desc' : 'asc';
-      sortState = { columnIndex: colIdx, direction };
-      if (lastResult) lastResult.serverSorted = false;
-      if (lastResult?.hasLimit) {
+      const direction = isActiveSort && state.sortState!.direction === 'asc' ? 'desc' : 'asc';
+      state.sortState = { columnIndex: colIdx, direction };
+      if (state.lastResult) state.lastResult.serverSorted = false;
+      if (state.lastResult?.hasLimit) {
         // A LIMIT-ed result can't be correctly re-sorted from just the rows
         // already in memory (see hasLimit's origin in duckdbConnection.ts) --
         // ask the host to re-run the query sorted against the full data.
@@ -972,13 +882,9 @@ function renderResults(preserveScroll = false): void {
 }
 
 /** Thousands separators, so a six-figure row count is readable at a glance. */
-function fmtCount(n: number): string {
-  return n.toLocaleString();
-}
-
 /** Body + footer only. Split out so a live tick can refresh the rows under an untouched header. */
 function renderRowsInto(table: HTMLTableElement, preservedScrollTop: number, wasPinnedToBottom: boolean): void {
-  const { rows } = lastResult!;
+  const { rows } = state.lastResult!;
 
   table.querySelector('tbody')?.remove();
   resultsEl.querySelector('.results-footer')?.remove();
@@ -1003,14 +909,14 @@ function renderRowsInto(table: HTMLTableElement, preservedScrollTop: number, was
   // footer you would get if a million rows were waiting behind it. So the
   // total is spelled out even when the two match: "146 of 146" is redundant
   // only until it is the thing you needed to know.
-  const total = lastResult!.totalRows;
+  const total = state.lastResult!.totalRows;
   const shown = rows.length;
   footer.textContent =
     total === undefined
       ? `${fmtCount(shown)} row${shown === 1 ? '' : 's'} shown`
       : `${fmtCount(shown)} of ${fmtCount(total)} row${total === 1 ? '' : 's'} shown`;
 
-  if (lastResult!.truncated) {
+  if (state.lastResult!.truncated) {
     // The count above is the whole story only when nothing was cut -- say so
     // explicitly, otherwise a capped result reads as the complete answer.
     const cap = document.createElement('span');
@@ -1019,7 +925,7 @@ function renderRowsInto(table: HTMLTableElement, preservedScrollTop: number, was
     footer.appendChild(cap);
   }
 
-  if (lastResult!.diffSkipped) {
+  if (state.lastResult!.diffSkipped) {
     const note = document.createElement('span');
     note.className = 'diff-skipped-note';
     note.textContent = ' — result too large to auto-diff against the backup.';
@@ -1057,263 +963,105 @@ function renderRowsInto(table: HTMLTableElement, preservedScrollTop: number, was
   }
 }
 
-function addThousandsSeparators(digits: string): string {
-  return digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-}
-
-// DuckDB's node-api serializes BIGINT/HUGEINT/DECIMAL/TIMESTAMP/DATE all as
-// plain strings over the wire (only the small int types and float/double
-// come through as JS numbers) -- so a string alone can't tell numeric values
-// apart from dates. `kind` (from columnStatsKind, computed server-side from
-// the actual DuckDB type) is what disambiguates. Formatting is done by
-// string manipulation, not toLocaleString(), so it never rounds/truncates
-// the value's original precision.
-function formatValue(value: unknown, kind?: StatsKind): string {
-  if (value === null || value === undefined) return 'NULL';
-  if (typeof value === 'object') return JSON.stringify(value);
-  if (kind === 'numeric' && (typeof value === 'number' || typeof value === 'bigint' || typeof value === 'string')) {
-    const match = String(value).match(/^(-?)(\d+)(\.\d+)?$/);
-    if (match) {
-      const [, sign, intPart, fracPart = ''] = match;
-      return `${sign}${addThousandsSeparators(intPart)}${fracPart}`;
-    }
-  }
-  return String(value);
-}
-
-/**
- * A computed statistic, at no more than four decimal places.
- *
- * Display-only, and deliberately NOT part of formatValue -- that one formats
- * cell values, and its promise never to touch a value's original precision
- * has to keep holding. This applies to avg and the two percentiles, which are
- * results of avg()/approx_quantile() rather than anything present in the data.
- *
- * "At most" four: an integer stays an integer and 0.5 stays 0.5, because
- * padding them out to 0.5000 would suggest a measurement precision that is
- * not there either. Non-numeric input falls through to formatValue unchanged.
- */
-function formatStat(value: unknown): string {
-  if (value === null || value === undefined) return 'NULL';
-  const n = typeof value === 'bigint' ? Number(value) : Number(value);
-  if (!Number.isFinite(n)) return formatValue(value, 'numeric');
-  // parseFloat drops the trailing zeros toFixed adds; String() then avoids
-  // toLocaleString, so addThousandsSeparators stays the one place grouping
-  // happens.
-  return formatValue(String(parseFloat(n.toFixed(4))), 'numeric');
-}
-
 function showError(message: string): void {
   resultsEl.innerHTML = '';
-  lastResult = undefined;
+  state.lastResult = undefined;
   const el = document.createElement('div');
   el.className = 'error';
   el.textContent = message;
   resultsEl.appendChild(el);
 }
 
-window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
-  const message = event.data;
-  switch (message.command) {
-    case 'tables':
-      renderTables(message.tables, message.combinedTableNames, message.previewFirst === true);
+/**
+ * The message loop, split in two.
+ *
+ * What each message DOES to the state -- and the several places where three
+ * different query results deliberately treat state.sortState, totalRows and the
+ * scroll position differently -- now lives in webviewState.ts, where it can be
+ * tested. What is left here is the half that needs a DOM: applying the effects
+ * the reducer asked for, in the order it asked for them.
+ */
+function applyEffect(effect: Effect): void {
+  switch (effect.kind) {
+    case 'renderTables':
+      renderTables(effect.tables, effect.combined, effect.previewFirst);
       break;
-    case 'queryResult':
-      setRunning(false);
-      statusEl.textContent = message.timeColumnWarning ?? '';
-      lastResult = {
-        columns: message.columns,
-        rows: message.rows,
-        columnStatsKind: message.columnStatsKind,
-        cellChanged: message.cellChanged,
-        rowIsNew: message.rowIsNew,
-        renamedColumns: message.renamedColumns,
-        diffSkipped: message.diffSkipped,
-        hasLimit: message.hasLimit,
-        truncated: message.truncated,
-        editable: message.editable,
-        editableTable: message.editableTable,
-        serverSorted: false,
-      };
-      sortState = undefined;
-      // A brand-new query result (not a live tick re-running the same one)
-      // always starts scrolled to the top — "pinned to bottom" only matters
-      // once this same query starts live-ticking.
-      pinnedToBottom = false;
-      renderResults();
+    case 'setRunning':
+      setRunning(effect.value);
       break;
-    case 'rowTotal':
-      // Late-arriving companion to the queryResult above. Ignored unless it
-      // counted the query currently on screen — the user can run something
-      // else while a count is still running, and a total from the previous
-      // query under these rows would be worse than no total at all.
-      if (lastResult && message.sql === awaitingTotalForSql) {
-        lastResult.totalRows = message.total;
-        renderResults();
-      }
+    case 'status':
+      statusEl.textContent = effect.text;
       break;
-    case 'sortQueryResult':
-      setRunning(false);
-      statusEl.textContent = '';
-      lastResult = {
-        columns: message.columns,
-        rows: message.rows,
-        columnStatsKind: message.columnStatsKind,
-        cellChanged: message.cellChanged,
-        rowIsNew: message.rowIsNew,
-        renamedColumns: message.renamedColumns,
-        diffSkipped: message.diffSkipped,
-        hasLimit: message.hasLimit,
-        truncated: message.truncated,
-        // Sorting re-orders the same matching rows and re-applies the same
-        // LIMIT, so the total is unchanged — carried across rather than
-        // recomputed, which would re-run the count on every column click.
-        totalRows: lastResult?.totalRows,
-        editable: message.editable,
-        editableTable: message.editableTable,
-        // DuckDB ordered these across the full data set; computeDisplayOrder
-        // must leave them exactly as they arrived.
-        serverSorted: message.serverSorted ?? true,
-      };
-      // sortState is intentionally left as-is -- this response IS the
-      // result of the sort that was just clicked, so the arrow icon must
-      // keep showing it (unlike a fresh runQuery, which clears it above).
-      renderResults();
+    case 'showError':
+      showError(effect.message);
       break;
-    case 'error':
-      setRunning(false);
-      statusEl.textContent = '';
-      showError(message.message);
+    case 'render':
+      renderResults(effect.preserveScroll);
       break;
-    case 'backupStatus':
-      statusEl.textContent = message.message;
+    case 'invalidateOrder':
+      displayOrderCache.invalidate();
       break;
     case 'tableChangeStatus':
-      applyTableChangeStatus(message.status);
+      applyTableChangeStatus(effect.status);
       break;
     case 'safeModeState':
-      safeModeCheck.checked = message.safeMode;
-      unlockOptionsEl.hidden = message.safeMode || liveEnabled;
+      safeModeCheck.checked = effect.safeMode;
+      unlockOptionsEl.hidden = effect.safeMode || state.liveEnabled;
       break;
-    case 'liveRefreshStarted':
-      setLiveUiEnabled(true);
-      liveIntervalMs = message.intervalMs;
-      liveIntervalInput.value = String(message.intervalMs / 1000);
-      liveLastUpdatedMs = undefined;
-      liveStale = false;
-      liveLastError = undefined;
+    case 'setLiveUi':
+      setLiveUiEnabled(effect.enabled);
+      break;
+    case 'setLiveIntervalInput':
+      liveIntervalInput.value = String(effect.intervalMs / 1000);
+      break;
+    case 'startLiveStatusTicker':
       startLiveStatusTicker();
       break;
-    case 'liveRefreshStopped':
-      setLiveUiEnabled(false);
-      if (message.readOnly) {
-        statusEl.textContent =
-          'Live off — but this file is still open read-only, because another process holds the write lock. Editing stays disabled until it releases.';
-      }
+    case 'updateLiveStatusText':
+      updateLiveStatusText();
       break;
     case 'liveRefreshRejected':
       modeStaticRadio.checked = true;
       modeLiveRadio.checked = false;
-      statusEl.textContent = message.reason;
       break;
-    case 'liveRefreshIntervalSet':
-      liveIntervalMs = message.intervalMs;
-      liveIntervalInput.value = String(message.intervalMs / 1000);
-      break;
-    case 'liveStatus':
-      liveStale = message.stale;
-      liveLastError = message.lastError;
-      updateLiveStatusText();
-      break;
-    case 'liveTick':
-      liveLastUpdatedMs = message.lastUpdatedMs;
-      updateLiveStatusText();
-      if (!message.unchanged && message.result) {
-        const r = message.result;
-        lastResult = {
-          columns: r.columns,
-          rows: r.rows,
-          columnStatsKind: r.columnStatsKind,
-          cellChanged: r.cellChanged,
-          rowIsNew: r.rowIsNew,
-          renamedColumns: r.renamedColumns,
-          diffSkipped: r.diffSkipped,
-          hasLimit: r.hasLimit,
-          truncated: r.truncated,
-          // Deliberately NOT carried across. A live tick means the underlying
-          // data just moved, so the previous total is exactly the number that
-          // has stopped being true — the footer drops back to "N rows shown"
-          // rather than asserting a stale one. Recounting every tick would
-          // double the cost of the poll loop to state something that is
-          // already about to change again.
-          editable: r.editable,
-          editableTable: r.editableTable,
-          // A live tick re-runs the user's own query, which carries whatever
-          // ORDER BY they wrote but not the client-side sort — so any active
-          // column sort still has to be applied here.
-          serverSorted: false,
-        };
-        renderResults(true); // preserve scroll position / pinned-bottom auto-follow — this is the same ongoing query, not a fresh one
-      }
-      break;
-    case 'columnStatsResult':
-      if (statsPopoverEl && pendingStatsColumn === message.column) {
-        renderStatsPopoverContent(statsPopoverEl, message);
+    case 'statsResult':
+      if (statsPopoverEl && pendingStatsColumn === effect.message.column) {
+        renderStatsPopoverContent(statsPopoverEl, effect.message);
         if (pendingStatsAnchor) positionPopover(statsPopoverEl, pendingStatsAnchor);
       }
       break;
-    case 'columnStatsError':
-      if (statsPopoverEl && pendingStatsColumn === message.column) {
+    case 'statsError':
+      if (statsPopoverEl && pendingStatsColumn === effect.column) {
         statsPopoverEl.innerHTML = '';
         const el = document.createElement('div');
         el.className = 'stats-empty';
-        el.textContent = message.message;
+        el.textContent = effect.message;
         statsPopoverEl.appendChild(el);
         if (pendingStatsAnchor) positionPopover(statsPopoverEl, pendingStatsAnchor);
       }
       break;
-    case 'cellUpdated':
-      if (lastResult) {
-        // Re-match by full-row equality (same principle used server-side),
-        // robust to any client-side sort that happened between send and
-        // receive — display order never matches the underlying row index.
-        const colIdx = lastResult.columns.indexOf(message.column);
-        const rowIdx = lastResult.rows.findIndex((row) =>
-          lastResult!.columns.every((c, j) => {
-            const expected = message.rowValues[c];
-            return c === message.column ? true : row[j] === expected || (row[j] == null && expected == null);
-          })
-        );
-        if (colIdx !== -1 && rowIdx !== -1) {
-          lastResult.rows[rowIdx][colIdx] = message.newValue;
-          // Edited in place, so the rows array keeps its identity — the cached
-          // permutation has to be dropped explicitly or an edit to the sort
-          // column would leave the row sitting in its old position.
-          cachedOrder = undefined;
-          if (lastResult.cellChanged) {
-            if (!lastResult.cellChanged[rowIdx]) {
-              lastResult.cellChanged[rowIdx] = lastResult.columns.map(() => false);
-            }
-            lastResult.cellChanged[rowIdx][colIdx] = true;
-          }
-        }
-      }
+    case 'closeCellInspector':
       closeCellInspector();
-      renderResults();
       break;
     case 'cellUpdateError':
-      if (pendingCellEdit && pendingCellEdit.column === message.column) {
-        pendingCellEdit.statusEl.textContent = message.message;
+      if (pendingCellEdit && pendingCellEdit.column === effect.column) {
+        pendingCellEdit.statusEl.textContent = effect.message;
         // Re-armed so a failed edit can be corrected and retried.
         pendingCellEdit.saveBtn.disabled = false;
       }
       break;
     case 'editStatus':
       if (pendingCellEdit) {
-        pendingCellEdit.statusEl.textContent = message.message;
+        pendingCellEdit.statusEl.textContent = effect.message;
       }
       break;
   }
+}
+
+window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
+  const { state: nextState, effects } = reduce(state, event.data);
+  state = nextState;
+  for (const effect of effects) applyEffect(effect);
 });
 
 vscode.postMessage({ command: 'ready' });

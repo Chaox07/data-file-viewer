@@ -75,12 +75,42 @@ test('a native DATE column charts on a time axis', async () => {
   }
 });
 
-test("the preview's trailing LIMIT is stripped, so the chart is the whole series", async () => {
-  // The reason runChartQuery exists at all.
+test("a trailing LIMIT is honoured, so the chart is the query on screen", async () => {
+  // This used to assert the opposite -- the LIMIT was stripped and the chart
+  // drew all 200 rows. That made the chart a picture of a query nobody had
+  // written: a grid showing `limit 100` plotted the whole table, silently, and
+  // every other clause of the query WAS being honoured. LIMIT was the one part
+  // of "what you asked for" the chart overrode.
   const file = await open();
   try {
     const r = await file.runChartQuery('SELECT * FROM "native" LIMIT 100;', 'Date', ['Rate'], false);
-    assert.equal(r.rows.length, 200);
+    assert.equal(r.rows.length, 100);
+  } finally {
+    file.dispose();
+  }
+});
+
+test('the limited rows are the ones the grid shows, not the earliest by x', async () => {
+  // The subtle half. Applying the LIMIT inside the subquery plots the hundred
+  // rows the grid holds; re-appending it after the chart's own `order by 1`
+  // would plot the earliest hundred rows of the whole table -- the same count,
+  // a different hundred, and not the ones on screen.
+  const file = await open();
+  try {
+    const limited = await file.runChartQuery(
+      'select * from "native" order by "Date" desc limit 10',
+      'Date',
+      ['Rate'],
+      false
+    );
+    const all = await file.runChartQuery('select * from "native"', 'Date', ['Rate'], false);
+    assert.equal(limited.rows.length, 10);
+    // The ten LATEST dates, because that is what the query selected -- not the
+    // ten earliest, which is what a re-appended LIMIT would have produced.
+    const lastOfAll = all.rows[all.rows.length - 1][0];
+    const lastOfLimited = limited.rows[limited.rows.length - 1][0];
+    assert.deepEqual(lastOfLimited, lastOfAll);
+    assert.notDeepEqual(limited.rows[0][0], all.rows[0][0]);
   } finally {
     file.dispose();
   }

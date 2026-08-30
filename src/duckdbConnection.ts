@@ -11,10 +11,12 @@ import {
 } from '@duckdb/node-api';
 import { basename, dirname, extname, join } from 'node:path';
 import { chmod, copyFile, mkdtemp, open, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
 import { KNOWN_FREQUENCIES, type SeriesFrequency } from './chartSpec';
 import { listSheets } from './xlsxSheets';
+import { patchCell as patchXlsxCell } from './xlsxWrite';
 
 export type StatsKind = 'numeric' | 'datetime' | 'other';
 
@@ -130,6 +132,19 @@ async function assertArrowStreamComplete(path: string): Promise<void> {
 const ARROW_FILE_MAGIC = Buffer.from('ARROW1', 'ascii');
 const FEATHER_V1_MAGIC = Buffer.from('FEA1', 'ascii');
 
+/**
+ * Whether an error is read_xlsx refusing a single cell's value, not the file.
+ *
+ * Matched on the message because that is all the extension gives: there is no
+ * error code, and the two failures have to be told apart -- a cell that will
+ * not parse is recoverable by reading it as NULL, while a sheet that is not a
+ * worksheet at all is not.
+ */
+function isCellParseError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /Failed to parse cell|Could not convert string/i.test(message);
+}
+
 async function isFeatherEncoding(path: string): Promise<boolean> {
   const head = Buffer.alloc(ARROW_FILE_MAGIC.length);
   let bytesRead = 0;
@@ -157,10 +172,20 @@ async function isFeatherEncoding(path: string): Promise<boolean> {
  * apache-arrow JS library is here for: tableFromIPC() reads BOTH encodings,
  * tableToIPC(t, 'stream') writes the one read_arrow wants.
  *
- * The whole table goes through memory, unlike every other format here, which
- * DuckDB streams off disk. That is inherent to converting rather than reading,
- * and it is the reason .feather is worth having as its own kind rather than
- * being treated as just another Arrow file.
+ * Converted a RECORD BATCH AT A TIME, not as a whole table. The Feather file
+ * encoding puts its footer at the end and is therefore random-access, which is
+ * exactly what apache-arrow's AsyncRecordBatchFileReader wants: handed a
+ * FileHandle it seeks to the footer, reads the batch index, and yields batches
+ * on demand. Each one is re-encoded and written straight out to the stream, so
+ * peak memory is one batch rather than the entire dataset — measured at 59 MB
+ * on a 12 MB / 400,000-row polars file that previously had to hold the whole
+ * decoded table, its re-encoded copy, and the file's own Buffer at once.
+ *
+ * A conversion still happens; that part is not avoidable while DuckDB has no
+ * Feather reader (re-verified against duckdb 1.5.5 + the arrow community
+ * extension: read_arrow fails on the file encoding, compressed or not, and
+ * nothing else in that extension takes one). What is avoidable is doing it in
+ * one bite, and that is what this does.
  *
  * COMPRESSED Feather cannot be handled and is refused with a message saying
  * so. apache-arrow JS has no IPC codecs at all — it throws "Record batch is
@@ -170,44 +195,12 @@ async function isFeatherEncoding(path: string): Promise<boolean> {
  * DuckDB's.
  */
 async function convertFeatherToStream(path: string): Promise<{ streamPath: string; tempDir: string }> {
-  const arrow = await import('apache-arrow');
-  const { tableFromIPC, tableToIPC, Table, Type, Utf8, vectorFromArray } = arrow;
-
-  /**
-   * Re-encode Utf8View columns as plain Utf8.
-   *
-   * polars writes strings as Arrow Utf8View by DEFAULT, and read_arrow rejects
-   * that type outright: "Unrecognized Field type with value 24" -- 24 being
-   * Type.Utf8View exactly. Converting the container is therefore not enough on
-   * its own; the string columns have to be brought down to a type DuckDB knows,
-   * or every file polars wrote fails after a successful conversion.
-   *
-   * This is the same hazard `compat_level=oldest` exists for on the write side,
-   * arriving from the other direction. It is worth knowing that this was missed
-   * by a green test suite: the fixtures were built from DuckDB's own output,
-   * which is plain Utf8, so the corpus agreed with the code and both were wrong
-   * about real polars files.
-   */
-  const downcastViews = (t: InstanceType<typeof Table>): InstanceType<typeof Table> => {
-    const columns: Record<string, unknown> = {};
-    let changed = false;
-    for (const field of t.schema.fields) {
-      const vector = t.getChild(field.name);
-      if (!vector) continue;
-      if (field.type.typeId === Type.Utf8View) {
-        columns[field.name] = vectorFromArray(vector.toJSON() as (string | null)[], new Utf8());
-        changed = true;
-      } else {
-        columns[field.name] = vector;
-      }
-    }
-    return changed ? new Table(columns as never) : t;
-  };
-
-  let table;
+  const tempDir = await mkdtemp(join(tmpdir(), 'dfv-feather-'));
+  const streamPath = join(tempDir, `${basename(path, extname(path))}.arrows`);
   try {
-    table = downcastViews(tableFromIPC(await readFile(path)));
+    await streamFeatherToArrowStream(path, streamPath);
   } catch (err) {
+    await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
     const message = err instanceof Error ? err.message : String(err);
     if (/compress/i.test(message)) {
       throw new Error(
@@ -220,11 +213,154 @@ async function convertFeatherToStream(path: string): Promise<{ streamPath: strin
     }
     throw new Error(`"${basename(path)}" could not be read as a Feather / Arrow IPC file: ${message}`);
   }
-
-  const tempDir = await mkdtemp(join(tmpdir(), 'dfv-feather-'));
-  const streamPath = join(tempDir, `${basename(path, extname(path))}.arrows`);
-  await writeFile(streamPath, Buffer.from(tableToIPC(table, 'stream')));
   return { streamPath, tempDir };
+}
+
+/**
+ * Re-encode a batch's Utf8View columns as plain Utf8, leaving the rest alone.
+ *
+ * polars writes strings as Arrow Utf8View by DEFAULT, and read_arrow rejects
+ * that type outright: "Unrecognized Field type with value 24" -- 24 being
+ * Type.Utf8View exactly. Converting the container is therefore not enough on
+ * its own; the string columns have to be brought down to a type DuckDB knows,
+ * or every file polars wrote fails after a successful conversion.
+ *
+ * This is the same hazard `compat_level=oldest` exists for on the write side,
+ * arriving from the other direction. It is worth knowing that this was missed
+ * by a green test suite: the fixtures were built from DuckDB's own output,
+ * which is plain Utf8, so the corpus agreed with the code and both were wrong
+ * about real polars files.
+ */
+async function downcastViewsInBatch(batch: unknown): Promise<unknown> {
+  const { Table, Type, Utf8, vectorFromArray } = await import('apache-arrow');
+  const source = batch as {
+    schema: { fields: { name: string; type: { typeId: number; dictionary?: { typeId: number } } }[] };
+    getChild(name: string): unknown;
+  };
+
+  // Dictionary-encoded strings are the same hazard as Utf8View, from a
+  // different writer. read_arrow refuses them at the schema -- "Schema message
+  // field with DictionaryEncoding not supported" -- and they are not exotic:
+  // a pandas categorical, an R factor and a polars Categorical all become one.
+  // Found by the Tier B corpus, which is the only part of the suite that can
+  // produce a file this repo's own writers never emit.
+  //
+  // Only STRING dictionaries are decoded. A dictionary over some other value
+  // type is left as it was, so this widens what opens without quietly changing
+  // what a numeric column means.
+  const STRING_TYPES = new Set<number>([Type.Utf8, Type.LargeUtf8, Type.Utf8View]);
+  const isStringDictionary = (type: { typeId: number; dictionary?: { typeId: number } }): boolean =>
+    type.typeId === Type.Dictionary && type.dictionary !== undefined && STRING_TYPES.has(type.dictionary.typeId);
+
+  const columns: Record<string, unknown> = {};
+  let changed = false;
+  for (const field of source.schema.fields) {
+    const vector = source.getChild(field.name);
+    if (!vector) continue;
+    if (field.type.typeId === Type.Utf8View || isStringDictionary(field.type)) {
+      // toJSON() reads through the encoding in both cases: a dictionary
+      // vector's get() resolves the index against its dictionary, so this is
+      // the decoded value either way.
+      columns[field.name] = vectorFromArray(
+        (vector as { toJSON(): (string | null)[] }).toJSON(),
+        new Utf8()
+      );
+      changed = true;
+    } else {
+      columns[field.name] = vector;
+    }
+  }
+  // A Table built from one batch's vectors has exactly one batch back out.
+  return changed ? new Table(columns as never).batches[0] : batch;
+}
+
+/**
+ * Arrow IPC stream at `from` -> Feather file at `to`, one record batch at a time.
+ *
+ * The save-side mirror of streamFeatherToArrowStream, and the reason .feather
+ * can be edited at all: DuckDB's `COPY ... (FORMAT arrow)` writes the stream
+ * encoding, and this turns that into the file encoding the original had, with
+ * the same one-batch memory ceiling as the read side.
+ *
+ * No Utf8View downcast on this side. These batches came out of DuckDB, which
+ * writes plain Utf8 -- the downcast exists for what polars WROTE, not for what
+ * this viewer writes.
+ */
+async function streamArrowStreamToFeather(from: string, to: string): Promise<void> {
+  const { RecordBatchReader, RecordBatchFileWriter } = await import('apache-arrow');
+  const handle = await open(from, 'r');
+  try {
+    // apache-arrow's typings do not list FileHandle among RecordBatchReader.from's
+    // overloads, though it accepts one at runtime and returns the async
+    // random-access reader the file encoding needs -- which is the whole point
+    // here. Typed at the call rather than cast at the argument: `handle as never`
+    // collapses the return type to `never` and takes `open()` with it.
+    const openReader = RecordBatchReader.from as unknown as (
+      source: unknown
+    ) => Promise<{ open(): Promise<void> } & AsyncIterable<unknown>>;
+    const reader = await openReader(handle);
+    await reader.open();
+
+    const out = createWriteStream(to);
+    const writer = new RecordBatchFileWriter();
+    const done = new Promise<void>((resolve, reject) => {
+      out.on('finish', resolve);
+      out.on('error', reject);
+    });
+    writer.toNodeStream().pipe(out);
+    try {
+      for await (const batch of reader) writer.write(batch as never);
+      writer.finish();
+    } catch (err) {
+      writer.close();
+      out.destroy();
+      throw err;
+    }
+    await done;
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Feather file at `from` -> Arrow IPC stream at `to`, one record batch at a time. */
+async function streamFeatherToArrowStream(from: string, to: string): Promise<void> {
+  const { RecordBatchReader, RecordBatchStreamWriter } = await import('apache-arrow');
+  const handle = await open(from, 'r');
+  try {
+    // apache-arrow's typings do not list FileHandle among RecordBatchReader.from's
+    // overloads, though it accepts one at runtime and returns the async
+    // random-access reader the file encoding needs -- which is the whole point
+    // here. Typed at the call rather than cast at the argument: `handle as never`
+    // collapses the return type to `never` and takes `open()` with it.
+    const openReader = RecordBatchReader.from as unknown as (
+      source: unknown
+    ) => Promise<{ open(): Promise<void> } & AsyncIterable<unknown>>;
+    const reader = await openReader(handle);
+    await reader.open();
+
+    const out = createWriteStream(to);
+    const writer = new RecordBatchStreamWriter();
+    const done = new Promise<void>((resolve, reject) => {
+      out.on('finish', resolve);
+      out.on('error', reject);
+    });
+    writer.toNodeStream().pipe(out);
+    try {
+      for await (const batch of reader) {
+        writer.write((await downcastViewsInBatch(batch)) as never);
+      }
+      writer.finish();
+    } catch (err) {
+      // Close the sink before rethrowing, or a failed conversion leaves the
+      // write stream open and the temp file undeleteable on Windows.
+      writer.close();
+      out.destroy();
+      throw err;
+    }
+    await done;
+  } finally {
+    await handle.close();
+  }
 }
 
 function quoteIdent(name: string): string {
@@ -505,7 +641,16 @@ const FORBIDDEN_KEYWORDS_RE = /\b(join|group\s+by|distinct|union|intersect|excep
 export class DuckDbFile {
   private lastBackupPath: string | undefined;
   private backupAttached = false;
+  /** Temp dir holding a Feather backup's stream conversion, if any. */
+  private backupTempDir: string | undefined;
   private materialized = false;
+  /** Set once this workbook's views have been re-created with ignore_errors. */
+  private xlsxErrorsTolerated = false;
+  /**
+   * Notices raised after open, by a query rather than by opening the file.
+   * Drained by the caller -- see takeLateWarnings.
+   */
+  private readonly lateWarnings: string[] = [];
 
   private constructor(
     private readonly connection: DuckDBConnection,
@@ -520,7 +665,15 @@ export class DuckDbFile {
     private readonly rootCatalogName: string = 'memory',
     private readonly siblingPath: string | undefined = undefined,
     /** Temp dir holding the stream a .feather file was converted into, if any. */
-    private readonly featherTempDir: string | undefined = undefined
+    private readonly featherTempDir: string | undefined = undefined,
+    /** Notices about a file that opened successfully; see openWarnings in open(). */
+    readonly openWarnings: readonly string[] = [],
+    /**
+     * Sheet name -> its worksheet part inside the package, for .xlsx only.
+     * Carried from open() because listSheets had already read it, and because
+     * an edit has to reach the right part of the zip knowing only the view name.
+     */
+    private readonly xlsxSheetPaths: Map<string, string> = new Map()
   ) {}
 
   isReadOnly(): boolean {
@@ -532,7 +685,18 @@ export class DuckDbFile {
   }
 
   private isFlatFileKind(): boolean {
-    return this.kind === 'parquet' || this.kind === 'csv' || this.kind === 'dta' || this.kind === 'arrow';
+    return (
+      this.kind === 'parquet' ||
+      this.kind === 'csv' ||
+      this.kind === 'dta' ||
+      this.kind === 'arrow' ||
+      // Feather earns its place here now that writeBackFlatFile can produce the
+      // FILE encoding. It was excluded for one reason only -- `COPY ... (FORMAT
+      // arrow)` writes a STREAM, so saving through DuckDB alone would have put
+      // stream bytes inside a .feather file and quietly changed its format out
+      // from under whatever reads it next.
+      this.kind === 'feather'
+    );
   }
 
   static async open(path: string, forceKind?: FileKind, options?: DuckDbFileOpenOptions): Promise<DuckDbFile> {
@@ -555,6 +719,13 @@ export class DuckDbFile {
     // Set when a Feather file is converted; the instance owns it and removes
     // it on dispose(), so a session leaves nothing behind in the temp dir.
     let featherTempDir: string | undefined;
+    // Things the user should be told about a file that DID open. Not errors --
+    // an error stops the open -- but facts about what they are now looking at
+    // that are not visible in the grid, such as a cell shown as empty because
+    // the workbook holds #DIV/0! there.
+    const openWarnings: string[] = [];
+    // Populated for .xlsx only; see the constructor parameter of the same name.
+    const xlsxSheetPaths = new Map<string, string>();
     const looksArrow = /\.(arrows?|feather)$/i.test(path);
     const isFeather = looksArrow && (await isFeatherEncoding(path));
     const isArrow = looksArrow && !isFeather;
@@ -730,6 +901,7 @@ export class DuckDbFile {
           await connection.run(
             `create view "${asIdent}" as select * from read_xlsx('${filePath}', sheet = '${asLiteral}')`
           );
+          xlsxSheetPaths.set(sheet.name, sheet.path);
         } catch (err) {
           // One unreadable sheet (a chart sheet, a macro sheet, an empty one)
           // must not cost the user the rest of the workbook.
@@ -804,7 +976,9 @@ export class DuckDbFile {
       siblingIsSqlite,
       rootCatalogName,
       options?.siblingPath,
-      featherTempDir
+      featherTempDir,
+      openWarnings,
+      xlsxSheetPaths
     );
   }
 
@@ -1119,6 +1293,80 @@ export class DuckDbFile {
    * deliberately imports no `vscode`; duckdbEditorProvider owns the setting.
    */
   async runQuery(sql: string, maxRows = 0): Promise<QueryResult> {
+    try {
+      return await this.runQueryOnce(sql, maxRows);
+    } catch (err) {
+      // A workbook cell Excel could not compute -- #DIV/0!, #N/A, #REF! -- in
+      // an otherwise numeric column. read_xlsx types the column from its
+      // values and then refuses the whole sheet over one of them.
+      //
+      // Repaired HERE rather than at open, because `create view ... from
+      // read_xlsx(...)` does not read the sheet: it binds a schema and returns,
+      // so the failure only ever surfaces on the first real query. Repairing at
+      // open would have meant scanning every sheet of every workbook up front
+      // to find out whether it was needed.
+      if (!(await this.repairXlsxViewsForCellErrors(err))) throw err;
+      return await this.runQueryOnce(sql, maxRows);
+    }
+  }
+
+  /**
+   * Re-create this workbook's sheet views with `ignore_errors`, once.
+   *
+   * Returns whether anything was repaired, so the caller knows whether
+   * retrying the query is worth it.
+   *
+   * `ignore_errors` reads an uncomputable cell as NULL and keeps every column's
+   * real type, which is what the value MEANS: Excel saying it has no number
+   * there. Measured on the workbook this was reported from, it changes exactly
+   * the one offending cell and nothing else.
+   *
+   * `all_varchar` would also open the sheet and is the wrong trade -- it turns
+   * every column in the sheet into text to rescue one cell, costing sorting,
+   * stats and charting on all of them.
+   *
+   * Every sheet is repaired rather than just the one queried, because the error
+   * does not say which sheet it came from and a query may join several. The
+   * flag makes it happen at most once per open, so a genuinely broken query
+   * cannot loop.
+   */
+  private async repairXlsxViewsForCellErrors(err: unknown): Promise<boolean> {
+    if (this.kind !== 'xlsx' || this.xlsxErrorsTolerated) return false;
+    if (!isCellParseError(err)) return false;
+
+    this.xlsxErrorsTolerated = true;
+    const filePath = this.path.replace(/'/g, "''");
+    const repaired: string[] = [];
+    for (const name of this.xlsxSheetPaths.keys()) {
+      const asLiteral = name.replace(/'/g, "''");
+      const asIdent = name.replace(/"/g, '""');
+      try {
+        await this.connection.run(
+          `create or replace view "${asIdent}" as select * from ` +
+            `read_xlsx('${filePath}', sheet = '${asLiteral}', ignore_errors = true)`
+        );
+        repaired.push(name);
+      } catch {
+        // Leave the original view in place; the caller's rethrow still reports
+        // the real problem.
+      }
+    }
+    if (repaired.length === 0) return false;
+    // Recorded rather than printed: a cell quietly becoming blank has to be
+    // said out loud, and the provider is what has a UI to say it in.
+    this.lateWarnings.push(
+      `This workbook holds cell values Excel could not compute (#DIV/0!, #N/A, #REF! ` +
+        `and the like). They are shown as empty cells; every other value is unchanged.`
+    );
+    return true;
+  }
+
+  /** Warnings raised since the last call. Emptied, so each is reported once. */
+  takeLateWarnings(): string[] {
+    return this.lateWarnings.splice(0, this.lateWarnings.length);
+  }
+
+  private async runQueryOnce(sql: string, maxRows = 0): Promise<QueryResult> {
     const capped = maxRows > 0;
     // One past the cap: that extra row is what distinguishes "exactly maxRows
     // rows exist" from "there were more", without reading the rest.
@@ -1207,7 +1455,19 @@ export class DuckDbFile {
   ): Promise<QueryResult & { xAxisMode: 'time' | 'category' }> {
     const stripped = stripTrailingSemicolon(baseSql);
     const extracted = extractTrailingLimit(stripped);
-    const inner = extracted ? extracted.withoutLimit : stripped;
+    // The LIMIT is KEPT, not stripped. It used to be stripped, on the argument
+    // that a chart is a picture of the whole series -- but that makes the chart
+    // a picture of a different query than the one on screen, and silently: a
+    // grid showing `... limit 100` plots twenty years of daily data. Every
+    // other clause of the query was already honoured, so LIMIT was the one part
+    // of "what you asked for" the chart overrode.
+    //
+    // Kept as a SUBQUERY rather than re-appended after the ordering below,
+    // which matters: `select ... from (inner limit 100) order by 1` plots the
+    // hundred rows the grid shows, while `select ... from inner order by 1
+    // limit 100` would plot the earliest hundred rows of the whole table --
+    // the same count, a different hundred, and not the ones on screen.
+    const inner = extracted ? `${extracted.withoutLimit} ${extracted.limitClause}` : stripped;
     const x = quoteIdent(xColumn);
     const ys = yColumns.map(quoteIdent).join(', ');
 
@@ -1324,13 +1584,21 @@ export class DuckDbFile {
       // Backup already succeeded above; permission mirroring is a nice-to-have.
     }
 
-    // A repeat createBackup() (Safe Mode toggled off more than once) must
-    // swap the attached catalog, not stack a second backup_cmp — DuckDB
-    // won't allow re-attaching an alias that's already attached.
-    if (this.backupAttached) {
-      await this.detachBackupCatalog();
-      this.backupAttached = false;
-    }
+    // A repeat createBackup() (Safe Mode toggled off more than once) must swap
+    // the attached catalog, not stack a second backup_cmp — DuckDB won't allow
+    // re-attaching an alias that's already attached.
+    //
+    // Detached unconditionally rather than only when `backupAttached` says so.
+    // That flag is set AFTER attachBackupCatalog returns, so any failure in
+    // between leaves the alias attached with the flag still false — and then
+    // every later attempt fails with "database with name backup_cmp already
+    // exists", which is a different error, in a different place, with nothing
+    // pointing back at the attempt that actually went wrong. That is not
+    // hypothetical: it is what the xlsx backup bug did in the field, and the
+    // second error is what the user saw. The state on the connection is the
+    // truth here; the flag is only a hint.
+    await this.detachBackupCatalog().catch(() => undefined);
+    this.backupAttached = false;
     this.lastBackupPath = backupPath;
     await this.attachBackupCatalog();
     this.backupAttached = true;
@@ -1342,38 +1610,114 @@ export class DuckDbFile {
     if (!this.lastBackupPath) throw new Error('No backup available to compare against');
     if (this.kind === 'duckdb') {
       await this.connection.run(`attach ${quoteLiteral(this.lastBackupPath)} as backup_cmp (read_only)`);
-    } else if (this.kind === 'sqlite') {
+      return;
+    }
+    if (this.kind === 'sqlite') {
       await this.connection.run(
         `attach ${quoteLiteral(this.lastBackupPath)} as backup_cmp (type sqlite, read_only)`
       );
-    } else {
-      // Parquet/CSV: mirror the same view name inside a fresh in-memory
-      // catalog, so unqualified SQL resolves against it once USEd, same as
-      // the others. (If this document's own file was already materialized
-      // into a table via an edit, the backup itself is still the original
-      // pre-edit flat file on disk — read back with the same read_* function
-      // used to open it in the first place, regardless of materialization.)
-      const readFn =
-        this.kind === 'parquet'
-          ? 'read_parquet'
-          : this.kind === 'dta'
-            ? 'read_dta'
-            : this.kind === 'arrow'
-              ? 'read_arrow'
-              : 'read_csv_auto';
-      await this.connection.run(`attach ':memory:' as backup_cmp`);
-      await this.connection.run('use backup_cmp');
-      await this.connection.run(
-        `create view ${quoteIdent(this.mainObjectName)} as select * from ${readFn}(${quoteLiteral(
-          this.lastBackupPath
-        )})`
-      );
-      await this.connection.run(`use ${quoteIdent(this.catalogName)}`);
+      return;
     }
+
+    // Every other kind: mirror the live view names inside a fresh in-memory
+    // catalog, so unqualified SQL resolves against it once USEd, same as the
+    // others. (If this document's own file was already materialized into a
+    // table via an edit, the backup itself is still the original pre-edit flat
+    // file on disk — read back the same way it was opened in the first place,
+    // regardless of materialization.)
+    await this.connection.run(`attach ':memory:' as backup_cmp`);
+    try {
+      await this.connection.run('use backup_cmp');
+      try {
+        await this.createBackupViews();
+      } finally {
+        // Non-negotiable, and the reason this is a finally rather than a
+        // trailing statement: while the connection points at backup_cmp, every
+        // unqualified query in the session resolves against it. A throw between
+        // the USE above and this line used to strand the connection there, so
+        // one failed backup turned into "Table with name X does not exist" for
+        // every query afterwards — the file looked fine, and nothing about the
+        // error mentioned Safe Mode.
+        await this.connection.run(`use ${quoteIdent(this.catalogName)}`);
+      }
+    } catch (err) {
+      // The alias is attached even though the views are not, and DuckDB refuses
+      // to re-attach a name already in use — so without this, a retry fails
+      // with a second, more confusing error than the first.
+      await this.connection.run('detach backup_cmp').catch(() => undefined);
+      await this.clearBackupTempDir();
+      throw err;
+    }
+  }
+
+  /** The backup's views, in whatever shape this kind reads. Runs inside backup_cmp. */
+  private async createBackupViews(): Promise<void> {
+    const backupPath = this.lastBackupPath!;
+
+    if (this.kind === 'xlsx') {
+      // A workbook is the one flat kind that is genuinely multi-table, so the
+      // backup needs one view per sheet under the same names the live catalog
+      // uses -- the diff pairs the two catalogs up by table name. Reading a
+      // workbook with read_csv_auto, which is what the old fallback did, fails
+      // on the ZIP header and takes Safe Mode down with it.
+      const literalPath = quoteLiteral(backupPath);
+      // If this workbook already needed ignore_errors to be readable, its
+      // backup needs it too -- otherwise the diff throws on the same
+      // uncomputable cell that the live side is already tolerating.
+      const tolerate = this.xlsxErrorsTolerated ? ', ignore_errors = true' : '';
+      let created = 0;
+      for (const name of this.xlsxSheetPaths.keys()) {
+        const asLiteral = name.replace(/'/g, "''");
+        const asIdent = name.replace(/"/g, '""');
+        try {
+          await this.connection.run(
+            `create view "${asIdent}" as select * from read_xlsx(${literalPath}, sheet = '${asLiteral}'${tolerate})`
+          );
+          created++;
+        } catch {
+          // One unreadable sheet must not cost the user Safe Mode on the rest,
+          // exactly as at open time.
+        }
+      }
+      if (created === 0) {
+        throw new Error('None of the workbook\'s sheets could be read from the backup copy.');
+      }
+      return;
+    }
+
+    let readPath = backupPath;
+    if (this.kind === 'feather') {
+      // read_arrow cannot read the Feather file encoding at all -- converting
+      // is the entire reason this kind exists -- so the backup copy has to go
+      // through the same conversion the original did.
+      const converted = await convertFeatherToStream(backupPath);
+      readPath = converted.streamPath;
+      this.backupTempDir = converted.tempDir;
+    }
+
+    const readFn =
+      this.kind === 'parquet'
+        ? 'read_parquet'
+        : this.kind === 'dta'
+          ? 'read_dta'
+          : this.kind === 'arrow' || this.kind === 'feather'
+            ? 'read_arrow'
+            : 'read_csv_auto';
+    await this.connection.run(
+      `create view ${quoteIdent(this.mainObjectName)} as select * from ${readFn}(${quoteLiteral(readPath)})`
+    );
+  }
+
+  private async clearBackupTempDir(): Promise<void> {
+    if (!this.backupTempDir) return;
+    const dir = this.backupTempDir;
+    this.backupTempDir = undefined;
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
   }
 
   private async detachBackupCatalog(): Promise<void> {
     await this.connection.run('detach backup_cmp');
+    await this.clearBackupTempDir();
   }
 
   /** Table-level "did anything in this table change since the backup" summary for the sidebar. */
@@ -1513,13 +1857,16 @@ export class DuckDbFile {
     // an in-memory table purely so this viewer can query it -- there is no
     // write-back path to real kdb+ format, so editing is never offered.
     //
-    // .xlsx is view-only for a different and sharper reason. DuckDB CAN write
-    // one (`copy ... to ... (format xlsx)`), but a workbook is many sheets and
-    // that writes a file containing ONE -- saving an edit to a single sheet
-    // would silently destroy every other sheet in the book. It also has no
-    // integer type, so a round trip turns 1 into 1.0 throughout. Neither is a
-    // trade worth making silently behind a double-click.
-    if (this.readOnly || this.kind === 'kdb' || this.kind === 'xlsx') return { editable: false };
+    // .xlsx used to be refused here for a sharper reason, now addressed rather
+    // than lived with. DuckDB CAN write a workbook (`copy ... to ... (format
+    // xlsx)`) and that was never the problem -- it writes a file containing ONE
+    // sheet, so saving an edit through it would have destroyed every other
+    // sheet in the book, along with the edited sheet's own formulas, number
+    // formats and (Excel having no integer type) the difference between 1 and
+    // 1.0. Nothing is regenerated now: xlsxWrite.ts rewrites the single <c>
+    // element inside the worksheet XML and leaves the rest of the package
+    // byte-for-byte, so none of that is on the table.
+    if (this.readOnly || this.kind === 'kdb') return { editable: false };
     const trimmed = sql.trim();
 
     try {
@@ -1597,6 +1944,14 @@ export class DuckDbFile {
     rowValues: Record<string, unknown>,
     onStatus?: (message: string) => void
   ): Promise<number> {
+    // A workbook is edited in the FILE, not in a materialized copy of it. Every
+    // other kind here can be rewritten wholesale from the table DuckDB holds; an
+    // .xlsx cannot, because that table is one sheet of many and holds none of
+    // what makes a workbook a workbook. See xlsxWrite.ts.
+    if (this.kind === 'xlsx') {
+      return this.updateXlsxCell(table, column, newValue, rowValues, onStatus);
+    }
+
     if (!this.materialized && this.isFlatFileKind()) {
       onStatus?.('Preparing file for editing…');
     }
@@ -1627,6 +1982,74 @@ export class DuckDbFile {
   }
 
   /**
+   * One cell of one sheet, rewritten inside the workbook package.
+   *
+   * The row is identified the way every other edit here identifies one -- full-
+   * row equality on the pre-edit values -- but the answer this needs is a
+   * spreadsheet ROW NUMBER, and comparing DuckDB's typed values against raw
+   * worksheet XML in JS is exactly the kind of nearly-right that ends with the
+   * wrong cell of somebody's workbook overwritten.
+   *
+   * So DuckDB does the matching in its own types and reports the row's ordinal,
+   * and xlsxWrite then CHECKS that the cell it is about to overwrite currently
+   * holds what the grid was showing. Two independent readings have to agree
+   * before anything is written; when they do not, the edit is refused.
+   */
+  private async updateXlsxCell(
+    table: string,
+    column: string,
+    newValue: unknown,
+    rowValues: Record<string, unknown>,
+    onStatus?: (message: string) => void
+  ): Promise<number> {
+    const sheetPath = this.xlsxSheetPaths.get(table);
+    if (!sheetPath) {
+      throw new Error(`"${table}" is not a sheet of this workbook, so it cannot be edited.`);
+    }
+
+    const whereCols = Object.keys(rowValues);
+    const whereClause = whereCols
+      .map((c, i) => `${quoteIdent(c)} is not distinct from $${i + 1}`)
+      .join(' and ');
+    const values = whereCols.map((c) => rowValues[c]) as DuckDBValue[];
+
+    // row_number() over () follows the scan, and read_xlsx scans the sheet in
+    // sheet order -- which is what makes "the Nth row DuckDB returned" mean
+    // "the Nth data row in the XML". Not trusted on its own; verified below.
+    const reader = await this.connection.runAndReadAll(
+      `select rn from (
+         select row_number() over () as rn, * from ${quoteIdent(table)}
+       ) as _rows${whereClause ? ` where ${whereClause}` : ''}`,
+      values
+    );
+    const matches = reader.getRows();
+    if (matches.length === 0) return 0;
+    if (matches.length > 1) {
+      // The same limitation the SQL path carries (identical rows update
+      // together) -- but a file rewrite cannot be half-applied, so here it is
+      // refused rather than applied to all of them.
+      throw new Error(
+        `${matches.length} rows in "${table}" are identical across every column, so there ` +
+          `is no way to tell which one you edited. The workbook was not changed.`
+      );
+    }
+
+    onStatus?.('Saving…');
+    await patchXlsxCell({
+      filePath: this.path,
+      sheetPath,
+      columnName: column,
+      columnNames: whereCols,
+      rowOrdinal: Number(matches[0][0]),
+      expectedCurrent: rowValues[column],
+      newValue,
+    });
+    // The view is `read_xlsx(...)`, re-read on every query, so the next one
+    // already sees the file as it now is. Nothing to invalidate.
+    return 1;
+  }
+
+  /**
    * Rewrites the ENTIRE source file from the current (materialized) table
    * contents — CSV/Parquet have no row-level update mechanism of their own,
    * so this is the only way an edit becomes visible outside the extension.
@@ -1648,6 +2071,30 @@ export class DuckDbFile {
       await this.connection.run(`copy ${table} to '${filePath}' (format dta)`);
     } else if (this.kind === 'arrow') {
       await this.connection.run(`copy ${table} to '${filePath}' (format arrow)`);
+    } else if (this.kind === 'feather') {
+      // Two steps, because DuckDB writes only the stream encoding and the file
+      // this came from is the file encoding. Writing the stream bytes straight
+      // into the .feather path would "work" -- the viewer would even reopen it,
+      // since the kind is sniffed from magic bytes rather than the extension --
+      // and would hand every OTHER reader a file whose contents no longer match
+      // its name. pyarrow.feather.read_feather() and pandas.read_feather() both
+      // refuse it.
+      //
+      // Written to a temp file and moved into place, so an interrupted save
+      // leaves the original intact rather than half a table.
+      const tempDir = await mkdtemp(join(tmpdir(), 'dfv-feather-save-'));
+      try {
+        const streamPath = join(tempDir, 'out.arrows');
+        const featherPath = join(tempDir, 'out.feather');
+        await this.connection.run(`copy ${table} to '${streamPath.replace(/'/g, "''")}' (format arrow)`);
+        await streamArrowStreamToFeather(streamPath, featherPath);
+        // copyFile rather than rename: the temp dir is in the OS temp location,
+        // which is routinely a different filesystem from the user's file, and
+        // rename across devices fails with EXDEV.
+        await copyFile(featherPath, this.path);
+      } finally {
+        await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+      }
     }
   }
 
@@ -1723,6 +2170,10 @@ export class DuckDbFile {
 
   dispose(): void {
     this.connection.closeSync();
+    if (this.backupTempDir) {
+      void rm(this.backupTempDir, { recursive: true, force: true }).catch(() => undefined);
+      this.backupTempDir = undefined;
+    }
     if (this.featherTempDir) {
       // Fire-and-forget: dispose() is synchronous by contract, and a temp file
       // left behind on a failed unlink is a far smaller problem than a throw

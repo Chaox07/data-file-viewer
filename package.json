@@ -1,7 +1,7 @@
 {
   "name": "data-file-viewer",
   "displayName": "Data File Viewer",
-  "description": "Open and explore .duckdb, .parquet, .csv, .dta (Stata), .arrow/.arrows/.feather (Arrow IPC), .xlsx (Excel), .db/.sqlite (SQLite), and kdb+ data files right inside VS Code, without needing a separate database program. A sidebar lists every table in the file — click one to see its rows in a grid, or write your own SQL query to look at exactly the data you want. Click a column header to sort by it, or open the stats panel to see quick numbers for that column — minimum, maximum, average, and percentiles — worked out across the whole dataset, not just the rows on screen. For editable formats (.duckdb, .parquet, .csv, .dta, .arrow/.arrows, .db/.sqlite; .feather is view-only, because it has to be converted to be read), double-click a cell to change its value and save it straight back to the file; turn on Safe Mode first to keep an automatic backup and see exactly which rows changed before you commit to the edit. kdb+ tables are read directly in their real, original format — no conversion step — though they are view-only for now, since there is no way yet to write changes back into that format. Excel workbooks show one sheet per sidebar entry and are also view-only, because writing one back would replace the whole workbook with the single sheet being edited.",
+  "description": "Open and explore .duckdb, .parquet, .csv, .dta (Stata), .arrow/.arrows/.feather (Arrow IPC), .xlsx (Excel), .db/.sqlite (SQLite), and kdb+ data files right inside VS Code, without needing a separate database program. A sidebar lists every table in the file — click one to see its rows in a grid, or write your own SQL query to look at exactly the data you want. Click a column header to sort by it, or open the stats panel to see quick numbers for that column — minimum, maximum, average, and percentiles — worked out across the whole dataset, not just the rows on screen. For editable formats (.duckdb, .parquet, .csv, .dta, .arrow/.arrows/.feather, .xlsx, .db/.sqlite), double-click a cell to change its value and save it straight back to the file; turn on Safe Mode first to keep an automatic backup and see exactly which rows changed before you commit to the edit. kdb+ tables are read directly in their real, original format — no conversion step — though they are view-only for now, since there is no way yet to write changes back into that format. Excel workbooks show one sheet per sidebar entry, and an edit rewrites just that one cell inside the workbook file, leaving the other sheets, the formulas and the cell formatting exactly as they were.",
   "publisher": "kemal-local",
   "version": "0.0.1",
   "private": true,
@@ -111,7 +111,7 @@
           "type": "number",
           "default": 200000,
           "minimum": 1,
-          "description": "Most points a chart will draw. A chart covers the whole series (the preview's LIMIT is stripped for it), so going over this refuses to draw and reports the real count rather than plotting a prefix that would look like a complete series."
+          "description": "Most points a chart will draw. A chart plots the rows your query returns, including its LIMIT, so going over this refuses to draw and reports the real count rather than plotting a prefix that would look like a complete series."
         },
     "dataFileViewer.debugLiveRefresh": {
           "type": "boolean",
@@ -141,6 +141,8 @@
     "watch": "node esbuild.js --watch",
     "typecheck": "tsc --noEmit",
     "test": "tsc -p tsconfig.test.json && node --test \"out-test/test/*.test.js\"",
+    "stress": "tsc -p tsconfig.test.json && node out-test/test/stress/run_stress.js",
+    "stress:foreign": "python3 test/stress/foreign/build_corpus.py",
     "package": "npm run build && npx vsce package"
   },
   "devDependencies": {
