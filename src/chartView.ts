@@ -15,7 +15,8 @@ import {
   GridComponent,
   TooltipComponent,
   LegendComponent,
-  DataZoomComponent,
+  DataZoomInsideComponent,
+  BrushComponent,
 } from 'echarts/components';
 import { CanvasRenderer } from 'echarts/renderers';
 
@@ -24,7 +25,10 @@ echarts.use([
   GridComponent,
   TooltipComponent,
   LegendComponent,
-  DataZoomComponent,
+  // Inside only -- the slider one draws the strip along the bottom, which is
+  // the thing being removed here. Dragging across the plot replaces it.
+  DataZoomInsideComponent,
+  BrushComponent,
   CanvasRenderer,
 ]);
 
@@ -51,6 +55,18 @@ type ChartMessage =
 // come into play when a query puts several numeric columns on one axis.
 const SERIES_COLOURS = ['#000080', '#b0532a', '#2e7d5b', '#7a3d8f', '#a3872c', '#3c6ea5'];
 
+// The chart page is white whatever the VS Code theme is, so these are stated
+// rather than read from --vscode-* variables. A chart is a figure: it gets
+// screenshotted, pasted into a document and printed, and a dark-theme one
+// arrives everywhere else as a negative of itself. Only this tab is white --
+// the grid still follows the theme.
+const INK = '#1f1f1f';
+const AXIS_LINE = '#8a8a8a';
+const SPLIT_LINE = '#e8e8e8';
+
+/** The x axis these charts always have exactly one of. */
+const X_AXIS_INDEX = 0;
+
 const vscode = acquireVsCodeApi();
 
 const root = document.getElementById('chart-root');
@@ -58,25 +74,33 @@ if (!root) throw new Error('missing #chart-root element');
 
 const titleEl = document.createElement('div');
 titleEl.className = 'chart-title';
+const plotEl = document.createElement('div');
+plotEl.className = 'chart-plot';
 const canvasEl = document.createElement('div');
 canvasEl.className = 'chart-canvas';
+// Reset lives over the plot rather than in a toolbox: ECharts' own "restore"
+// action resets legend selection along with zoom, so a user who had hidden a
+// series would see it come back just from zooming out.
+const resetEl = document.createElement('button');
+resetEl.className = 'chart-reset';
+resetEl.title = 'Reset zoom';
+resetEl.textContent = '⟲';
+resetEl.hidden = true;
+resetEl.addEventListener('click', () => {
+  chart?.dispatchAction({ type: 'dataZoom', xAxisIndex: X_AXIS_INDEX, start: 0, end: 100 });
+});
+plotEl.appendChild(canvasEl);
+plotEl.appendChild(resetEl);
 root.appendChild(titleEl);
-root.appendChild(canvasEl);
+root.appendChild(plotEl);
 
 let chart: echarts.ECharts | undefined;
-
-function themeTextColour(): string {
-  // The webview inherits VS Code's theme through CSS variables; reading the
-  // resolved value is what lets ECharts, which wants concrete colours, follow
-  // a light/dark switch instead of drawing black axes on a dark ground.
-  const styles = getComputedStyle(document.body);
-  return styles.getPropertyValue('--vscode-editor-foreground').trim() || '#333';
-}
 
 function showMessage(text: string): void {
   chart?.dispose();
   chart = undefined;
   titleEl.textContent = '';
+  resetEl.hidden = true;
   canvasEl.textContent = text;
 }
 
@@ -133,22 +157,35 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
 
   canvasEl.textContent = '';
   const points = `${drawn.toLocaleString()} point${drawn === 1 ? '' : 's'}`;
-  titleEl.textContent =
+  const heading =
     message.yColumns.length === 1
       ? `${message.yColumns[0]} by ${message.xColumn} — ${points}`
       : `${message.yColumns.length} series by ${message.xColumn} — ${points}`;
+  titleEl.textContent = heading;
+  const hintEl = document.createElement('span');
+  hintEl.className = 'chart-hint';
+  hintEl.textContent = 'drag across the plot to zoom · scroll to zoom · ⟲ to reset';
+  titleEl.appendChild(hintEl);
+  resetEl.hidden = false;
 
   chart?.dispose();
   chart = echarts.init(canvasEl, undefined, { renderer: 'canvas' });
-  const textColour = themeTextColour();
+  const axis = {
+    axisLabel: { color: INK },
+    axisLine: { lineStyle: { color: AXIS_LINE } },
+    axisTick: { lineStyle: { color: AXIS_LINE } },
+  };
   chart.setOption({
     animation: false,
-    textStyle: { color: textColour },
-    grid: { left: 64, right: 24, top: 16, bottom: 56 },
+    // Painted, not left transparent: the canvas is what a screenshot or an
+    // ECharts image export captures, and a transparent one picks up whatever
+    // is behind it.
+    backgroundColor: '#ffffff',
+    textStyle: { color: INK },
+    grid: { left: 64, right: 24, top: 16, bottom: message.yColumns.length > 1 ? 46 : 28 },
     // A single series has nothing to be told apart from, so its legend would
     // be a caption in the wrong place.
-    legend:
-      message.yColumns.length > 1 ? { bottom: 0, textStyle: { color: textColour } } : undefined,
+    legend: message.yColumns.length > 1 ? { bottom: 0, textStyle: { color: INK } } : undefined,
     tooltip: { trigger: 'axis' },
     xAxis: isCategory
       ? {
@@ -157,21 +194,57 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
           // spacing between its ticks, which is the honest thing to say about
           // strings we could not parse into dates.
           data: labels,
-          axisLabel: { color: textColour },
-          axisLine: { lineStyle: { color: textColour } },
+          ...axis,
         }
-      : {
-          type: 'time',
-          axisLabel: { color: textColour },
-          axisLine: { lineStyle: { color: textColour } },
-        },
-    yAxis: { type: 'value', scale: true, axisLabel: { color: textColour }, splitLine: { show: true } },
-    // Scroll/pinch to zoom in place, and a brush below for coarse navigation.
-    dataZoom: [
-      { type: 'inside' },
-      { type: 'slider', bottom: message.yColumns.length > 1 ? 24 : 8, height: 18 },
-    ],
+      : { type: 'time', ...axis },
+    yAxis: {
+      type: 'value',
+      scale: true,
+      ...axis,
+      splitLine: { show: true, lineStyle: { color: SPLIT_LINE } },
+    },
+    // Wheel/pinch zoom in place. No slider: the whole series is on screen to
+    // begin with, and a strip along the bottom is a second, smaller copy of
+    // the chart that has to be aimed at. Dragging on the plot itself is the
+    // gesture that replaces it -- see the brush below.
+    dataZoom: [{ type: 'inside', xAxisIndex: X_AXIS_INDEX }],
+    // Drag-to-zoom is built on `brush`, not on the toolbox dataZoom feature's
+    // own cursor mode: that mode is registered BY the toolbox feature, so
+    // hiding its icons unregisters dragging with them, and showing them
+    // desyncs their highlight from the cursor mode forced on below. `brush` is
+    // a standalone component, so its cursor works with no toolbox at all.
+    // `lineX` restricts a drag to an x-range, which is the only selection that
+    // means anything for a time series.
+    brush: {
+      xAxisIndex: X_AXIS_INDEX,
+      brushType: 'lineX',
+      brushMode: 'single',
+      throttleType: 'debounce',
+      throttleDelay: 80,
+      brushStyle: { borderWidth: 0, color: 'rgba(0, 0, 128, 0.10)' },
+    },
     series,
+  });
+
+  // Turn the dragged range into a zoom, then clear the shape so the next drag
+  // starts from a clean plot rather than on top of the last selection.
+  chart.on('brushEnd', (params: unknown) => {
+    const range = (params as { areas?: { coordRange?: number[] }[] }).areas?.[0]?.coordRange;
+    if (!range || range.length < 2 || range[0] === range[1]) return;
+    chart?.dispatchAction({
+      type: 'dataZoom',
+      xAxisIndex: X_AXIS_INDEX,
+      startValue: range[0],
+      endValue: range[1],
+    });
+    chart?.dispatchAction({ type: 'brush', areas: [] });
+  });
+
+  // Brush mode on by default, so a drag zooms without arming anything first.
+  chart.dispatchAction({
+    type: 'takeGlobalCursor',
+    key: 'brush',
+    brushOption: { brushType: 'lineX', brushMode: 'single' },
   });
 }
 

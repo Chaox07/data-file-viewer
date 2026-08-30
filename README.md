@@ -195,6 +195,14 @@ Every results grid — table previews and hand-written queries alike — gets:
   chart in its own VS Code tab beside the grid. Plotting a second column
   redraws the same tab rather than opening another one.
 
+  The chart opens showing the whole series, and you **drag across the plot**
+  to zoom into a range — the scroll wheel zooms too, and ⟲ in the top right
+  puts it back. There is no slider along the bottom: that is a second, smaller
+  copy of the chart you have to aim at before you can look at the real one.
+  The tab is white whatever your editor theme is, since a chart is a figure —
+  it ends up in screenshots and documents, where a dark one reads as a
+  negative of itself.
+
   The chart is always of the **whole** series. A preview runs `LIMIT 100`,
   and charting those hundred rows of a longer series would draw a line that
   stops early and looks exactly like a series that ends early — so the
