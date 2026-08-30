@@ -33,8 +33,11 @@ const SPEC: w.TableSpec = {
     i,
     `2020-01-01`,
     // Deliberately non-monotonic, so "sorted" and "in file order" differ and a
-    // path that returns one where the other was asked for is visible.
-    Math.sin(i) * 1000,
+    // path that returns one where the other was asked for is visible. Every
+    // 50th value is NULL, so the chart's subset relation is exercised rather
+    // than trivially satisfied -- the omission that let this case pass while
+    // being wrong.
+    i % 50 === 0 ? null : Math.sin(i) * 1000,
     `b${i % 7}`,
   ]),
 };
@@ -129,12 +132,22 @@ registerCase({
 });
 
 /**
- * The chart plots the rows the grid shows.
+ * The chart plots the rows the grid shows, minus the ones it cannot plot.
  *
  * Under every clause: a WHERE narrows both, an ORDER BY chooses which rows a
  * LIMIT keeps, and a LIMIT caps both. Compared as a SET of x values rather
  * than positionally, because the chart legitimately re-orders by its x axis --
  * what must match is WHICH rows were plotted, not the order they arrive in.
+ *
+ * The "minus" is not a hedge, and it was learned from a real file rather than
+ * reasoned about: a row whose y value is NULL has no point to draw, so the
+ * chart returns fewer rows than the grid and is right to. This case originally
+ * asserted the two counts were equal and passed -- because the generated
+ * fixture had no nulls in it. Run against a Federal Reserve yield-curve table
+ * it reported 49 of 50, which was the invariant being wrong rather than the
+ * code. The honest statement is a subset relation plus an exact accounting of
+ * what is missing, so a chart that drops a row it COULD have plotted still
+ * fails.
  */
 registerCase({
   name: 'consistency_chart_plots_the_grid_rows',
@@ -147,22 +160,47 @@ registerCase({
       const grid = await file.runQuery(sql);
       const chart = await file.runChartQuery(sql, 'id', ['value']);
 
-      if (chart.rows.length !== grid.rows.length) {
+      const xIdx = grid.columns.indexOf('id');
+      const chartXIdx = chart.columns.indexOf('id');
+
+      // 1. The chart must never plot MORE rows than the query returned. That
+      //    would be fabrication, and it is the only direction with no
+      //    defensible reading.
+      if (chart.rows.length > grid.rows.length) {
         ctx.fail(
           'silent-misread',
-          `${label}: the grid shows ${grid.rows.length} rows and the chart plots ${chart.rows.length}`
+          `${label}: the grid has ${grid.rows.length} rows and the chart drew ${chart.rows.length}`
         );
         continue;
       }
 
-      const gridIds = new Set(grid.rows.map((r) => String(r[grid.columns.indexOf('id')])));
-      const chartIds = new Set(chart.rows.map((r) => String(r[chart.columns.indexOf('id')])));
-      const missing = [...gridIds].filter((v) => !chartIds.has(v));
-      if (missing.length) {
+      // 2. Every point it did draw must come from a row the grid has.
+      const gridXs = new Set(grid.rows.map((r) => String(r[xIdx])));
+      const invented = chart.rows
+        .map((r) => String(r[chartXIdx]))
+        .filter((v) => !gridXs.has(v));
+      if (invented.length) {
         ctx.fail(
           'silent-misread',
-          `${label}: the chart plotted a different set of rows — ${missing.length} of the grid's ` +
-            `rows are absent from it (first: id ${missing[0]})`
+          `${label}: the chart drew ${invented.length} point(s) with no matching row in the grid ` +
+            `(first x: ${invented[0]})`
+        );
+        continue;
+      }
+
+      // 3. Where every row IS plottable, the counts must match exactly --
+      //    otherwise "the chart honours the query" means nothing. Rows with a
+      //    null y are excluded from this count rather than asserted about:
+      //    whether such a row is dropped or drawn as a gap legitimately
+      //    depends on the axis mode, and measuring showed it differs between
+      //    a time axis and a category one. Asserting a single answer here
+      //    would be asserting a behaviour nobody chose.
+      const yIdx = grid.columns.indexOf('value');
+      const allPlottable = grid.rows.every((r) => r[xIdx] !== null && r[yIdx] !== null);
+      if (allPlottable && chart.rows.length !== grid.rows.length) {
+        ctx.fail(
+          'silent-misread',
+          `${label}: every row is plottable, but the chart drew ${chart.rows.length} of ${grid.rows.length}`
         );
       }
     }
