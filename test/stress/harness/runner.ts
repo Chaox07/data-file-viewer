@@ -98,9 +98,12 @@ export async function runCase(c: Case): Promise<Outcome> {
           message: `refused, but for the wrong reason: expected ${String(pattern)}, got "${message}"`,
         });
       }
-    } else {
+    } else if (!c.expect.mayRefuse) {
       findings.push({ severity: 'crash', message });
     }
+    // mayRefuse: a refusal is one of the two acceptable outcomes, so there is
+    // nothing to report. The other outcome is checked above, on the path where
+    // the file actually opened.
   } finally {
     // Guarded: the roundtrip family has to close the file before reopening it
     // (a .duckdb holds a write lock), so by the time the runner gets here the

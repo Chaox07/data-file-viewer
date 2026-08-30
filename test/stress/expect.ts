@@ -46,6 +46,21 @@ export interface Expectation {
   refuses?: string | RegExp | true;
 
   /**
+   * Refusing is ACCEPTABLE here, but not required.
+   *
+   * For damage whose consequences are genuinely open: a flipped byte may land
+   * in slack space, inside a checksum-protected block that recovers, or in a
+   * value that is still a valid value of its type. Demanding a refusal would
+   * be demanding that the reader detect corruption it has no way to see.
+   *
+   * What is NOT acceptable is the third outcome -- opening, drawing a grid,
+   * and showing something that is not what the file holds. So a case with this
+   * set passes when it refuses, and otherwise runs its `check` to prove what
+   * it displayed was right.
+   */
+  mayRefuse?: boolean;
+
+  /**
    * Warnings the user must be SHOWN -- openWarnings plus takeLateWarnings().
    * For the cases whose whole point is that something was said out loud. A
    * blanked #DIV/0! cell is indistinguishable from an empty cell in the grid;
