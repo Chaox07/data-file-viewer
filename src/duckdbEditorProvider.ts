@@ -640,6 +640,58 @@ async function reportRowTotal(
   webview.postMessage({ command: 'rowTotal', sql, total });
 }
 
+/**
+ * Warnings an EDIT raised, and the one offer that can act on them.
+ *
+ * Text written into a numeric column saves correctly and then reads back
+ * blank -- the file is right, the column's inferred type is what hides it. The
+ * warning says so; this is where the way out is offered, because re-reading the
+ * sheet as text is a trade (no numeric sort, no stats, no chart on that sheet)
+ * that belongs to the user rather than to the viewer.
+ */
+async function reportEditWarnings(document: DuckDBDocument, webview: vscode.Webview): Promise<void> {
+  const warnings = document.file.takeLateWarnings();
+  const sheet = document.file.takeReadAsTextOffer();
+  const name = basename(document.uri.fsPath);
+  for (const warning of warnings) {
+    if (!sheet) {
+      void vscode.window.showWarningMessage(`${name}: ${warning}`);
+      continue;
+    }
+    const action = 'Read this sheet as text';
+    const chosen = await vscode.window.showWarningMessage(`${name}: ${warning}`, action);
+    if (chosen !== action) continue;
+    try {
+      await document.runExclusive(() => document.file.readSheetAsText(sheet));
+    } catch (err) {
+      void vscode.window.showErrorMessage(`${name}: ${(err as Error).message}`);
+      continue;
+    }
+    // The grid is still showing the pre-edit typing of the column, so re-run
+    // whatever produced it rather than leaving the user to guess that the fix
+    // landed. Deliberately not a live tick: this is a schema change, not new data.
+    if (!document.lastSql) continue;
+    const sql = document.lastSql;
+    try {
+      const result = await document.runExclusive(() => document.file.runQuery(sql, getMaxResultRows()));
+      const editability = await document.runExclusive(() => document.file.checkEditableSelect(sql));
+      document.lastEditableTable = editability.editable ? editability.table : undefined;
+      document.lastEditableColumns = editability.editable ? editability.columns : undefined;
+      webview.postMessage({
+        command: 'queryResult',
+        ...result,
+        diffSkipped: false,
+        hasLimit: hasTrailingLimit(sql),
+        editable: editability.editable,
+        editableTable: editability.editable ? editability.table : undefined,
+      });
+      void reportRowTotal(document, webview, sql, result);
+    } catch (err) {
+      webview.postMessage({ command: 'error', message: (err as Error).message });
+    }
+  }
+}
+
 async function startLiveRefresh(
   document: DuckDBDocument,
   webview: vscode.Webview,
@@ -1368,6 +1420,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
               rowValues: message.rowValues,
               rowsMatched,
             });
+            await reportEditWarnings(document, webview);
           }
         } catch (err) {
           webview.postMessage({ command: 'cellUpdateError', column: message.column, message: (err as Error).message });

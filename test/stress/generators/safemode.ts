@@ -266,3 +266,72 @@ registerCase({
     }
   },
 });
+
+/**
+ * One sheet holding an uncomputable cell must not cost the others their status.
+ *
+ * `compareToBackup` is what the sidebar's change badges come from, and it walks
+ * every table in the workbook. Its diff query does NOT go through `runQuery`,
+ * so the lazy `ignore_errors` repair never fired for it -- one `#DIV/0!`
+ * anywhere in the book threw, and the whole comparison ended there. Every other
+ * sheet lost its badge because of a cell in a sheet the user may never open.
+ *
+ * Found on a real workbook (merged_excel.xlsx: `current_account` has a
+ * `#DIV/0!` at E122) while checking that Safe Mode still worked, not by the
+ * suite -- the generated corpus had no workbook that mixed a bad cell with
+ * sheets that were fine.
+ *
+ * Both halves are asserted: every sheet gets a status, and the repair the retry
+ * depends on has to be applied to the BACKUP's views too, or the two sides read
+ * that sheet differently and the diff reports a change that is not there.
+ */
+registerCase({
+  name: 'safemode_error_value_does_not_end_the_comparison',
+  family: 'safemode',
+  expect: { note: 'a #DIV/0! in one sheet leaves every other sheet its change status' },
+  build: async (ctx) => ({
+    path: await w.xlsxFile(join(ctx.dir, 'mixed.xlsx'), [
+      { name: 'clean', rows: [['id', 'label'], [1, 'alpha'], [2, 'beta']] },
+      { name: 'broken', rows: [['id', 'amount'], [1, 1.5], [2, '#DIV/0!'], [3, 3.5]] },
+      { name: 'alsoclean', rows: [['id', 'label'], [1, 'gamma']] },
+    ]),
+  }),
+  check: async (file, ctx) => {
+    await file.createBackup();
+    let status: Record<string, string>;
+    try {
+      status = await file.compareToBackup();
+    } catch (err) {
+      ctx.fail(
+        'crash',
+        `one sheet's uncomputable cell ended the whole comparison: ${
+          err instanceof Error ? err.message.split('\n')[0] : String(err)
+        }`
+      );
+      return;
+    }
+
+    for (const sheet of ['clean', 'alsoclean']) {
+      if (!(sheet in status)) {
+        ctx.fail('bad-message', `"${sheet}" has nothing wrong with it and got no change status`);
+      } else if (status[sheet] !== 'unchanged') {
+        ctx.fail(
+          'silent-misread',
+          `"${sheet}" is untouched since the backup and was reported as "${status[sheet]}"`
+        );
+      }
+    }
+    // And the sheet with the bad cell gets a status of its own, which is the
+    // half that needs the repair rather than merely surviving without it:
+    // isolating the failure would leave this sheet permanently unbadged, so
+    // asserting only on the others would pass with the repair deleted. It
+    // reads identically on both sides once both are repaired, so it is
+    // unchanged -- anything else sends the user looking for an edit nobody made.
+    if (status.broken !== 'unchanged') {
+      ctx.fail(
+        'silent-misread',
+        `nothing was edited, and the sheet holding #DIV/0! was reported as "${status.broken ?? 'nothing at all'}"`
+      );
+    }
+  },
+});

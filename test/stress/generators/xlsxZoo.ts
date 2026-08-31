@@ -275,36 +275,16 @@ registerCase({
   },
 });
 
-/** Editing a cell to null, and to text, in a numeric column. */
+/** Editing a cell to null, and to numbers a naive check would skip, in a numeric column. */
 for (const [slug, value, note] of [
   ['to_null', null, 'clearing a numeric cell'],
-  ['to_text', 'n/a', 'putting text into a numeric column'],  // pinned below
   ['to_negative', -12.5, 'a negative number'],
   ['to_zero', 0, 'zero, which a falsy check would skip'],
 ] as const) {
   registerCase({
     name: `xlsx_edit_${slug}`,
     family: 'xlsxZoo',
-    expect: {
-      note: `${note} is written and reads back`,
-      // Typing text into a column read_xlsx typed as numeric writes the cell
-      // correctly -- verified in the XML: C4 becomes an inlineStr holding
-      // "n/a", and Excel shows it -- but on reload read_xlsx types the column
-      // DOUBLE from its three remaining numbers, fails on the text, and the
-      // lazy ignore_errors repair blanks it. So the user types a value, the
-      // file is right, and the cell they typed into goes empty in front of
-      // them. Worse, the warning they get blames "#DIV/0!, #N/A, #REF! and the
-      // like" -- Excel error values -- for a word they typed themselves.
-      //
-      // Pinned rather than fixed: the honest repairs are to detect the
-      // type conflict at edit time and say so, or to read a mixed column as
-      // VARCHAR. Both are product decisions about a trade-off that already has
-      // a considered answer written into repairXlsxViewsForCellErrors.
-      knownBug:
-        slug === 'to_text'
-          ? 'text typed into a numeric column is written to the file correctly but reads back as null, and the warning shown blames Excel error values rather than the edit'
-          : undefined,
-    },
+    expect: { note: `${note} is written and reads back` },
     build: async (ctx) => ({
       path: await w.xlsxFile(join(ctx.dir, `${slug}.xlsx`), [
         { name: 'data', rows: [HEADER, ...BODY] },
@@ -317,9 +297,228 @@ for (const [slug, value, note] of [
   });
 }
 
+/**
+ * Text typed into a numeric column: right in the file, blank in the grid.
+ *
+ * The write is correct and always was -- verified in the XML, the cell becomes
+ * an inlineStr holding "n/a" and Excel displays it. What went wrong was
+ * everything after: on reload `read_xlsx` types the column DOUBLE from its
+ * three remaining numbers, refuses the text, and the `ignore_errors` repair
+ * blanks it. The user typed a value and watched the cell go empty while the
+ * file on disk was right -- and the warning they got blamed "#DIV/0!, #N/A,
+ * #REF! and the like" for a word they had typed themselves thirty seconds
+ * earlier.
+ *
+ * Neither half is pinned any more, and this case is now the contract for both:
+ * the edit still happens (refusing it would lose a legitimate value Excel
+ * honours), the warning describes what actually occurred, and the way out --
+ * reading that one sheet as text -- makes the value visible.
+ */
+registerCase({
+  name: 'xlsx_edit_to_text',
+  family: 'xlsxZoo',
+  expect: {
+    note: 'text put into a numeric column is written, explained honestly, and readable as text',
+  },
+  build: async (ctx) => ({
+    path: await w.xlsxFile(join(ctx.dir, 'to_text.xlsx'), [
+      { name: 'data', rows: [HEADER, ...BODY] },
+      { name: 'keep', rows: [['untouched']] },
+    ]),
+  }),
+  check: async (file, ctx, built) => {
+    const before = await readTable(file, 'data');
+    const rowValues: Record<string, unknown> = {};
+    before.columns.forEach((c, i) => {
+      rowValues[c] = before.rows[2][i];
+    });
+
+    const changed = await file.updateCell('data', 'amount', 'n/a', rowValues);
+    const saidAtEdit = file.takeLateWarnings();
+    file.dispose();
+    if (changed !== 1) {
+      ctx.fail('lost-edit', `updateCell reported ${changed} rows changed, expected 1`);
+      return;
+    }
+
+    // The user must be told, at the moment they do it, that what they will see
+    // is not what the file now holds.
+    if (!saidAtEdit.some((s) => s.includes('n/a') && s.includes('amount'))) {
+      ctx.fail(
+        'silent-misread',
+        `the edit was saved but shows as blank, and nothing named the value or the column: ${
+          saidAtEdit.join(' | ') || '(nothing)'
+        }`
+      );
+    }
+
+    const { DuckDbFile } = await import('../../../src/duckdbConnection');
+    const reopened = await DuckDbFile.open(built.path);
+    try {
+      // Reading normally, the cell is blank -- that part is read_xlsx's type
+      // inference and is not fixable from here. What must not happen is it
+      // being blamed on an Excel error value nobody put in the file.
+      const blanked = await readTable(reopened, 'data');
+      const said = [...reopened.openWarnings, ...reopened.takeLateWarnings()];
+      if (said.some((s) => /could not compute/i.test(s))) {
+        ctx.fail('bad-message', `a word the user typed was reported as an Excel error value: ${said.join(' | ')}`);
+      }
+      if (blanked.rows.length !== BODY.length) {
+        ctx.fail('silent-corruption', `the sheet had ${BODY.length} rows before the edit and ${blanked.rows.length} after`);
+      }
+
+      // And the way out works, for that sheet only.
+      await reopened.readSheetAsText('data');
+      const asText = await readTable(reopened, 'data');
+      if (String(asText.rows[2][2]) !== 'n/a') {
+        ctx.fail(
+          'lost-edit',
+          `read as text, the cell should hold "n/a"; it holds ${JSON.stringify(asText.rows[2][2])}`
+        );
+      }
+      for (let r = 0; r < BODY.length; r++) {
+        for (let c = 0; c < HEADER.length; c++) {
+          if (r === 2 && c === 2) continue;
+          if (String(asText.rows[r][c]) !== String(BODY[r][c])) {
+            ctx.fail(
+              'silent-corruption',
+              `row ${r} column ${HEADER[c]} was ${JSON.stringify(BODY[r][c])} and is now ${JSON.stringify(
+                asText.rows[r][c]
+              )}`
+            );
+          }
+        }
+      }
+    } finally {
+      reopened.dispose();
+    }
+  },
+});
+
 // ---------------------------------------------------------------------------
 // Refusals that must stay refusals
 // ---------------------------------------------------------------------------
+
+/**
+ * A sheet that is being read CORRECTLY must be left alone.
+ *
+ * The counterweight to the raw-rectangle rescue, and the more important half:
+ * a rescue that fires when it should not is worse than the bug it fixes,
+ * because it replaces a correct table -- named columns, sortable numbers,
+ * editable -- with a grid of spreadsheet letters read as text.
+ *
+ * Both shapes here come from a workbook in daily use, and both fooled a version
+ * of the check that shipped nowhere only because it was run against real files:
+ *
+ *   - `<dimension>` over-declaring. Excel writes the rectangle it once touched,
+ *     not the one holding data: `efektif_kur` declares three columns for two
+ *     columns of data, `chain_gdp` twelve for ten. Judged against the declared
+ *     rectangle, five of that workbook's ten sheets were rewritten.
+ *   - a stray `<c r="C3"/>`, an empty cell left behind by formatting, which
+ *     makes a row look one column wider than it is to anything counting cells
+ *     rather than values.
+ *   - footnotes UNDER the table that are wider than the table: `Veri Kaynağı |
+ *     TCMB` sits in three columns beneath two columns of data. Judged against
+ *     the widest row, the sheet again looks like it is missing a column.
+ */
+const LEFT_ALONE: [string, w.SheetSpec, string][] = [
+  [
+    'over_declared_dimension',
+    {
+      name: 'data',
+      rows: [['Date', 'value'], ['1996-1Q', 1.5], ['1996-2Q', 2.5]],
+      dimension: 'A1:C133',
+      emptyCells: ['C2'],
+    },
+    'a dimension claiming a third column that holds nothing, plus an empty cell in it',
+  ],
+  [
+    'notes_below_are_wider',
+    {
+      name: 'data',
+      rows: [
+        ['Date', 'value'],
+        ['1996-1Q', 1.5],
+        ['1996-2Q', 2.5],
+        [],
+        ['TP.RK.T1.Y', 'Veri Kaynağı', 'TCMB'],
+        ['TP.RK.T1.Y', 'Gözlem', 'Bitiş'],
+      ],
+      dimension: 'A1:C6',
+    },
+    'footnotes below the table occupying more columns than the table itself',
+  ],
+];
+
+for (const [slug, spec, note] of LEFT_ALONE) {
+  registerCase({
+    name: `xlsx_reads_normally_with_${slug}`,
+    family: 'xlsxZoo',
+    expect: {
+      note: `${note} — the sheet still reads with its own header, and stays editable`,
+      hasColumns: ['Date', 'value'],
+      lacksColumns: ['A', 'B', 'C'],
+    },
+    build: async (ctx) => ({ path: await w.xlsxFile(join(ctx.dir, `${slug}.xlsx`), [spec]) }),
+    check: async (file, ctx) => {
+      const editability = await file.checkEditableSelect('select * from "data"');
+      if (!editability.editable) {
+        ctx.fail('crash', 'a correctly-read sheet was made view-only, so its edits are gone');
+      }
+      const said = [...file.openWarnings, ...file.takeLateWarnings()];
+      if (said.some((s) => /laid out|read as empty/.test(s))) {
+        ctx.fail('bad-message', `a correctly-read sheet was reported as unreadable: ${said.join(' | ')}`);
+      }
+    },
+  });
+}
+
+/**
+ * A sheet shown as its raw rectangle must refuse an edit.
+ *
+ * When no header row can be found the sheet is shown exactly as laid out, and
+ * its columns are the spreadsheet's own letters -- `A`, `B`, `C` -- not names
+ * taken from the sheet. xlsxWrite reaches a cell by matching the grid's column
+ * NAME against the header row in the XML, so there is nothing here for it to
+ * match. The failure this guards against is not a crash: it is a value written
+ * into the wrong column of a workbook the user has been keeping for years.
+ *
+ * Asserted at BOTH gates. checkEditableSelect is what stops the UI offering the
+ * edit; updateCell is what stops anything that got past it.
+ */
+registerCase({
+  name: 'xlsx_refuses_edit_to_raw_rectangle_sheet',
+  family: 'xlsxZoo',
+  expect: {
+    note: 'a sheet with no findable header is view-only, at both the editability gate and the writer',
+    says: [/laid out|read as empty/],
+  },
+  build: async (ctx) => ({
+    path: await w.xlsxFile(join(ctx.dir, 'raw.xlsx'), [
+      { name: 'data', rows: w.withNotes(HEADER, BODY, { above: [['Quarterly figures']] }) },
+    ]),
+  }),
+  check: async (file, ctx) => {
+    const editability = await file.checkEditableSelect('select * from "data"');
+    if (editability.editable) {
+      ctx.fail('silent-corruption', 'a raw-rectangle sheet was offered as editable, so an edit would land by column letter');
+    }
+    const before = await readTable(file, 'data');
+    const rowValues: Record<string, unknown> = {};
+    before.columns.forEach((c, i) => {
+      rowValues[c] = before.rows[2][i];
+    });
+    try {
+      await file.updateCell('data', before.columns[1], 'EDITED', rowValues);
+      ctx.fail('silent-corruption', 'updateCell wrote to a sheet whose columns are spreadsheet letters');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!/view-only|no header/i.test(message)) {
+        ctx.fail('bad-message', `refused, but for a reason the user cannot act on: ${message}`);
+      }
+    }
+  },
+});
 
 /**
  * Two rows identical across every column.
