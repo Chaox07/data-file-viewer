@@ -129,6 +129,60 @@ export function toCategoryValues(ys: unknown[]): (number | null)[] {
   return ys.map(toFiniteNumber);
 }
 
+/** Which mark the chart draws its series with. Toggled from the chart tab. */
+export type ChartMode = 'line' | 'scatter';
+
+/** Line width -- `linewidth * 2` (0.7 * 2) in long_run_3.R's ECharts branch. */
+const LINE_WIDTH = 1.4;
+
+/**
+ * Point size -- `point_size * 4` (1.8 * 4) in the `raw_type == "scatter"` branch
+ * of long_run_3.R. Ported rather than chosen, like every other number in this
+ * file: the R script has had this exact toggle all along, and the two draw the
+ * same series with the same mark at the same size.
+ */
+const SCATTER_SYMBOL_SIZE = 7.2;
+
+/** The per-series style fields that differ between the two marks. */
+export interface SeriesShape {
+  type: ChartMode;
+  itemStyle: { color: string };
+  showSymbol?: boolean;
+  symbolSize?: number;
+  lineStyle?: { color: string; width: number };
+}
+
+/**
+ * The mark for one series, as plain data -- this module stays ECharts-free so
+ * the numbers in it can be pinned by tests.
+ *
+ * Both branches are ports, from the `raw_type == "line"` and
+ * `raw_type == "scatter"` arms of long_run_3.R: line with `symbol = "none"` and
+ * a 1.4 stroke, scatter with a 7.2 circle and the colour moved from lineStyle
+ * to itemStyle. The `large`/`progressive` settings the R traces also carry are
+ * the same for both marks, so chartView.ts keeps them rather than repeating
+ * them here.
+ *
+ * A scatter carries NO lineStyle at all rather than a zero-width one: the two
+ * look identical until something merges a width back in, and "a scatter with a
+ * hairline through it" is the failure this shape exists to make impossible.
+ * Both marks take the same colour, so toggling changes the mark and nothing
+ * else about how the series reads.
+ */
+export function seriesShape(mode: ChartMode, colour: string): SeriesShape {
+  if (mode === 'scatter') {
+    return { type: 'scatter', symbolSize: SCATTER_SYMBOL_SIZE, itemStyle: { color: colour } };
+  }
+  return {
+    type: 'line',
+    // The line IS the mark here, so the points themselves stay unmarked --
+    // symbols on a 60-year daily series draw a smear, not a series.
+    showSymbol: false,
+    lineStyle: { color: colour, width: LINE_WIDTH },
+    itemStyle: { color: colour },
+  };
+}
+
 /**
  * Axis padding and tick placement, ported from the R plotting helpers so that
  * a series charted here and the same series charted by long_run_3.R are the

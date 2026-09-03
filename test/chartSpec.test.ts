@@ -14,6 +14,7 @@ import {
   evenBreaks,
   axisDateLabel,
   pointDateLabel,
+  seriesShape,
 } from '../src/chartSpec';
 
 // ------------------------------------------------------------- picking an x
@@ -266,4 +267,37 @@ test('dates are read in UTC, not in the viewer timezone', () => {
 
 test('an unparseable instant labels as empty rather than "Invalid Date"', () => {
   assert.equal(pointDateLabel(Number.NaN, undefined), '');
+});
+
+// ------------------------------------------------------ the mark, either way
+// Also ported: the two arms of `raw_type` in
+// Kod/R/Time_Series_Plotting/long_run_3.R, which has had this line/scatter
+// switch all along. 1.4 is `linewidth * 2` there and 7.2 is `point_size * 4`.
+
+test('a line is drawn at 1.4 with no symbols on its points', () => {
+  assert.deepEqual(seriesShape('line', '#000080'), {
+    type: 'line',
+    showSymbol: false,
+    lineStyle: { color: '#000080', width: 1.4 },
+    itemStyle: { color: '#000080' },
+  });
+});
+
+test('a scatter is drawn as 7.2 points and carries no line at all', () => {
+  // Not even a zero-width one: the two look identical until something merges a
+  // width back in, and a scatter with a hairline through it is not a scatter.
+  const shape = seriesShape('scatter', '#000080');
+  assert.deepEqual(shape, {
+    type: 'scatter',
+    symbolSize: 7.2,
+    itemStyle: { color: '#000080' },
+  });
+  assert.equal('lineStyle' in shape, false);
+});
+
+test('both marks take the colour they are given, so toggling changes only the mark', () => {
+  const colour = '#b0532a';
+  assert.equal(seriesShape('line', colour).lineStyle?.color, colour);
+  assert.equal(seriesShape('scatter', colour).itemStyle.color, colour);
+  assert.equal(seriesShape('line', colour).itemStyle.color, colour);
 });

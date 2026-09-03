@@ -14,6 +14,8 @@ import {
   evenBreaks,
   axisDateLabel,
   pointDateLabel,
+  seriesShape,
+  type ChartMode,
   type SeriesFrequency,
 } from './chartSpec';
 // Modular import rather than `from 'echarts'`: the umbrella entry point
@@ -21,7 +23,7 @@ import {
 // 1.5 MB. This registers the line chart and the components actually used
 // below, and nothing else.
 import * as echarts from 'echarts/core';
-import { LineChart } from 'echarts/charts';
+import { LineChart, ScatterChart } from 'echarts/charts';
 import {
   GridComponent,
   TooltipComponent,
@@ -33,6 +35,11 @@ import { CanvasRenderer } from 'echarts/renderers';
 
 echarts.use([
   LineChart,
+  // The scatter the toolbar toggles to. A real series type rather than a line
+  // with its width set to zero: the scatter renderer has its own large-mode
+  // point painter, and a 200,000-point line asked to draw a symbol per point
+  // instead draws 200,000 graphic elements.
+  ScatterChart,
   GridComponent,
   TooltipComponent,
   LegendComponent,
@@ -119,17 +126,28 @@ const plotEl = document.createElement('div');
 plotEl.className = 'chart-plot';
 const canvasEl = document.createElement('div');
 canvasEl.className = 'chart-canvas';
-// Reset lives over the plot rather than in a toolbox: ECharts' own "restore"
-// action resets legend selection along with zoom, so a user who had hidden a
-// series would see it come back just from zooming out.
+// The tools live over the plot rather than in ECharts' toolbox: its own
+// "restore" action resets legend selection along with zoom, so a user who had
+// hidden a series would see it come back just from zooming out.
+const toolsEl = document.createElement('div');
+toolsEl.className = 'chart-tools';
+// Hidden as a group -- there is nothing to reset or reshape until a chart is
+// actually drawn, and a toolbar over an error message is furniture.
+toolsEl.hidden = true;
+// Each button says what pressing it DOES, not what is on screen: the mark
+// currently drawn is already visible in the plot.
+const modeEl = document.createElement('button');
+modeEl.className = 'chart-mode';
+modeEl.addEventListener('click', () => setMode(mode === 'line' ? 'scatter' : 'line'));
 const resetEl = document.createElement('button');
 resetEl.className = 'chart-reset';
 resetEl.title = 'Reset zoom (or double-click the plot)';
 resetEl.textContent = '⟲';
-resetEl.hidden = true;
 resetEl.addEventListener('click', () => resetZoom());
+toolsEl.appendChild(modeEl);
+toolsEl.appendChild(resetEl);
 plotEl.appendChild(canvasEl);
-plotEl.appendChild(resetEl);
+plotEl.appendChild(toolsEl);
 root.appendChild(titleEl);
 root.appendChild(plotEl);
 
@@ -143,6 +161,52 @@ canvasEl.addEventListener('dblclick', () => resetZoom());
 
 let chart: echarts.ECharts | undefined;
 
+/**
+ * The mark the plot is drawn with. Deliberately NOT carried across plots --
+ * render() puts it back to 'line', so clicking a column always starts from the
+ * chart the R scripts draw, and a scatter is something you asked for about the
+ * series in front of you.
+ */
+let mode: ChartMode = 'line';
+
+/**
+ * render()'s series builder, kept so the toolbar can rebuild them for the other
+ * mark without re-running the whole draw. Undefined until something is drawn.
+ */
+let buildSeries: ((mode: ChartMode) => unknown[]) | undefined;
+
+/** Brush mode on, so a drag zooms without arming anything first. */
+function armBrush(): void {
+  chart?.dispatchAction({
+    type: 'takeGlobalCursor',
+    key: 'brush',
+    brushOption: { brushType: 'lineX', brushMode: 'single' },
+  });
+}
+
+function syncModeButton(): void {
+  modeEl.textContent = mode === 'line' ? '∴' : '∿';
+  modeEl.title = mode === 'line' ? 'Show as a scatter' : 'Show as a line';
+}
+
+function setMode(next: ChartMode): void {
+  if (next === mode) return;
+  mode = next;
+  syncModeButton();
+  if (!chart || !buildSeries) return;
+  // replaceMerge over a plain merge, and over a full redraw: it swaps the
+  // series wholesale -- a line and a scatter share no style fields to reconcile
+  // -- while leaving dataZoom, brush, legend and tooltip untouched. So the
+  // toggle keeps the range you had zoomed into and any series you had hidden,
+  // where re-running render() would reset both.
+  chart.setOption({ series: buildSeries(mode) }, { replaceMerge: 'series' });
+  // Re-armed rather than assumed: the brush cursor is a mode held outside the
+  // option tree, and a chart you could no longer drag-zoom on after one click
+  // of a toolbar button would be a strange thing to debug later. Dispatching it
+  // again when it was already on costs nothing.
+  armBrush();
+}
+
 function resetZoom(): void {
   if (!chart) return;
   chart.dispatchAction({ type: 'dataZoom', xAxisIndex: X_AXIS_INDEX, start: 0, end: 100 });
@@ -152,8 +216,9 @@ function resetZoom(): void {
 function showMessage(text: string): void {
   chart?.dispose();
   chart = undefined;
+  buildSeries = undefined;
   titleEl.textContent = '';
-  resetEl.hidden = true;
+  toolsEl.hidden = true;
   canvasEl.textContent = text;
 }
 
@@ -242,30 +307,39 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
   const xs = message.rows.map((row) => row[xIndex]);
   const labels = isCategory ? toCategoryLabels(xs) : [];
 
-  const series = message.yColumns.map((name, i) => {
+  // Built once and reused for both marks: only the style fields seriesShape
+  // owns differ between a line and a scatter, and re-deriving the points on
+  // every toggle would walk every row again for a change of stroke.
+  const data = message.yColumns.map((name) => {
     const yIndex = message.columns.indexOf(name);
     const ys = yIndex < 0 ? [] : message.rows.map((row) => row[yIndex]);
-    const colour = SERIES_COLOURS[i % SERIES_COLOURS.length];
-    return {
+    // No connectNulls: a gap in a series is a fact about the data, and joining
+    // across it draws a segment nobody measured.
+    return isCategory ? toCategoryValues(ys) : toSeriesPoints(xs, ys);
+  });
+
+  buildSeries = (forMode: ChartMode) =>
+    message.yColumns.map((name, i) => ({
       name,
-      type: 'line' as const,
-      showSymbol: false,
-      // No connectNulls: a gap in a series is a fact about the data, and
-      // joining across it draws a segment nobody measured.
-      data: isCategory ? toCategoryValues(ys) : toSeriesPoints(xs, ys),
-      lineStyle: { color: colour, width: 1.4 },
-      itemStyle: { color: colour },
-      // large/progressive keep a long daily series interactive. No sampling:
-      // lttb invents sharp spikes at the zoomed-out view that are not in the
-      // data, which is the same reason the R scripts turn it off.
+      data: data[i],
+      ...seriesShape(forMode, SERIES_COLOURS[i % SERIES_COLOURS.length]),
+      // large/progressive keep a long daily series interactive, on either mark
+      // -- the R traces carry them on both too. No sampling: lttb invents sharp
+      // spikes at the zoomed-out view that are not in the data, which is the
+      // same reason the R scripts turn it off.
       large: true,
       largeThreshold: 2000,
       progressive: 2000,
       progressiveThreshold: 2000,
-    };
-  });
+    }));
 
-  const drawn = series.reduce((n, s) => n + s.data.length, 0);
+  // A new plot is a new question, so the mark goes back to the line the R
+  // scripts draw rather than inheriting the last chart's toggle.
+  mode = 'line';
+  syncModeButton();
+  const series = buildSeries(mode);
+
+  const drawn = data.reduce((n, points) => n + points.length, 0);
   if (drawn === 0) {
     showMessage('Nothing to chart -- no row had both an x value and a number.');
     return;
@@ -282,7 +356,7 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
   hintEl.className = 'chart-hint';
   hintEl.textContent = 'drag to zoom · scroll to zoom · double-click to reset';
   titleEl.appendChild(hintEl);
-  resetEl.hidden = false;
+  toolsEl.hidden = false;
 
   chart?.dispose();
   chart = echarts.init(canvasEl, undefined, { renderer: 'canvas' });
@@ -290,18 +364,16 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
   // Axis ranges and ticks are the R helpers' numbers, not ECharts' defaults:
   // padded either side, and the y ticks placed from the UNPADDED extent so the
   // outermost ones sit just inside the ends of the axis.
+  // From `data`, not from the series: the extents are a property of the points,
+  // and toggling the mark must not move an axis.
   const yExtent = finiteExtent(
-    series.flatMap((s) =>
-      s.data.map((point) => (Array.isArray(point) ? point[1] : (point as number | null)))
-    )
+    data.flat().map((point) => (Array.isArray(point) ? point[1] : (point as number | null)))
   );
   const yRange = yExtent ? padValueRange(yExtent) : undefined;
   const yBreaks = yExtent ? evenBreaks(yExtent.lo, yExtent.hi, Y_TICKS) : undefined;
   const xExtent = isCategory
     ? undefined
-    : finiteExtent(
-        series.flatMap((s) => s.data.map((point) => (Array.isArray(point) ? point[0] : null)))
-      );
+    : finiteExtent(data.flat().map((point) => (Array.isArray(point) ? point[0] : null)));
   const xRange = xExtent ? padTimeRange(xExtent) : undefined;
   // Shared by both axes. The minor lines are the ones between the labelled
   // ticks; ECharts only draws them on value/time/log axes, which is why the
@@ -462,12 +534,7 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
     chart.setOption({ tooltip: { show: visible <= TOOLTIP_POINT_LIMIT } });
   });
 
-  // Brush mode on by default, so a drag zooms without arming anything first.
-  chart.dispatchAction({
-    type: 'takeGlobalCursor',
-    key: 'brush',
-    brushOption: { brushType: 'lineX', brushMode: 'single' },
-  });
+  armBrush();
 }
 
 window.addEventListener('message', (event: MessageEvent<ChartMessage>) => {

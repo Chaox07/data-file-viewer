@@ -538,7 +538,8 @@ html, body {
    defeated `hidden` for exactly the reason spelled out at .th-inner /
    #unlock-options above -- the empty panel stayed visible and squeezed the
    table into the bottom of the pane. Exactly one thing here is toggled with
-   `hidden` (.chart-reset), and it carries the `:not([hidden])` guard. */
+   `hidden` (.chart-tools, the toolbar over the plot), and it carries the
+   `:not([hidden])` guard. */
 /* White whatever the editor theme is, and deliberately so: this tab is a
    figure. It gets screenshotted, pasted into a document and printed, and a
    dark-theme chart arrives everywhere else as a negative of itself. The
@@ -569,7 +570,7 @@ html, body {
   white-space: nowrap;
 }
 
-/* Holds the canvas and the reset button on top of it, so the button needs a
+/* Holds the canvas and the toolbar on top of it, so the toolbar needs a
    positioned ancestor that is not the canvas ECharts writes into. */
 .chart-plot {
   position: relative;
@@ -587,16 +588,24 @@ html, body {
 }
 
 /* `:not([hidden])` is load-bearing -- see .th-inner / #unlock-options above.
-   This button IS toggled with `hidden`, and a bare `display` here would beat
+   This toolbar IS toggled with `hidden`, and a bare `display` here would beat
    the UA rule and pin it on screen. */
-.chart-reset:not([hidden]) {
+.chart-tools:not([hidden]) {
   display: flex;
 }
 
-.chart-reset {
+.chart-tools {
   position: absolute;
   top: 10px;
   right: 12px;
+  gap: 6px;
+}
+
+/* One rule for every tool, rather than per-button ones: these sit over the
+   figure, so a second button that drifted a pixel or a shade from the first
+   would be visible as exactly that. */
+.chart-tools button {
+  display: flex;
   align-items: center;
   justify-content: center;
   width: 22px;
@@ -613,6 +622,6 @@ html, body {
   transition: opacity 0.15s;
 }
 
-.chart-reset:hover {
+.chart-tools button:hover {
   opacity: 1;
 }

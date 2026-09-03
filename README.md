@@ -251,6 +251,14 @@ Every results grid — table previews and hand-written queries alike — gets:
   the plot (or ⟲ in the top right) puts it back. There is no slider along the
   bottom: that is a second, smaller
   copy of the chart you have to aim at before you can look at the real one.
+
+  **∴ beside ⟲ switches the line to a scatter**, and pressing it again switches
+  back — one button, because the only other state is the one you came from. It
+  redraws the mark alone: the range you have zoomed into and any series you have
+  hidden in the legend survive the toggle. Every new plot starts as a line
+  again, so a scatter is always something you asked for about the series in
+  front of you. The two marks are `long_run_3.R`'s own `raw_type <- "line"` /
+  `"scatter"`, down to the 1.4 stroke and the 7.2 points.
   The tab is white whatever your editor theme is, since a chart is a figure —
   it ends up in screenshots and documents, where a dark one reads as a
   negative of itself.
@@ -296,7 +304,8 @@ Every results grid — table previews and hand-written queries alike — gets:
   them: the white ground, black axis rules, hairline gridlines with lighter
   minor ones between them, serif labels, the white tooltip with its black
   crosshair, 2%/4% padding on the time axis and 3% on the value axis, eight
-  pinned y ticks, three-significant-digit axis labels and four-significant-digit
+  pinned y ticks, the line and scatter marks with their widths and point sizes,
+  three-significant-digit axis labels and four-significant-digit
   tooltip values, and the tooltip that switches itself off above 3,000 points
   in view and back on when you zoom in — hovering a line that has thousands of
   points overplotted into a few pixels reports a value that isn't the one your
