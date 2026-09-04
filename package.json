@@ -107,6 +107,12 @@
           "default": true,
           "description": "Preview the first table as soon as a file opens, instead of waiting for a click. For a file holding one table that click is pure ceremony; turn this off if opening a very large file should stay instant."
         },
+        "dataFileViewer.hotFilePatterns": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["{base}.sqlite", "{base}_hot.sqlite"],
+          "markdownDescription": "Filename patterns for the hot half of a hot/cold pair, with `{base}` standing for the cold file's name. Declarative because the writer's naming is not fixed: trading_project's `SQLITE_HOT_NAME` is `auto`, and a rename there would otherwise silently end live updates. Patterns are inverted to find the cold half when the hot one is opened."
+        },
         "dataFileViewer.numberLocale": {
           "type": "string",
           "enum": ["auto", "en", "eu"],

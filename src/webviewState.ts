@@ -51,7 +51,13 @@ export type ExtensionMessage =
   | { command: 'backupStatus'; message: string }
   | { command: 'tableChangeStatus'; status: Record<string, TableStatus> }
   | { command: 'safeModeState'; safeMode: boolean }
-  | { command: 'liveRefreshStarted'; intervalMs: number; suggestedIntervalSeconds: number | null }
+  | {
+      command: 'liveRefreshStarted';
+      intervalMs: number;
+      suggestedIntervalSeconds: number | null;
+      hasSource?: boolean;
+      sourceLookedFor?: string;
+    }
   | { command: 'liveRefreshStopped'; readOnly?: boolean }
   | { command: 'liveRefreshRejected'; reason: string }
   | { command: 'liveRefreshIntervalSet'; intervalMs: number }
@@ -93,6 +99,10 @@ export interface WebviewState {
   liveIntervalMs: number;
   liveLastUpdatedMs: number | undefined;
   liveStale: boolean;
+  /** False when no companion file was found — see liveStatus.ts. */
+  liveHasSource?: boolean;
+  /** The candidate paths that were looked for, to name them. */
+  liveSourceLookedFor?: string;
   liveLastError: string | undefined;
 }
 
@@ -248,6 +258,10 @@ export function reduce(state: WebviewState, message: ExtensionMessage): Reduced 
       next.liveLastUpdatedMs = undefined;
       next.liveStale = false;
       next.liveLastError = undefined;
+      // Absent means "not reported" -> treated as sourced, so an older host
+      // cannot make every file look sourceless.
+      next.liveHasSource = message.hasSource;
+      next.liveSourceLookedFor = message.sourceLookedFor;
       effects.push(
         { kind: 'setLiveUi', enabled: true },
         { kind: 'setLiveIntervalInput', intervalMs: message.intervalMs },

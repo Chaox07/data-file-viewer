@@ -526,6 +526,14 @@ html, body {
   font-weight: 600;
 }
 
+/* No companion file is being written alongside this one. Muted rather than
+   alarming -- nothing is broken, there is simply nothing to be live about --
+   but deliberately NOT the active green, which would read as healthy. */
+.live-status.live-status-nosource {
+  color: #7d8493;
+  font-style: italic;
+}
+
 .cell-inspector-status, .cell-inspector-note {
   color: #7d8493;
   font-size: 12px;

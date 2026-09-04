@@ -525,14 +525,33 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
   // The other half of the density gate: recount what is in view after every
   // zoom and switch the tooltip accordingly. Only the top-level `show` flag is
   // touched, so the formatter and styling above survive the merge.
-  chart.on('datazoom', () => {
+  //
+  // The range comes off the EVENT, not from chart.getOption(). ECharts
+  // documents getOption() as returning a deep copy of the whole option object
+  // -- series data included -- so reading it here deep-cloned every point on
+  // the chart on every single scroll-wheel step. On a 12,000-point series
+  // that is the difference between panning smoothly and not. (The same bug
+  // was in long_run_3.R's handler, which this was ported from; both are
+  // fixed.) A user drag/wheel puts the range on params directly; a
+  // dispatchAction -- which is what the brush-zoom and reset above both do --
+  // puts it under params.batch[0].
+  //
+  // The flag is also latched: setOption() forces an option merge and a
+  // re-render, and firing it on every event meant hundreds of no-op redraws
+  // during one drag.
+  let tooltipShown = drawn <= TOOLTIP_POINT_LIMIT;
+  chart.on('datazoom', (params: unknown) => {
     if (!chart) return;
-    const zooms = (chart.getOption() as { dataZoom?: { start?: number; end?: number }[] }).dataZoom;
-    const zoom = zooms?.[0];
-    const from = zoom?.start ?? 0;
-    const to = zoom?.end ?? 100;
+    const p = params as { start?: number; end?: number; batch?: { start?: number; end?: number }[] };
+    const src = p?.batch?.length ? p.batch[0] : p;
+    if (!src || (src.start == null && src.end == null)) return;
+    const from = src.start ?? 0;
+    const to = src.end ?? 100;
     const visible = (drawn * (to - from)) / 100;
-    chart.setOption({ tooltip: { show: visible <= TOOLTIP_POINT_LIMIT } });
+    const want = visible <= TOOLTIP_POINT_LIMIT;
+    if (want === tooltipShown) return;
+    tooltipShown = want;
+    chart.setOption({ tooltip: { show: want } });
   });
 
   armBrush();

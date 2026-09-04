@@ -221,6 +221,8 @@ function updateLiveStatusText(): void {
   const status = liveStatusText({
     enabled: state.liveEnabled,
     hostStale: state.liveStale,
+    hasSource: state.liveHasSource,
+    sourceLookedFor: state.liveSourceLookedFor,
     lastUpdatedMs: state.liveLastUpdatedMs,
     intervalMs: state.liveIntervalMs,
     lastError: state.liveLastError,

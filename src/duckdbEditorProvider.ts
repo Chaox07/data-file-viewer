@@ -201,23 +201,58 @@ const HASH_ROW_THRESHOLD = 5000;
  * before returning it — the file itself being a valid database is verified
  * separately, by DuckDbFile.open's own attach-and-probe fallback.
  */
-function resolveSiblingPath(fsPath: string): string | undefined {
+/**
+ * Filename patterns for the hot half of a hot/cold pair, `{base}` standing
+ * for the cold file's basename.
+ *
+ * Declarative because the writer's naming is not this extension's to fix in
+ * place: trading_project sets SQLITE_HOT_NAME = "auto" (config_trading.py),
+ * so a rename there would silently end live updates here with nothing to
+ * change but a hardcoded string. The setting is the seam.
+ */
+const DEFAULT_HOT_PATTERNS = ['{base}.sqlite', '{base}_hot.sqlite'];
+
+function hotFilePatterns(): string[] {
+  const configured = vscode.workspace
+    .getConfiguration('dataFileViewer')
+    .get<string[]>('hotFilePatterns', DEFAULT_HOT_PATTERNS);
+  const usable = Array.isArray(configured) ? configured.filter((p) => typeof p === 'string' && p.includes('{base}')) : [];
+  return usable.length > 0 ? usable : DEFAULT_HOT_PATTERNS;
+}
+
+/** Every path that would have counted as this file's partner, tried in order. */
+function siblingCandidates(fsPath: string): string[] {
   const dir = dirname(fsPath);
   const ext = extname(fsPath);
   const lowerExt = ext.toLowerCase();
   const base = basename(fsPath, ext);
-  const candidates: string[] = [];
 
+  // Cold half opened: look for the hot half by pattern.
   if (lowerExt === '.duckdb') {
-    candidates.push(join(dir, `${base}.sqlite`), join(dir, `${base}_hot.sqlite`));
-  } else if (lowerExt === '.sqlite' || lowerExt === '.db') {
-    candidates.push(join(dir, `${base}.duckdb`));
-    if (base.endsWith('_hot')) {
-      candidates.push(join(dir, `${base.slice(0, -'_hot'.length)}.duckdb`));
-    }
+    return hotFilePatterns().map((p) => join(dir, p.replace('{base}', base)));
   }
 
-  for (const candidate of candidates) {
+  // Hot half opened: look for the cold half. Derived by inverting the same
+  // patterns, so a custom pattern keeps working in this direction too rather
+  // than only the one it was written for.
+  if (lowerExt === '.sqlite' || lowerExt === '.db') {
+    const out = [join(dir, `${base}.duckdb`)];
+    for (const pattern of hotFilePatterns()) {
+      const [prefix, suffixWithExt] = pattern.split('{base}');
+      const suffix = suffixWithExt?.replace(/\.[^.]*$/, '') ?? '';
+      if (base.startsWith(prefix) && base.endsWith(suffix) && (prefix || suffix)) {
+        const coldBase = base.slice(prefix.length, base.length - suffix.length);
+        if (coldBase) out.push(join(dir, `${coldBase}.duckdb`));
+      }
+    }
+    return out;
+  }
+  return [];
+}
+
+function resolveSiblingPath(fsPath: string): string | undefined {
+  const dir = dirname(fsPath);
+  for (const candidate of siblingCandidates(fsPath)) {
     if (isVerifiedSiblingPath(dir, candidate)) return candidate;
   }
   return undefined;
@@ -705,10 +740,16 @@ async function startLiveRefresh(
   });
   document.liveRefreshController = controller;
 
+  // Whether anything is actually writing alongside this file. Without it the
+  // status line reported a healthy "Live · waiting for first update…" forever
+  // on a file with no partner -- see liveStatus.ts.
+  const candidates = siblingCandidates(document.uri.fsPath);
   webview.postMessage({
     command: 'liveRefreshStarted',
     intervalMs,
     suggestedIntervalSeconds: suggestedSeconds,
+    hasSource: document.file.hasSibling(),
+    sourceLookedFor: candidates.map((c) => basename(c)).join(', '),
   });
   logLive(`[${label}] live refresh started, interval ${intervalMs}ms${suggestedSeconds ? ` (auto-detected ${suggestedSeconds}s)` : ''}`);
 

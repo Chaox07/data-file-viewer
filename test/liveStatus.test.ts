@@ -112,3 +112,38 @@ test('the age in the line advances with the clock', () => {
   assert.match(liveStatusText(s, NOW + 1000).text, /1s ago/);
   assert.match(liveStatusText(s, NOW + 65_000).text, /1m 5s ago/);
 });
+
+test('a file with no live source says so, instead of waiting forever', () => {
+  // The defect this replaced: hasSource absent, lastUpdatedMs undefined, so
+  // isLocallyStale() is false and the badge read "Live · waiting for first
+  // update…" in the ACTIVE style, indefinitely — a healthy-looking live view
+  // of a file nothing is writing.
+  const status = liveStatusText({
+    enabled: true,
+    hasSource: false,
+    sourceLookedFor: 'market_hot.sqlite, market.sqlite',
+    hostStale: false,
+    lastUpdatedMs: undefined,
+    intervalMs: 2000,
+    lastError: undefined,
+  });
+  assert.match(status.text, /no live source found/);
+  assert.match(status.className, /live-status-nosource/);
+  assert.doesNotMatch(status.className, /live-status-active/);
+  // It names what it looked for, so the answer is actionable.
+  assert.match(status.title, /market_hot\.sqlite/);
+});
+
+test('an older host that reports no hasSource is still treated as sourced', () => {
+  // Undefined means "not reported". Defaulting it to false would make every
+  // file look sourceless the moment the host and webview versions differed.
+  const status = liveStatusText({
+    enabled: true,
+    hostStale: false,
+    lastUpdatedMs: undefined,
+    intervalMs: 2000,
+    lastError: undefined,
+  });
+  assert.doesNotMatch(status.className, /live-status-nosource/);
+  assert.match(status.text, /waiting for first update/);
+});

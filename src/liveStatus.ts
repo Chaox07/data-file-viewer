@@ -18,6 +18,20 @@ import { formatAgo } from './gridFormat';
 
 export interface LiveState {
   enabled: boolean;
+  /**
+   * Whether a live source was actually found for this file.
+   *
+   * Without it, a file with no hot partner reported "Live · waiting for first
+   * update…" in the active style forever: lastUpdatedMs is undefined, so
+   * isLocallyStale() returns false, so nothing ever went stale and nothing was
+   * ever wrong on screen. That reads as a healthy live view of a file nothing
+   * is writing -- the same "looks fine, is wrong" failure as guessing a
+   * decimal separator. Undefined means "not reported", which is treated as
+   * present so an older host cannot make every file look sourceless.
+   */
+  hasSource?: boolean;
+  /** What was looked for, to name it when nothing was found. */
+  sourceLookedFor?: string;
   /** The host's own staleness flag. */
   hostStale: boolean;
   lastUpdatedMs: number | undefined;
@@ -47,6 +61,17 @@ export interface LiveStatusText {
 }
 
 export function liveStatusText(state: LiveState, now: number = Date.now()): LiveStatusText {
+  // Nothing is writing to this file, so there is nothing to be live about.
+  // Said plainly, and named, rather than shown as a healthy live view.
+  if (state.hasSource === false) {
+    return {
+      text: 'Live · no live source found',
+      className: 'live-status live-status-nosource',
+      title: state.sourceLookedFor
+        ? `No companion file is being written alongside this one. Looked for: ${state.sourceLookedFor}`
+        : 'No companion file is being written alongside this one.',
+    };
+  }
   const stale = state.hostStale || isLocallyStale(state, now);
   const agoText =
     state.lastUpdatedMs !== undefined ? `updated ${formatAgo(state.lastUpdatedMs, now)}` : 'waiting for first update…';
