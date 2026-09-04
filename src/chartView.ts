@@ -313,8 +313,9 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
   const data = message.yColumns.map((name) => {
     const yIndex = message.columns.indexOf(name);
     const ys = yIndex < 0 ? [] : message.rows.map((row) => row[yIndex]);
-    // No connectNulls: a gap in a series is a fact about the data, and joining
-    // across it draws a segment nobody measured.
+    // Gaps stay in the DATA as nulls -- dropping the point would move the
+    // series in x, not just close a hole. Whether the line bridges them is a
+    // rendering choice, and seriesShape() makes it (connectNulls, matching R).
     return isCategory ? toCategoryValues(ys) : toSeriesPoints(xs, ys);
   });
 

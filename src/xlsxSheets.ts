@@ -120,3 +120,46 @@ export async function listSheets(filePath: string): Promise<XlsxSheet[]> {
   }
   return out;
 }
+
+/**
+ * The `<dimension ref="B2:AH16809"/>` a worksheet declares, as 1-based bounds.
+ *
+ * Needed because `read_xlsx` without a `range` stops at the first contiguous
+ * block of rows — on a sheet with a preamble and a blank line before the real
+ * table, that is the preamble, which is why such a file currently opens as a
+ * 3-column, 1-row table. Giving it an explicit range fixes that, and a range
+ * needs an end row.
+ *
+ * The declaration is an upper bound, not a measurement: workbooks routinely
+ * over-declare it (see the project's xlsx geometry notes), so a caller should
+ * treat a too-large end row as normal. Returns undefined when the sheet
+ * declares nothing, which is legal.
+ *
+ * Only this one worksheet part is inflated, not the whole workbook.
+ */
+export async function readSheetDimension(
+  filePath: string,
+  sheetPath: string
+): Promise<{ firstRow: number; lastRow: number; firstCol: string; lastCol: string } | undefined> {
+  const buf = await readFile(filePath);
+  let files: Record<string, Uint8Array>;
+  try {
+    files = unzipSync(new Uint8Array(buf), { filter: (f) => f.name === sheetPath });
+  } catch {
+    return undefined;
+  }
+  const part = files[sheetPath];
+  if (!part) return undefined;
+
+  // The dimension element is in the first few hundred bytes of the part, well
+  // before the row data, so this never scans a large sheet body.
+  const head = strFromU8(part.subarray(0, Math.min(part.length, 4096)));
+  const m = /<(?:[A-Za-z0-9_.-]+:)?dimension\s+ref="([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?"/.exec(head);
+  if (!m) return undefined;
+  const firstCol = m[1];
+  const firstRow = Number(m[2]);
+  const lastCol = m[3] ?? m[1];
+  const lastRow = Number(m[4] ?? m[2]);
+  if (!Number.isFinite(firstRow) || !Number.isFinite(lastRow)) return undefined;
+  return { firstRow, lastRow, firstCol, lastCol };
+}

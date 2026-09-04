@@ -16,7 +16,8 @@ import { tmpdir } from 'node:os';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
 import { KNOWN_FREQUENCIES, type SeriesFrequency } from './chartSpec';
 import { csvLocaleOptions, decideFile, type NumberLocale } from './numericLocale';
-import { listSheets } from './xlsxSheets';
+import { listSheets, readSheetDimension } from './xlsxSheets';
+import { analyseSheet, needsBlockHandling, notesText, type Cell } from './sheetBlocks';
 import { patchCell as patchXlsxCell } from './xlsxWrite';
 
 export type StatsKind = 'numeric' | 'datetime' | 'other';
@@ -126,6 +127,72 @@ async function sniffCsvLocale(
     // back to DuckDB's own defaults rather than to a guess.
     return empty;
   }
+}
+
+/** Structure of one worksheet: where its header is, and what sits above it. */
+interface SheetShapeInfo {
+  /** 1-based Excel row of the header. */
+  headerExcelRow: number;
+  /** Last row the sheet declares, for the range's end bound. */
+  lastRow: number;
+  /** Last column the sheet declares. */
+  lastCol: string;
+  /** Preamble/note lines, kept rather than discarded. */
+  notes: string[];
+}
+
+/** How many rows to sample when locating a sheet's header. */
+const SHEET_SHAPE_SAMPLE_ROWS = 200;
+
+/**
+ * Locate a sheet's header row, or undefined when it is already row 1 (the
+ * ordinary case, which keeps reading exactly as it did before).
+ */
+async function sniffSheetShape(
+  connection: DuckDBConnection,
+  filePathLiteral: string,
+  sheetLiteral: string,
+  fsPath: string,
+  sheetPartPath: string
+): Promise<SheetShapeInfo | undefined> {
+  try {
+    const dim = await readSheetDimension(fsPath, sheetPartPath);
+    if (!dim) return undefined;
+    const sampleEnd = Math.min(dim.lastRow, SHEET_SHAPE_SAMPLE_ROWS);
+    const reader = await connection.runAndReadAll(
+      `select * from read_xlsx('${filePathLiteral}', sheet = '${sheetLiteral}', ` +
+        `header = false, all_varchar = true, ignore_errors = true, ` +
+        `range = 'A1:${dim.lastCol}${sampleEnd}')`
+    );
+    const shape = analyseSheet(reader.getRows() as Cell[][]);
+    if (!shape.table || !needsBlockHandling(shape)) return undefined;
+    return {
+      headerExcelRow: (shape.table.headerRow ?? 0) + 1,
+      lastRow: dim.lastRow,
+      lastCol: dim.lastCol,
+      notes: notesText(shape),
+    };
+  } catch {
+    // A sheet we cannot sample is read the way it always was.
+    return undefined;
+  }
+}
+
+/** The read_xlsx() call for one sheet, ranged only when the header is not row 1. */
+function xlsxReadExpr(
+  filePathLiteral: string,
+  sheetLiteral: string,
+  shape: SheetShapeInfo | undefined
+): string {
+  if (!shape) return `read_xlsx('${filePathLiteral}', sheet = '${sheetLiteral}')`;
+  // ignore_errors: a ranged read types each column from the range, and one
+  // uncomputable cell in a 16,000-row sheet would otherwise refuse the lot.
+  // The existing xlsxErrorsTolerated path does the same for the same reason.
+  return (
+    `read_xlsx('${filePathLiteral}', sheet = '${sheetLiteral}', ` +
+    `range = 'A${shape.headerExcelRow}:${shape.lastCol}${shape.lastRow}', ` +
+    `header = true, ignore_errors = true)`
+  );
 }
 
 /** The read_csv() call for a CSV, with locale options only when we have grounds for them. */
@@ -1008,9 +1075,30 @@ export class DuckDbFile {
         const asLiteral = sheet.name.replace(/'/g, "''");
         const asIdent = sheet.name.replace(/"/g, '""');
         try {
+          // Where does this sheet's table actually start?
+          //
+          // read_xlsx with no `range` stops at the first contiguous block of
+          // rows. On a sheet with a preamble and a blank line above the real
+          // table -- the ordinary shape of a published workbook -- that block
+          // IS the preamble, so the sheet opens as a handful of columns and
+          // one row and cannot be charted. Verified on YieldCurve_Data.xlsx:
+          // 3 columns, 1 row, no error.
+          //
+          // So sample the top of the sheet as text, find the header by width
+          // (see sheetBlocks.ts), and give read_xlsx an explicit range when
+          // the header is not already row 1. Structure only: nothing is
+          // dropped, and the rows above the header come back as notes.
+          const shape = await sniffSheetShape(connection, filePath, asLiteral, path, sheet.path);
           await connection.run(
-            `create view "${asIdent}" as select * from read_xlsx('${filePath}', sheet = '${asLiteral}')`
+            `create view "${asIdent}" as select * from ${xlsxReadExpr(filePath, asLiteral, shape)}`
           );
+          if (shape && shape.notes.length > 0) {
+            openWarnings.push(
+              `Sheet "${sheet.name}": the table starts at row ${shape.headerExcelRow}. ` +
+                `The rows above it are kept as notes: ${shape.notes.slice(0, 3).join(' / ')}` +
+                (shape.notes.length > 3 ? ` (+${shape.notes.length - 3} more)` : '')
+            );
+          }
           xlsxSheetPaths.set(sheet.name, sheet.path);
         } catch (err) {
           // One unreadable sheet (a chart sheet, a macro sheet, an empty one)

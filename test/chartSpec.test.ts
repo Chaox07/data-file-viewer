@@ -278,9 +278,22 @@ test('a line is drawn at 1.4 with no symbols on its points', () => {
   assert.deepEqual(seriesShape('line', '#000080'), {
     type: 'line',
     showSymbol: false,
+    connectNulls: true,
     lineStyle: { color: '#000080', width: 1.4 },
     itemStyle: { color: '#000080' },
   });
+});
+
+test('a line bridges gaps, because long_run_3.R does', () => {
+  // The one place the two implementations deliberately disagreed. R sets
+  // connectNulls = TRUE on every line trace, for a reason its comment records
+  // as verified against a real chart: thousands of single-point gaps fragment
+  // the line into segments ECharts then fails to re-render after a zoom-in and
+  // reset. used_YieldCurve's "2&1" is null in 3,879 of its 12,406 rows, so
+  // this is the difference between one line and thousands of fragments.
+  assert.equal(seriesShape('line', '#000080').connectNulls, true);
+  // A scatter has no line to bridge anything with.
+  assert.equal('connectNulls' in seriesShape('scatter', '#000080'), false);
 });
 
 test('a scatter is drawn as 7.2 points and carries no line at all', () => {

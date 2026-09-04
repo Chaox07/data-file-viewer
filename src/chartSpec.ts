@@ -148,6 +148,7 @@ export interface SeriesShape {
   type: ChartMode;
   itemStyle: { color: string };
   showSymbol?: boolean;
+  connectNulls?: boolean;
   symbolSize?: number;
   lineStyle?: { color: string; width: number };
 }
@@ -178,6 +179,24 @@ export function seriesShape(mode: ChartMode, colour: string): SeriesShape {
     // The line IS the mark here, so the points themselves stay unmarked --
     // symbols on a 60-year daily series draw a smear, not a series.
     showSymbol: false,
+    // Matches long_run_3.R, which sets connectNulls = TRUE on every line
+    // trace. This was the one place the two implementations deliberately
+    // disagreed, and both had a reason:
+    //
+    //   here  -- a gap is a fact about the data, and joining across it draws
+    //            a segment nobody measured;
+    //   R     -- "without connectNulls, thousands of single-day NA gaps
+    //            fragment the line into disconnected segments that ECharts
+    //            fails to re-render after a zoom-in + reset back to full
+    //            view (verified against a real chart instance)."
+    //
+    // R's is the empirical one, and it is the specification this chart is a
+    // port of. It also decides the case that prompted this: used_YieldCurve's
+    // "2&1" is null in 3,879 of 12,406 rows, so at connectNulls: false the
+    // series renders as thousands of disconnected fragments -- which
+    // communicates "no data" far more strongly than a joined line
+    // misrepresents the gaps.
+    connectNulls: true,
     lineStyle: { color: colour, width: LINE_WIDTH },
     itemStyle: { color: colour },
   };
