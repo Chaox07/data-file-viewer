@@ -15,6 +15,7 @@ import { createWriteStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
 import { KNOWN_FREQUENCIES, type SeriesFrequency } from './chartSpec';
+import { csvLocaleOptions, decideFile, type NumberLocale } from './numericLocale';
 import { listSheets } from './xlsxSheets';
 import { patchCell as patchXlsxCell } from './xlsxWrite';
 
@@ -66,6 +67,76 @@ export interface DuckDbFileOpenOptions {
   forceReadOnly?: boolean;
   /** Absolute path to the other half of a hot/cold pair, if one was found — see duckdbEditorProvider.ts's sibling detection. */
   siblingPath?: string;
+  /**
+   * Decimal convention for CSV. `"auto"` (the default) samples the file and
+   * decides, refusing when the file carries no evidence. `"en"`/`"eu"` state
+   * it outright, which is how a user resolves a column we declined to guess.
+   * Mirrors ETL's NUMBER_LOCALE escape hatch.
+   */
+  numberLocale?: 'auto' | NumberLocale;
+}
+
+/** What the locale sniff concluded, for the notice the viewer shows. */
+export interface NumberLocaleReport {
+  /** Applied convention, or null when the file needed no options. */
+  locale: NumberLocale | null;
+  /** `true` when the user stated it rather than us sniffing it. */
+  forced: boolean;
+  /** Columns left as text because nothing in them could break the tie. */
+  undecidable: { column: string; samples: string[] }[];
+  /** Set when different columns wanted different conventions. */
+  conflicting: boolean;
+}
+
+/** How many rows to sample when sniffing a CSV's decimal convention. */
+const LOCALE_SAMPLE_ROWS = 2000;
+
+/**
+ * Which decimal convention is this CSV written in?
+ *
+ * Read as text first (`all_varchar=true`, so DuckDB's own type detection
+ * cannot pre-empt the question) and hand the raw strings to
+ * numericLocale.decideFile. The parsing is still DuckDB's; only the choice is
+ * ours, because DuckDB has no way to make it and getting it wrong is a silent
+ * factor of 1000 rather than an error.
+ */
+async function sniffCsvLocale(
+  connection: DuckDBConnection,
+  filePath: string
+): Promise<{ locale: NumberLocale | null; undecidable: { column: string; samples: string[] }[]; conflicting: boolean }> {
+  const empty = { locale: null, undecidable: [], conflicting: false };
+  try {
+    const reader = await connection.runAndReadAll(
+      `select * from read_csv_auto(${quoteLiteral(filePath)}, all_varchar=true) limit ${LOCALE_SAMPLE_ROWS}`
+    );
+    const names = reader.columnNames();
+    const rows = reader.getRows();
+    if (names.length === 0 || rows.length === 0) return empty;
+
+    const columns = new Map<string, (string | null)[]>();
+    names.forEach((name, i) => {
+      columns.set(
+        name,
+        rows.map((r) => (r[i] === null || r[i] === undefined ? null : String(r[i])))
+      );
+    });
+    return decideFile(columns);
+  } catch {
+    // A file we cannot sample is a file we cannot make claims about. Fall
+    // back to DuckDB's own defaults rather than to a guess.
+    return empty;
+  }
+}
+
+/** The read_csv() call for a CSV, with locale options only when we have grounds for them. */
+function csvReadExpr(filePath: string, locale: NumberLocale | null): string {
+  if (!locale || locale === 'en') {
+    // "en" is already what read_csv_auto does; adding the options would only
+    // disable its delimiter/header sniffing for no gain.
+    return `read_csv_auto(${quoteLiteral(filePath)})`;
+  }
+  const { decimal, thousands } = csvLocaleOptions(locale);
+  return `read_csv(${quoteLiteral(filePath)}, decimal_separator=${quoteLiteral(decimal)}, thousands=${quoteLiteral(thousands)})`;
 }
 
 /**
@@ -673,7 +744,9 @@ export class DuckDbFile {
      * Carried from open() because listSheets had already read it, and because
      * an edit has to reach the right part of the zip knowing only the view name.
      */
-    private readonly xlsxSheetPaths: Map<string, string> = new Map()
+    private readonly xlsxSheetPaths: Map<string, string> = new Map(),
+    /** Which decimal convention a CSV was read with, and what was refused. */
+    readonly numberLocale: NumberLocaleReport | undefined = undefined
   ) {}
 
   isReadOnly(): boolean {
@@ -724,6 +797,9 @@ export class DuckDbFile {
     // that are not visible in the grid, such as a cell shown as empty because
     // the workbook holds #DIV/0! there.
     const openWarnings: string[] = [];
+    // Set by the isCsv branch below; carried onto the instance so the UI can
+    // show which convention was applied and offer the override.
+    let csvLocaleReport: NumberLocaleReport | undefined;
     // Populated for .xlsx only; see the constructor parameter of the same name.
     const xlsxSheetPaths = new Map<string, string>();
     const looksArrow = /\.(arrows?|feather)$/i.test(path);
@@ -815,8 +891,42 @@ export class DuckDbFile {
     if (isCsv) {
       // Same single-view treatment as Parquet — auto-detects delimiter,
       // header presence, and column types.
-      const filePath = path.replace(/'/g, "''");
-      await connection.run(`create view "${mainObjectName}" as select * from read_csv_auto('${filePath}')`);
+      //
+      // What it cannot auto-detect is the decimal convention. On a Turkish
+      // file (`1.794.446,52`) read_csv_auto types the column as VARCHAR and
+      // says nothing: it sorts lexicographically and will not chart. Told the
+      // European separators it comes back DOUBLE and exact. But told them
+      // WRONGLY, an English file's `12.5` becomes `125` — equally silent. So
+      // the convention is sniffed from the file's own values, and a file that
+      // carries no evidence is left on DuckDB's defaults and reported rather
+      // than guessed at. See numericLocale.ts.
+      const requested = options?.numberLocale ?? 'auto';
+      const sniffed =
+        requested === 'auto'
+          ? await sniffCsvLocale(connection, path)
+          : { locale: requested, undecidable: [], conflicting: false };
+      csvLocaleReport = { ...sniffed, forced: requested !== 'auto' };
+
+      await connection.run(
+        `create view ${quoteIdent(mainObjectName)} as select * from ${csvReadExpr(path, sniffed.locale)}`
+      );
+
+      for (const u of sniffed.undecidable) {
+        const sample = u.samples[0] ?? '';
+        const en = sample.replace(/,/g, '');
+        const eu = sample.replace(/\./g, '').replace(/,/g, '.');
+        openWarnings.push(
+          `Column "${u.column}" was left as text: ${sample} is ${eu} read as Turkish and ` +
+            `${en} read as English, and nothing else in the column tells them apart. ` +
+            `Set dataFileViewer.numberLocale to "eu" or "en" to convert it.`
+        );
+      }
+      if (sniffed.conflicting) {
+        openWarnings.push(
+          'Columns in this file disagree about the decimal convention, so none were converted. ' +
+            'Set dataFileViewer.numberLocale to "eu" or "en" to read the whole file one way.'
+        );
+      }
     }
 
     if (isDta) {
@@ -978,7 +1088,8 @@ export class DuckDbFile {
       options?.siblingPath,
       featherTempDir,
       openWarnings,
-      xlsxSheetPaths
+      xlsxSheetPaths,
+      csvLocaleReport
     );
   }
 
@@ -1695,16 +1806,20 @@ export class DuckDbFile {
       this.backupTempDir = converted.tempDir;
     }
 
-    const readFn =
+    // A CSV rebuilds through csvReadExpr(), not a bare read_csv_auto: the
+    // convention decided at open time has to survive, or the backup copy
+    // would be read one way and the live file the other, and every value in
+    // a Turkish column would show as changed.
+    const readExpr =
       this.kind === 'parquet'
-        ? 'read_parquet'
+        ? `read_parquet(${quoteLiteral(readPath)})`
         : this.kind === 'dta'
-          ? 'read_dta'
+          ? `read_dta(${quoteLiteral(readPath)})`
           : this.kind === 'arrow' || this.kind === 'feather'
-            ? 'read_arrow'
-            : 'read_csv_auto';
+            ? `read_arrow(${quoteLiteral(readPath)})`
+            : csvReadExpr(readPath, this.numberLocale?.locale ?? null);
     await this.connection.run(
-      `create view ${quoteIdent(this.mainObjectName)} as select * from ${readFn}(${quoteLiteral(readPath)})`
+      `create view ${quoteIdent(this.mainObjectName)} as select * from ${readExpr}`
     );
   }
 

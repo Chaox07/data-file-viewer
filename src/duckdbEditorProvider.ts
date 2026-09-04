@@ -41,6 +41,15 @@ function isPreviewFirstTableEnabled(): boolean {
   return vscode.workspace.getConfiguration('dataFileViewer').get<boolean>('previewFirstTableOnOpen', true) !== false;
 }
 
+// Decimal convention for CSV. "auto" sniffs and refuses when the file carries
+// no evidence; "en"/"eu" state it outright, which is how a user resolves a
+// column the sniff declined to guess. Read per open, so changing it and
+// reopening the file is the whole workflow.
+function numberLocaleSetting(): 'auto' | 'en' | 'eu' {
+  const value = vscode.workspace.getConfiguration('dataFileViewer').get<string>('numberLocale', 'auto');
+  return value === 'en' || value === 'eu' ? value : 'auto';
+}
+
 // Most points a chart will draw. This is the viewer's OWN ceiling, not the
 // query's: a LIMIT you typed is honoured by runChartQuery and plotted in full.
 // This cap exists for the query that has no limit and matches ten million rows,
@@ -507,7 +516,11 @@ async function reconnectDocument(document: DuckDBDocument, forceReadOnly: boolea
   }
 
   const siblingPath = document.getSiblingPath();
-  const newFile = await DuckDbFile.open(document.uri.fsPath, document.forceKind, { forceReadOnly, siblingPath });
+  const newFile = await DuckDbFile.open(document.uri.fsPath, document.forceKind, {
+    forceReadOnly,
+    siblingPath,
+    numberLocale: numberLocaleSetting(),
+  });
   if (document.disposed) {
     // dispose() fired while this reconnect was in flight — don't swap a
     // fresh connection into a now-dead document (a connection leak, and a
@@ -820,7 +833,10 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
       if (isFlatFile) releaseLock = await acquireFileLock(uri.fsPath);
 
       const siblingPath = forceKind === 'kdb' ? undefined : resolveSiblingPath(uri.fsPath);
-      const file = await DuckDbFile.open(uri.fsPath, forceKind, { siblingPath });
+      const file = await DuckDbFile.open(uri.fsPath, forceKind, {
+        siblingPath,
+        numberLocale: numberLocaleSetting(),
+      });
       if (file.isReadOnly()) {
         vscode.window.showWarningMessage(
           `${basename(uri.fsPath)}: opened read-only — this file is already open elsewhere. Edits will fail until the other handle is released.`

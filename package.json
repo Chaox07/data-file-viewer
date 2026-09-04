@@ -107,6 +107,12 @@
           "default": true,
           "description": "Preview the first table as soon as a file opens, instead of waiting for a click. For a file holding one table that click is pure ceremony; turn this off if opening a very large file should stay instant."
         },
+        "dataFileViewer.numberLocale": {
+          "type": "string",
+          "enum": ["auto", "en", "eu"],
+          "default": "auto",
+          "markdownDescription": "Decimal convention for CSV files. `auto` samples the file and decides; a file that carries no evidence is left as text and reported, rather than guessed at — reading `1.234` the wrong way is a silent factor of 1000. `en` reads `1,234.56`; `eu` reads Turkish/European `1.234,56`. Mirrors the ETL pipeline's NUMBER_LOCALE."
+        },
         "dataFileViewer.chartMaxPoints": {
           "type": "number",
           "default": 200000,
