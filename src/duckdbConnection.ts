@@ -145,6 +145,9 @@ async function sniffCsvLocale(
   }
 }
 
+/** What a worksheet declares (or, absent a declaration, measures) as its extent. */
+type SheetDimension = NonNullable<Awaited<ReturnType<typeof readSheetDimension>>>;
+
 /** Structure of one worksheet: where its header is, and what sits above it. */
 interface SheetShapeInfo {
   /** 1-based Excel row of the header. */
@@ -178,11 +181,9 @@ async function sniffSheetShape(
   connection: DuckDBConnection,
   filePathLiteral: string,
   sheetLiteral: string,
-  fsPath: string,
-  sheetPartPath: string
+  dim: SheetDimension | undefined
 ): Promise<SheetShapeInfo | undefined> {
   try {
-    const dim = await readSheetDimension(fsPath, sheetPartPath);
     if (!dim) return undefined;
     const sampleEnd = Math.min(dim.lastRow, SHEET_SHAPE_SAMPLE_ROWS);
     // Sampled from the sheet's own first column, the same bound the real read
@@ -264,11 +265,114 @@ interface ViewSource {
    * means `*` — the file exactly as DuckDB types it.
    */
   projection?: string[];
+  /**
+   * Cells the source declares, when it can be known cheaply. Only the budget
+   * below reads it; undefined means "don't cache", which is the safe answer.
+   */
+  cellCount?: number;
+  /** True once the name resolves to a real table holding the data, not a view. */
+  cached?: boolean;
 }
 
 function viewBodySql(source: ViewSource, filePath: string, tolerateErrors: boolean): string {
   const select = source.projection ? source.projection.join(', ') : '*';
   return `select ${select} from ${source.readExpr(filePath, tolerateErrors)}`;
+}
+
+/**
+ * Above this, a sheet is left as a view and re-read per query.
+ *
+ * 10 million cells is roughly 80 MB held as doubles — a ceiling a viewer can
+ * justify, against a workbook whose every query would otherwise inflate and
+ * XML-parse the whole package. Raw_Data, the sheet this was measured on, is
+ * 1.68 million.
+ */
+const MAX_CACHED_CELLS = 10_000_000;
+
+/** Column letters to a 0-based index, so "AA" comes after "Z" rather than before it. */
+function columnIndex(letters: string): number {
+  let n = 0;
+  for (const ch of letters) n = n * 26 + (ch.charCodeAt(0) - 64);
+  return n - 1;
+}
+
+function declaredCellCount(dim: {
+  firstRow: number;
+  lastRow: number;
+  firstCol: string;
+  lastCol: string;
+}): number {
+  const rows = Math.max(0, dim.lastRow - dim.firstRow + 1);
+  const cols = Math.max(0, columnIndex(dim.lastCol) - columnIndex(dim.firstCol) + 1);
+  return rows * cols;
+}
+
+let nextLoadId = 0;
+
+/**
+ * Replace whatever object stands behind `name` with a real table holding
+ * `body`'s result.
+ *
+ * Built under a temporary name and renamed into place rather than dropped
+ * first: a failure part-way through then leaves the existing object standing,
+ * instead of leaving the workbook with a sheet that no longer exists.
+ *
+ * `create or replace table x as select ... from x` is not an option — it is
+ * the object being read, and DuckDB has no promise that the read completes
+ * before the replace begins.
+ */
+async function replaceWithTable(
+  connection: DuckDBConnection,
+  name: string,
+  body: string,
+  currentlyCached: boolean
+): Promise<void> {
+  const target = quoteIdent(name);
+  const tmp = quoteIdent(`__dfv_load_${nextLoadId++}`);
+  await connection.run(`create table ${tmp} as ${body}`);
+  try {
+    await connection.run(currentlyCached ? `drop table ${target}` : `drop view ${target}`);
+  } catch (err) {
+    await connection.run(`drop table if exists ${tmp}`);
+    throw err;
+  }
+  await connection.run(`alter table ${tmp} rename to ${target}`);
+}
+
+/**
+ * Read a sheet once, into memory, instead of once per query.
+ *
+ * Measured on YieldCurve_Data.xlsx (21 MB, two sheets). Opening it inflated
+ * and XML-parsed the package SIX times — a 200-row shape sample, a sampling
+ * scan and a verification scan, per sheet — and then once more for every
+ * query the user made:
+ *
+ *              as a view     as a table
+ *   limit 100      545 ms          8 ms
+ *   count(*)       801 ms          0 ms
+ *   sort           1369 ms         7 ms
+ *
+ * The cost is the package, not the row count: reading 200 rows of Raw_Data
+ * takes 601 ms, the same as reading all 16,803. So a workbook is the one kind
+ * here where re-reading per query is not a reasonable default, and the table
+ * costs 646 ms once.
+ *
+ * Returns whether the swap happened; a failure leaves the view in place and
+ * the file simply stays slower.
+ */
+async function cacheSheetAsTable(
+  connection: DuckDBConnection,
+  name: string,
+  source: ViewSource
+): Promise<boolean> {
+  if (source.cellCount === undefined || source.cellCount > MAX_CACHED_CELLS) return false;
+  try {
+    await replaceWithTable(connection, name, `select * from ${quoteIdent(name)}`, false);
+    source.cached = true;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** The read_csv() call for a CSV, with locale options only when we have grounds for them. */
@@ -428,11 +532,18 @@ async function interpretTextColumns(
   });
   try {
     source.projection = projection;
-    await connection.run(
-      `create or replace view ${view} as ${viewBodySql(source, source.sourcePath, false)}`
-    );
+    if (source.cached) {
+      // Already in memory: project off the table rather than off the file, so
+      // the interpretation costs a scan of what is already there instead of
+      // another read of the whole package.
+      await replaceWithTable(connection, viewName, `select ${projection.join(', ')} from ${view}`, true);
+    } else {
+      await connection.run(
+        `create or replace view ${view} as ${viewBodySql(source, source.sourcePath, false)}`
+      );
+    }
   } catch {
-    // Leave the view as it was rather than half-applying an interpretation.
+    // Leave the object as it was rather than half-applying an interpretation.
     source.projection = undefined;
     return [];
   }
@@ -1387,11 +1498,15 @@ export class DuckDbFile {
           // (see sheetBlocks.ts), and give read_xlsx an explicit range when
           // the header is not already row 1. Structure only: nothing is
           // dropped, and the rows above the header come back as notes.
-          const shape = await sniffSheetShape(connection, filePath, asLiteral, path, sheet.path);
+          // Read once per sheet and used twice: to find the header row, and to
+          // decide whether the sheet is small enough to hold in memory.
+          const dim = await readSheetDimension(path, sheet.path);
+          const shape = await sniffSheetShape(connection, filePath, asLiteral, dim);
           const source: ViewSource = {
             sourcePath: path,
             readExpr: (p, tolerate) =>
               xlsxReadExpr(p.replace(/'/g, "''"), asLiteral, shape, tolerate),
+            cellCount: dim ? declaredCellCount(dim) : undefined,
           };
           await connection.run(`create view "${asIdent}" as ${viewBodySql(source, path, false)}`);
           viewSources.set(sheet.name, source);
@@ -1438,6 +1553,22 @@ export class DuckDbFile {
         }
       }
       await connection.run(`use "${mainObjectName}"`);
+    }
+
+    // A workbook is read into memory once, before anything else queries it.
+    // Ordered before the interpretation below on purpose: that pass makes two
+    // passes over each sheet, and against a view every one of them re-inflates
+    // the whole package. See cacheSheetAsTable for the measurements.
+    if (isXlsx) {
+      // Budgeted across the WORKBOOK, not per sheet: a workbook of forty
+      // sheets that each pass the per-sheet test would otherwise be held in
+      // memory forty times over. Sheets are taken in workbook order, so which
+      // ones make the cut is at least predictable.
+      let budget = MAX_CACHED_CELLS;
+      for (const [name, source] of viewSources) {
+        if ((source.cellCount ?? Infinity) > budget) continue;
+        if (await cacheSheetAsTable(connection, name, source)) budget -= source.cellCount ?? 0;
+      }
     }
 
     // Every view exists by now, so read the text columns and say what they
@@ -1769,6 +1900,11 @@ export class DuckDbFile {
           // materialized into a real table, where this connection's data no
           // longer comes from the file at all.
           if (this.materialized) return false;
+          // ...and the other exception: a workbook sheet held in memory is a
+          // real table too, so "each query re-reads the file" stops being true
+          // and this is where it has to be made true again. Without it, Live
+          // on a workbook would poll happily and show the same rows forever.
+          await this.reloadCachedSheets();
           break;
         case 'duckdb':
           // A DuckDB database's MVCC snapshot is fixed for the life of the
@@ -1783,6 +1919,31 @@ export class DuckDbFile {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * Re-read the sheets being held in memory, so a cached workbook is still a
+   * view of the file rather than a snapshot of it.
+   *
+   * Best-effort per sheet: one sheet that has become unreadable (the file is
+   * mid-write, or has been replaced by something that is not a workbook) leaves
+   * the previous table standing, which is stale but coherent, rather than
+   * taking the sheet out of the catalog entirely.
+   */
+  private async reloadCachedSheets(): Promise<void> {
+    for (const [name, source] of this.viewSources) {
+      if (!source.cached) continue;
+      try {
+        await replaceWithTable(
+          this.connection,
+          name,
+          viewBodySql(source, source.sourcePath, this.xlsxErrorsTolerated),
+          true
+        );
+      } catch {
+        // Keep what we have.
+      }
     }
   }
 
@@ -2564,8 +2725,19 @@ export class DuckDbFile {
       expectedCurrent: rowValues[column],
       newValue,
     });
-    // The view is `read_xlsx(...)`, re-read on every query, so the next one
-    // already sees the file as it now is. Nothing to invalidate.
+    // An uncached sheet is `read_xlsx(...)`, re-read on every query, so the
+    // next one already sees the file as it now is. A cached one is a table,
+    // and would keep showing the pre-edit value: the edit would land in the
+    // file and appear not to have happened.
+    const source = this.viewSources.get(table);
+    if (source?.cached) {
+      await replaceWithTable(
+        this.connection,
+        table,
+        viewBodySql(source, source.sourcePath, this.xlsxErrorsTolerated),
+        true
+      );
+    }
     return 1;
   }
 
