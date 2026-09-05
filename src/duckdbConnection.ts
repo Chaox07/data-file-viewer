@@ -2731,12 +2731,23 @@ export class DuckDbFile {
     // file and appear not to have happened.
     const source = this.viewSources.get(table);
     if (source?.cached) {
-      await replaceWithTable(
-        this.connection,
-        table,
-        viewBodySql(source, source.sourcePath, this.xlsxErrorsTolerated),
-        true
-      );
+      try {
+        await replaceWithTable(
+          this.connection,
+          table,
+          viewBodySql(source, source.sourcePath, this.xlsxErrorsTolerated),
+          true
+        );
+      } catch {
+        // The write already succeeded, so this is not a failed edit and must
+        // not be reported as one. The grid is behind by one cell until the
+        // next refresh or reopen; saying "the edit failed" about an edit that
+        // is in the file would be the worse of the two.
+        this.lateWarnings.push(
+          `The edit was saved, but "${table}" could not be re-read from the workbook — ` +
+            `the grid may show the previous value until you reopen the file.`
+        );
+      }
     }
     return 1;
   }
