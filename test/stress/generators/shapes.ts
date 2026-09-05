@@ -311,18 +311,20 @@ registerCase({
 });
 
 /**
- * A title row above the header collapses the whole sheet to one column.
+ * A title row above the header used to collapse the whole sheet to one column.
  *
  * read_xlsx takes the first row of the sheet as the header, full stop. A
  * workbook whose sheet opens with a merged title banner -- which is most
- * workbooks a human made -- therefore reads as a single column named after the
- * title, with the real header sitting in the data as row 1.
+ * workbooks a human made -- therefore read as a single column named after the
+ * title, with the real header sitting in the data as row 1: the file opened,
+ * the grid drew, and what it showed was not the table.
  *
- * This is the worst category in this suite's ranking: the file opens, the grid
- * draws, and what it shows is not the table. Nothing warns the user. It is
- * pinned rather than fixed because the fix is a real feature (offer a header
- * row / range, the way read_xlsx's own options allow) and not a one-line
- * change, but it should not go unrecorded in the meantime.
+ * Now fixed, in two halves. sheetBlocks.ts finds the header by width and
+ * duckdbConnection gives read_xlsx an explicit range; and, for this case
+ * specifically, readSheetDimension measures the sheet's bounds when it
+ * declares no `<dimension>` -- which this hand-built workbook does not, and
+ * nor do plenty of real writers. Without that measurement there was no end row
+ * to build a range from, so the shape work could not engage at all.
  */
 registerCase({
   name: 'shapes_xlsx_title_row_above',
@@ -330,8 +332,6 @@ registerCase({
   expect: {
     note: 'a workbook with a title row above the header still shows the real table',
     hasColumns: ['id', 'label', 'amount'],
-    knownBug:
-      'read_xlsx always treats sheet row 1 as the header, so a title banner above the table collapses the sheet to one column and the real header becomes data — shown with no warning',
   },
   build: async (ctx) => ({
     path: await w.xlsxFile(join(ctx.dir, 'title.xlsx'), [

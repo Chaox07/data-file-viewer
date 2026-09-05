@@ -18,6 +18,16 @@ import { KNOWN_FREQUENCIES, type SeriesFrequency } from './chartSpec';
 import { csvLocaleOptions, decideFile, type NumberLocale } from './numericLocale';
 import { listSheets, readSheetDimension } from './xlsxSheets';
 import { analyseSheet, needsBlockHandling, notesText, type Cell } from './sheetBlocks';
+import {
+  EXCEL_ERROR_TOKENS,
+  classifyTextColumn,
+  isExcelError,
+  markerBlankExpr,
+  markerCountExpr,
+  markerNullExpr,
+  markerResidueExpr,
+  nonMarkerCountExpr,
+} from './textColumns';
 import { patchCell as patchXlsxCell } from './xlsxWrite';
 
 export type StatsKind = 'numeric' | 'datetime' | 'other';
@@ -75,6 +85,12 @@ export interface DuckDbFileOpenOptions {
    * Mirrors ETL's NUMBER_LOCALE escape hatch.
    */
   numberLocale?: 'auto' | NumberLocale;
+  /**
+   * Cell values read as "no value here" — Excel's error markers. Defaults to
+   * EXCEL_ERROR_TOKENS; an empty array turns the whole interpretation off and
+   * shows the file's literal text, which is what makes it reversible.
+   */
+  nullText?: readonly string[];
 }
 
 /** What the locale sniff concluded, for the notice the viewer shows. */
@@ -135,6 +151,16 @@ interface SheetShapeInfo {
   headerExcelRow: number;
   /** Last row the sheet declares, for the range's end bound. */
   lastRow: number;
+  /**
+   * First column the sheet declares — the range's LEFT bound, not "A".
+   *
+   * Both sheets of YieldCurve_Data.xlsx declare `B2:AH16809`: column A is
+   * empty throughout. Anchoring the range at A instead gave every sheet a
+   * leading all-NULL column named `C0` (34 columns where the sheet has 33),
+   * and shifted sheetBlocks' header text by one against its own width, so the
+   * last real column fell off the end of the detected header.
+   */
+  firstCol: string;
   /** Last column the sheet declares. */
   lastCol: string;
   /** Preamble/note lines, kept rather than discarded. */
@@ -159,16 +185,30 @@ async function sniffSheetShape(
     const dim = await readSheetDimension(fsPath, sheetPartPath);
     if (!dim) return undefined;
     const sampleEnd = Math.min(dim.lastRow, SHEET_SHAPE_SAMPLE_ROWS);
+    // Sampled from the sheet's own first column, the same bound the real read
+    // uses below, so the column indices sheetBlocks reasons about are the
+    // indices the data actually has.
     const reader = await connection.runAndReadAll(
       `select * from read_xlsx('${filePathLiteral}', sheet = '${sheetLiteral}', ` +
         `header = false, all_varchar = true, ignore_errors = true, ` +
-        `range = 'A1:${dim.lastCol}${sampleEnd}')`
+        `range = '${dim.firstCol}1:${dim.lastCol}${sampleEnd}')`
     );
-    const shape = analyseSheet(reader.getRows() as Cell[][]);
+    const rows = reader.getRows() as Cell[][];
+    const shape = analyseSheet(rows);
     if (!shape.table || !needsBlockHandling(shape)) return undefined;
+    // Where the range ENDS is as much a decision as where it starts. The
+    // sheet's last row is the right bound only when the table runs to it; on a
+    // sheet with notes UNDER the table, ending there sweeps the blank line and
+    // the notes in as data rows. (Measured: a four-row table with two note
+    // lines below it read back as seven rows.) `endRow` is exclusive and
+    // 0-based, so it is already the 1-based last row of the block; it can only
+    // be trusted when the block ended before the sample did, because a block
+    // that reaches the end of the sample may simply have been cut off by it.
+    const tableEndedInSample = shape.table.endRow < rows.length;
     return {
       headerExcelRow: (shape.table.headerRow ?? 0) + 1,
-      lastRow: dim.lastRow,
+      lastRow: tableEndedInSample ? shape.table.endRow : dim.lastRow,
+      firstCol: dim.firstCol,
       lastCol: dim.lastCol,
       notes: notesText(shape),
     };
@@ -182,17 +222,53 @@ async function sniffSheetShape(
 function xlsxReadExpr(
   filePathLiteral: string,
   sheetLiteral: string,
-  shape: SheetShapeInfo | undefined
+  shape: SheetShapeInfo | undefined,
+  tolerateErrors = false
 ): string {
-  if (!shape) return `read_xlsx('${filePathLiteral}', sheet = '${sheetLiteral}')`;
+  if (!shape) {
+    const tolerate = tolerateErrors ? ', ignore_errors = true' : '';
+    return `read_xlsx('${filePathLiteral}', sheet = '${sheetLiteral}'${tolerate})`;
+  }
   // ignore_errors: a ranged read types each column from the range, and one
   // uncomputable cell in a 16,000-row sheet would otherwise refuse the lot.
-  // The existing xlsxErrorsTolerated path does the same for the same reason.
+  // The existing xlsxErrorsTolerated path does the same for the same reason,
+  // which is why a shaped sheet never needs that repair.
   return (
     `read_xlsx('${filePathLiteral}', sheet = '${sheetLiteral}', ` +
-    `range = 'A${shape.headerExcelRow}:${shape.lastCol}${shape.lastRow}', ` +
+    `range = '${shape.firstCol}${shape.headerExcelRow}:${shape.lastCol}${shape.lastRow}', ` +
     `header = true, ignore_errors = true)`
   );
+}
+
+/**
+ * How one view is built, for any copy of the file.
+ *
+ * Three places create these views — open(), the ignore_errors repair, and the
+ * backup copy Safe Mode diffs against — and they have to agree, because the
+ * diff pairs the two catalogs up by table name and compares row by row. Before
+ * this existed each site spelled its own read out, so a sheet the shape sniffer
+ * had opened as 33 columns of numbers was re-opened by the other two as the
+ * 3-column preamble, and every value in the diff read as changed.
+ */
+interface ViewSource {
+  /**
+   * The file this view actually reads. Differs from the document's own path
+   * for exactly one kind: a .feather file is converted to an Arrow stream in a
+   * temp dir first, and the view reads the conversion.
+   */
+  sourcePath: string;
+  /** The read_*() expression, for whichever copy of the file is being read. */
+  readExpr: (filePath: string, tolerateErrors: boolean) => string;
+  /**
+   * The select list, once interpretTextColumns has decided one. `undefined`
+   * means `*` — the file exactly as DuckDB types it.
+   */
+  projection?: string[];
+}
+
+function viewBodySql(source: ViewSource, filePath: string, tolerateErrors: boolean): string {
+  const select = source.projection ? source.projection.join(', ') : '*';
+  return `select ${select} from ${source.readExpr(filePath, tolerateErrors)}`;
 }
 
 /** The read_csv() call for a CSV, with locale options only when we have grounds for them. */
@@ -204,6 +280,203 @@ function csvReadExpr(filePath: string, locale: NumberLocale | null): string {
   }
   const { decimal, thousands } = csvLocaleOptions(locale);
   return `read_csv(${quoteLiteral(filePath)}, decimal_separator=${quoteLiteral(decimal)}, thousands=${quoteLiteral(thousands)})`;
+}
+
+/** How many rows to sample when deciding what a text column holds. */
+const TEXT_COLUMN_SAMPLE_ROWS = 2000;
+
+/**
+ * Read a view's text columns as numbers where they demonstrably are numbers
+ * with Excel error markers in them, and report what was done.
+ *
+ * Runs over every format that is exposed as a view — CSV, XLSX, Parquet,
+ * Arrow, dta — which is why it takes the ViewSource rather than reading back
+ * the view it is about to replace: `create or replace view v as select ... from
+ * v` is circular, and going through duckdb_views() to recover the body would
+ * make this depend on how DuckDB chooses to print it. Recording the decision on
+ * the ViewSource rather than only in the catalog is what lets the backup copy
+ * be read the same way.
+ *
+ * DELIBERATELY NOT applied to attached .duckdb/.sqlite tables. Those are real
+ * tables with a schema the file itself declares; a column is VARCHAR there
+ * because its writer said so. Reinterpreting untyped text out of a
+ * spreadsheet is a reading of an ambiguous file — overriding a stated schema
+ * is a different and much larger claim, and not one a viewer should make.
+ *
+ * Returns the notices for openWarnings. Nothing is written to the file.
+ */
+async function interpretTextColumns(
+  connection: DuckDBConnection,
+  viewName: string,
+  label: string,
+  source: ViewSource,
+  tokens: readonly string[]
+): Promise<string[]> {
+  if (tokens.length === 0) return [];
+  const view = quoteIdent(viewName);
+
+  let names: string[];
+  let textColumns: string[];
+  try {
+    const head = await connection.runAndReadAll(`select * from ${view} limit 0`);
+    names = head.columnNames();
+    const typeIds = head.columnTypes().map((t) => t.typeId);
+    textColumns = names.filter((_, i) => typeIds[i] === DuckDBTypeId.VARCHAR);
+  } catch {
+    // A view we cannot describe is a view we leave exactly as it is.
+    return [];
+  }
+  if (textColumns.length === 0) return [];
+
+  // Sample first: this picks each column's decimal convention and throws out
+  // the plainly textual columns before the whole-column work below.
+  //
+  // A reservoir sample, NOT `limit N`. Measured on Raw_Data: its long-maturity
+  // columns hold "NA" for the first 3,274 rows, because those maturities did
+  // not exist in 1961 — so the first 2,000 rows of a 16,803-row column are
+  // markers and nothing else, and a head sample concluded "this column holds
+  // nothing but markers" for all 70 of them. The head of a time series is the
+  // least representative part of it. `repeatable` so two opens of the same
+  // file reach the same verdict.
+  let sampled: Map<string, (string | null)[]>;
+  try {
+    const reader = await connection.runAndReadAll(
+      `select ${textColumns.map(quoteIdent).join(', ')} from ${view} ` +
+        `using sample reservoir(${TEXT_COLUMN_SAMPLE_ROWS} rows) repeatable(1)`
+    );
+    const rows = reader.getRows();
+    sampled = new Map(
+      textColumns.map((name, i) => [
+        name,
+        rows.map((r) => (r[i] === null || r[i] === undefined ? null : String(r[i]))),
+      ])
+    );
+  } catch {
+    return [];
+  }
+
+  const candidates: { column: string; locale: NumberLocale }[] = [];
+  const blanked: string[] = [];
+  const refused: { column: string; residue: string[] }[] = [];
+  for (const column of textColumns) {
+    const values = sampled.get(column) ?? [];
+    const verdict = classifyTextColumn(values, tokens);
+    if (verdict.kind === 'numeric') candidates.push({ column, locale: verdict.locale });
+    else if (verdict.kind === 'markers-only') blanked.push(column);
+    else if (verdict.reason !== 'empty' && values.some((v) => v !== null && isExcelError(v, tokens))) {
+      // Only worth a notice when the column actually holds markers: that is a
+      // column where the user will SEE "#N/A" and wonder why this one was left
+      // alone. An ordinary text column is not news.
+      refused.push({ column, residue: verdict.residue });
+    }
+  }
+  if (candidates.length === 0 && blanked.length === 0) return refused.map(refusalNotice);
+
+  // Now the check that makes this safe rather than merely likely, over the
+  // WHOLE column rather than the sample. try_cast cannot tell "was a marker"
+  // from "was a value we could not read", so a column that is clean for 2,000
+  // rows and carries one written note at row 9,000 would have that note
+  // silently become NULL, indistinguishable from the markers. Measured on
+  // Raw_Data: 0.77s for 70 columns x 16,803 rows, so there is no case for
+  // sampling it.
+  let counts: number[] = [];
+  const probes = [
+    ...candidates.flatMap((c) => [
+      markerCountExpr(c.column, tokens),
+      markerResidueExpr(c.column, c.locale, tokens),
+    ]),
+    // The same question asked of a "nothing but markers" column: the sample
+    // said it was empty, and one value anywhere in it says otherwise.
+    ...blanked.map((column) => nonMarkerCountExpr(column, tokens)),
+  ];
+  try {
+    const reader = await connection.runAndReadAll(`select ${probes.join(', ')} from ${view}`);
+    counts = (reader.getRows()[0] as unknown[]).map(Number);
+  } catch {
+    return [];
+  }
+
+  const converted: { column: string; locale: NumberLocale; markers: number }[] = [];
+  candidates.forEach((c, i) => {
+    const markers = counts[2 * i] ?? 0;
+    const residue = counts[2 * i + 1] ?? 0;
+    if (residue > 0) refused.push({ column: c.column, residue: [] });
+    else converted.push({ ...c, markers });
+  });
+  const blankedConfirmed: string[] = [];
+  blanked.forEach((column, i) => {
+    if ((counts[2 * candidates.length + i] ?? 0) === 0) blankedConfirmed.push(column);
+    // The sample saw only markers and the whole column disagrees. We have no
+    // reading for values we never looked at, so the column keeps its text.
+    else refused.push({ column, residue: [] });
+  });
+
+  if (converted.length === 0 && blankedConfirmed.length === 0) {
+    return refused.map(refusalNotice);
+  }
+
+  const byName = new Map(converted.map((c) => [c.column, c]));
+  const blankSet = new Set(blankedConfirmed);
+  const projection = names.map((name) => {
+    const c = byName.get(name);
+    if (c) return `${markerNullExpr(name, c.locale, tokens)} as ${quoteIdent(name)}`;
+    // A column of nothing but markers: they still become NULL, because that is
+    // what they mean, but no type is invented for a column that never showed
+    // one. It stays VARCHAR, and every value in it is now empty.
+    if (blankSet.has(name)) return `${markerBlankExpr(name, tokens)} as ${quoteIdent(name)}`;
+    return quoteIdent(name);
+  });
+  try {
+    source.projection = projection;
+    await connection.run(
+      `create or replace view ${view} as ${viewBodySql(source, source.sourcePath, false)}`
+    );
+  } catch {
+    // Leave the view as it was rather than half-applying an interpretation.
+    source.projection = undefined;
+    return [];
+  }
+
+  const notices: string[] = [];
+  const totalMarkers = converted.reduce((n, c) => n + c.markers, 0);
+  if (converted.length > 0) {
+    const plural = converted.length === 1 ? '' : 's';
+    notices.push(
+      `${label}: ${converted.length} text column${plural} read as numbers` +
+        (totalMarkers > 0
+          ? `, with ${totalMarkers.toLocaleString('en-US')} Excel error marker${
+              totalMarkers === 1 ? '' : 's'
+            } shown as empty`
+          : '') +
+        `. The file itself is unchanged — set dataFileViewer.nullText to [] to read it literally.`
+    );
+  }
+  if (blankedConfirmed.length > 0) {
+    const n = blankedConfirmed.length;
+    notices.push(
+      `${label}: ${n} column${n === 1 ? '' : 's'} hold nothing but error markers ` +
+        `(${blankedConfirmed.slice(0, 3).join(', ')}${n > 3 ? ', …' : ''}) and are shown as empty. ` +
+        `They keep their original type — a column that never held a value cannot say what type it is.`
+    );
+  }
+  notices.push(...refused.map(refusalNotice));
+  return notices;
+}
+
+/**
+ * Why one column kept its text. Quotes the file's own values where we have
+ * them: "the rule said no" is not something a user can act on, and the value
+ * that caused it usually is.
+ */
+function refusalNotice(r: { column: string; residue: readonly string[] }): string {
+  const what =
+    r.residue.length > 0
+      ? `values such as ${r.residue.map((s) => `"${s}"`).join(', ')}`
+      : 'values that are neither markers nor numbers';
+  return (
+    `Column "${r.column}" was left as text: it holds error markers, but also ${what}, ` +
+    `so reading it as numbers would lose them.`
+  );
 }
 
 /**
@@ -813,7 +1086,13 @@ export class DuckDbFile {
      */
     private readonly xlsxSheetPaths: Map<string, string> = new Map(),
     /** Which decimal convention a CSV was read with, and what was refused. */
-    readonly numberLocale: NumberLocaleReport | undefined = undefined
+    readonly numberLocale: NumberLocaleReport | undefined = undefined,
+    /**
+     * View name -> how that view is built. Empty for the kinds that have no
+     * views of their own (.duckdb and .sqlite are ATTACHed, not read through
+     * a view). See ViewSource.
+     */
+    private readonly viewSources: Map<string, ViewSource> = new Map()
   ) {}
 
   isReadOnly(): boolean {
@@ -869,6 +1148,11 @@ export class DuckDbFile {
     let csvLocaleReport: NumberLocaleReport | undefined;
     // Populated for .xlsx only; see the constructor parameter of the same name.
     const xlsxSheetPaths = new Map<string, string>();
+    // How each view is built, keyed by view name. Populated by the branches
+    // below, handed to the instance, and used again by the ignore_errors
+    // repair and by the Safe Mode backup copy — see ViewSource.
+    const viewSources = new Map<string, ViewSource>();
+    const viewLabels = new Map<string, string>();
     const looksArrow = /\.(arrows?|feather)$/i.test(path);
     const isFeather = looksArrow && (await isFeatherEncoding(path));
     const isArrow = looksArrow && !isFeather;
@@ -945,14 +1229,18 @@ export class DuckDbFile {
     const rootReader = await connection.runAndReadAll('select current_database()');
     const rootCatalogName = String(rootReader.getRows()[0][0]);
 
-    const mainObjectName = basename(path, extname(path)).replace(/"/g, '""');
+    const mainObjectRawName = basename(path, extname(path));
+    const mainObjectName = mainObjectRawName.replace(/"/g, '""');
 
     if (isParquet) {
       // Exposed as a single view named after the file, so the sidebar's
       // "click a table to preview it" behavior works unchanged — Parquet
       // has no concept of multiple tables, just the one dataset.
       const filePath = path.replace(/'/g, "''");
-      await connection.run(`create view "${mainObjectName}" as select * from read_parquet('${filePath}')`);
+      const source: ViewSource = { sourcePath: path, readExpr: (p) => `read_parquet(${quoteLiteral(p)})` };
+      await connection.run(`create view "${mainObjectName}" as ${viewBodySql(source, path, false)}`);
+      viewSources.set(mainObjectRawName, source);
+      viewLabels.set(mainObjectRawName, mainObjectRawName);
     }
 
     if (isCsv) {
@@ -974,9 +1262,14 @@ export class DuckDbFile {
           : { locale: requested, undecidable: [], conflicting: false };
       csvLocaleReport = { ...sniffed, forced: requested !== 'auto' };
 
+      const source: ViewSource = { sourcePath: path, readExpr: (p) => csvReadExpr(p, sniffed.locale) };
+      // quoteIdent over the RAW name, not over mainObjectName, which has
+      // already had its quotes doubled -- the two together escaped twice.
       await connection.run(
-        `create view ${quoteIdent(mainObjectName)} as select * from ${csvReadExpr(path, sniffed.locale)}`
+        `create view ${quoteIdent(mainObjectRawName)} as ${viewBodySql(source, path, false)}`
       );
+      viewSources.set(mainObjectRawName, source);
+      viewLabels.set(mainObjectRawName, mainObjectRawName);
 
       for (const u of sniffed.undecidable) {
         const sample = u.samples[0] ?? '';
@@ -1011,7 +1304,10 @@ export class DuckDbFile {
         );
       }
       const filePath = path.replace(/'/g, "''");
-      await connection.run(`create view "${mainObjectName}" as select * from read_dta('${filePath}')`);
+      const source: ViewSource = { sourcePath: path, readExpr: (p) => `read_dta(${quoteLiteral(p)})` };
+      await connection.run(`create view "${mainObjectName}" as ${viewBodySql(source, path, false)}`);
+      viewSources.set(mainObjectRawName, source);
+      viewLabels.set(mainObjectRawName, mainObjectRawName);
     }
 
     if (isArrow || isFeather) {
@@ -1041,7 +1337,10 @@ export class DuckDbFile {
         await assertArrowStreamComplete(path);
       }
       const filePath = readPath.replace(/'/g, "''");
-      await connection.run(`create view "${mainObjectName}" as select * from read_arrow('${filePath}')`);
+      const source: ViewSource = { sourcePath: readPath, readExpr: (p) => `read_arrow(${quoteLiteral(p)})` };
+      await connection.run(`create view "${mainObjectName}" as ${viewBodySql(source, source.sourcePath, false)}`);
+      viewSources.set(mainObjectRawName, source);
+      viewLabels.set(mainObjectRawName, mainObjectRawName);
     }
 
     if (isXlsx) {
@@ -1089,9 +1388,14 @@ export class DuckDbFile {
           // the header is not already row 1. Structure only: nothing is
           // dropped, and the rows above the header come back as notes.
           const shape = await sniffSheetShape(connection, filePath, asLiteral, path, sheet.path);
-          await connection.run(
-            `create view "${asIdent}" as select * from ${xlsxReadExpr(filePath, asLiteral, shape)}`
-          );
+          const source: ViewSource = {
+            sourcePath: path,
+            readExpr: (p, tolerate) =>
+              xlsxReadExpr(p.replace(/'/g, "''"), asLiteral, shape, tolerate),
+          };
+          await connection.run(`create view "${asIdent}" as ${viewBodySql(source, path, false)}`);
+          viewSources.set(sheet.name, source);
+          viewLabels.set(sheet.name, `Sheet "${sheet.name}"`);
           if (shape && shape.notes.length > 0) {
             openWarnings.push(
               `Sheet "${sheet.name}": the table starts at row ${shape.headerExcelRow}. ` +
@@ -1136,6 +1440,17 @@ export class DuckDbFile {
       await connection.run(`use "${mainObjectName}"`);
     }
 
+    // Every view exists by now, so read the text columns and say what they
+    // hold. Runs after the sheet loop rather than inside it because one
+    // sheet's interpretation must not be able to cost the user that sheet: a
+    // throw inside the loop is caught there as "this sheet is unreadable".
+    const nullText = options?.nullText ?? EXCEL_ERROR_TOKENS;
+    for (const [view, source] of viewSources) {
+      openWarnings.push(
+        ...(await interpretTextColumns(connection, view, viewLabels.get(view) ?? view, source, nullText))
+      );
+    }
+
     const catalogReader = await connection.runAndReadAll('select current_database()');
     const catalogName = String(catalogReader.getRows()[0][0]);
 
@@ -1177,7 +1492,8 @@ export class DuckDbFile {
       featherTempDir,
       openWarnings,
       xlsxSheetPaths,
-      csvLocaleReport
+      csvLocaleReport,
+      viewSources
     );
   }
 
@@ -1534,15 +1850,18 @@ export class DuckDbFile {
     if (!isCellParseError(err)) return false;
 
     this.xlsxErrorsTolerated = true;
-    const filePath = this.path.replace(/'/g, "''");
     const repaired: string[] = [];
     for (const name of this.xlsxSheetPaths.keys()) {
-      const asLiteral = name.replace(/'/g, "''");
+      const source = this.viewSources.get(name);
+      if (!source) continue;
       const asIdent = name.replace(/"/g, '""');
       try {
+        // Rebuilt from the sheet's own ViewSource, not from a fresh
+        // read_xlsx(): a sheet whose header is not row 1 is read through a
+        // range, and re-reading it without one would put the view back to the
+        // preamble block — three columns and one row — to rescue a cell.
         await this.connection.run(
-          `create or replace view "${asIdent}" as select * from ` +
-            `read_xlsx('${filePath}', sheet = '${asLiteral}', ignore_errors = true)`
+          `create or replace view "${asIdent}" as ${viewBodySql(source, source.sourcePath, true)}`
         );
         repaired.push(name);
       } catch {
@@ -1859,18 +2178,20 @@ export class DuckDbFile {
       // uses -- the diff pairs the two catalogs up by table name. Reading a
       // workbook with read_csv_auto, which is what the old fallback did, fails
       // on the ZIP header and takes Safe Mode down with it.
-      const literalPath = quoteLiteral(backupPath);
-      // If this workbook already needed ignore_errors to be readable, its
-      // backup needs it too -- otherwise the diff throws on the same
-      // uncomputable cell that the live side is already tolerating.
-      const tolerate = this.xlsxErrorsTolerated ? ', ignore_errors = true' : '';
+      // Built from each sheet's own ViewSource, pointed at the backup copy.
+      // The diff pairs the catalogs by table name and compares row by row, so
+      // the two sides have to be read the same way: same range, same header
+      // row, same error-marker interpretation. Spelling the read out again
+      // here is what made a shaped sheet diff its 33 numeric columns against
+      // the backup's 3 preamble ones.
       let created = 0;
       for (const name of this.xlsxSheetPaths.keys()) {
-        const asLiteral = name.replace(/'/g, "''");
+        const source = this.viewSources.get(name);
+        if (!source) continue;
         const asIdent = name.replace(/"/g, '""');
         try {
           await this.connection.run(
-            `create view "${asIdent}" as select * from read_xlsx(${literalPath}, sheet = '${asLiteral}'${tolerate})`
+            `create view "${asIdent}" as ${viewBodySql(source, backupPath, this.xlsxErrorsTolerated)}`
           );
           created++;
         } catch {
@@ -1894,20 +2215,16 @@ export class DuckDbFile {
       this.backupTempDir = converted.tempDir;
     }
 
-    // A CSV rebuilds through csvReadExpr(), not a bare read_csv_auto: the
-    // convention decided at open time has to survive, or the backup copy
-    // would be read one way and the live file the other, and every value in
-    // a Turkish column would show as changed.
-    const readExpr =
-      this.kind === 'parquet'
-        ? `read_parquet(${quoteLiteral(readPath)})`
-        : this.kind === 'dta'
-          ? `read_dta(${quoteLiteral(readPath)})`
-          : this.kind === 'arrow' || this.kind === 'feather'
-            ? `read_arrow(${quoteLiteral(readPath)})`
-            : csvReadExpr(readPath, this.numberLocale?.locale ?? null);
+    // Rebuilt through the view's own ViewSource, so everything decided at open
+    // time survives onto the backup side: a CSV's decimal convention, and any
+    // text column read as numbers. Read the backup one way and the live file
+    // the other and every value in an affected column shows as changed.
+    const source = this.viewSources.get(basename(this.path, extname(this.path)));
+    if (!source) {
+      throw new Error(`No view definition recorded for "${basename(this.path)}".`);
+    }
     await this.connection.run(
-      `create view ${quoteIdent(this.mainObjectName)} as select * from ${readExpr}`
+      `create view ${quoteIdent(this.mainObjectName)} as ${viewBodySql(source, readPath, false)}`
     );
   }
 

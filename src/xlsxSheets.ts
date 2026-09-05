@@ -135,8 +135,32 @@ export async function listSheets(filePath: string): Promise<XlsxSheet[]> {
  * treat a too-large end row as normal. Returns undefined when the sheet
  * declares nothing, which is legal.
  *
+ * `<dimension>` is OPTIONAL in the format, and plenty of writers omit it. A
+ * sheet that declares nothing used to get no block handling at all — the
+ * caller had no end row, so it fell back to the unranged read and the
+ * preamble-only open this exists to prevent. So when the declaration is
+ * missing the bounds are measured from the sheet's own cell references
+ * instead.
+ *
+ * Guessing a generous range instead is NOT an option, and this is worth
+ * recording: `range = 'A1:XFD1048576'` does not return the used cells, it
+ * materialises the whole grid. Measured on a five-row sheet, it took the
+ * process out with an out-of-memory kill. A bounded range pads too —
+ * 'A1:Z200' on that same sheet returns 200 rows of 26 columns — so the end
+ * bound has to be real.
+ *
  * Only this one worksheet part is inflated, not the whole workbook.
  */
+
+/**
+ * Above this, a sheet with no `<dimension>` is left to the unranged read
+ * rather than scanned for its bounds. The scan is linear in the part's size
+ * and this runs per sheet at open; a workbook big enough to matter is also
+ * one written by a tool that declares its dimension (verified on
+ * YieldCurve_Data.xlsx, whose 78 MB part declares B1:CW16814).
+ */
+const MAX_BOUNDS_SCAN_BYTES = 32 * 1024 * 1024;
+
 export async function readSheetDimension(
   filePath: string,
   sheetPath: string
@@ -155,11 +179,59 @@ export async function readSheetDimension(
   // before the row data, so this never scans a large sheet body.
   const head = strFromU8(part.subarray(0, Math.min(part.length, 4096)));
   const m = /<(?:[A-Za-z0-9_.-]+:)?dimension\s+ref="([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?"/.exec(head);
-  if (!m) return undefined;
-  const firstCol = m[1];
-  const firstRow = Number(m[2]);
-  const lastCol = m[3] ?? m[1];
-  const lastRow = Number(m[4] ?? m[2]);
-  if (!Number.isFinite(firstRow) || !Number.isFinite(lastRow)) return undefined;
-  return { firstRow, lastRow, firstCol, lastCol };
+  if (m) {
+    const firstCol = m[1];
+    const firstRow = Number(m[2]);
+    const lastCol = m[3] ?? m[1];
+    const lastRow = Number(m[4] ?? m[2]);
+    if (Number.isFinite(firstRow) && Number.isFinite(lastRow)) {
+      return { firstRow, lastRow, firstCol, lastCol };
+    }
+  }
+  if (part.length > MAX_BOUNDS_SCAN_BYTES) return undefined;
+  return measureSheetBounds(strFromU8(part));
+}
+
+/** Column letters to a 0-based index, so "AA" sorts after "Z" rather than before it. */
+function columnIndex(letters: string): number {
+  let n = 0;
+  for (const ch of letters) n = n * 26 + (ch.charCodeAt(0) - 64);
+  return n - 1;
+}
+
+function columnLetters(index: number): string {
+  let out = '';
+  let n = index;
+  for (;;) {
+    out = String.fromCharCode(65 + (n % 26)) + out;
+    if (n < 26) return out;
+    n = Math.floor(n / 26) - 1;
+  }
+}
+
+/** The bounds a sheet with no `<dimension>` actually occupies, from its cell refs. */
+function measureSheetBounds(
+  xml: string
+): { firstRow: number; lastRow: number; firstCol: string; lastCol: string } | undefined {
+  const cellRef = /<c\s[^>]*?r="([A-Z]+)(\d+)"/g;
+  let firstColIndex = Number.POSITIVE_INFINITY;
+  let lastColIndex = -1;
+  let firstRow = Number.POSITIVE_INFINITY;
+  let lastRow = -1;
+  let match: RegExpExecArray | null;
+  while ((match = cellRef.exec(xml)) !== null) {
+    const col = columnIndex(match[1]);
+    const row = Number(match[2]);
+    if (col < firstColIndex) firstColIndex = col;
+    if (col > lastColIndex) lastColIndex = col;
+    if (row < firstRow) firstRow = row;
+    if (row > lastRow) lastRow = row;
+  }
+  if (lastColIndex < 0 || lastRow < 0) return undefined;
+  return {
+    firstRow,
+    lastRow,
+    firstCol: columnLetters(firstColIndex),
+    lastCol: columnLetters(lastColIndex),
+  };
 }

@@ -13,6 +13,7 @@ import {
   fnv1aFold,
   hasTrailingLimit,
 } from './duckdbConnection';
+import { EXCEL_ERROR_TOKENS } from './textColumns';
 import { ChartPanel } from './chartPanel';
 import { destructiveReason, hasMultipleStatements } from './sqlSafety';
 import { LiveRefreshController, LiveStatus } from './liveRefresh';
@@ -48,6 +49,20 @@ function isPreviewFirstTableEnabled(): boolean {
 function numberLocaleSetting(): 'auto' | 'en' | 'eu' {
   const value = vscode.workspace.getConfiguration('dataFileViewer').get<string>('numberLocale', 'auto');
   return value === 'en' || value === 'eu' ? value : 'auto';
+}
+
+// Cell text that means "no value here" — Excel's error markers. Read per open
+// like the locale above, so setting it to [] and reopening shows the file's
+// literal text, which is what makes the interpretation reversible rather than
+// merely announced.
+function nullTextSetting(): readonly string[] {
+  const value = vscode.workspace
+    .getConfiguration('dataFileViewer')
+    .get<unknown>('nullText', EXCEL_ERROR_TOKENS as unknown as string[]);
+  // An explicit [] is a real answer and must survive; only a non-array (a
+  // hand-edited settings.json with a string in it) falls back to the default.
+  if (!Array.isArray(value)) return EXCEL_ERROR_TOKENS;
+  return value.filter((v): v is string => typeof v === 'string' && v.trim() !== '');
 }
 
 // Most points a chart will draw. This is the viewer's OWN ceiling, not the
@@ -555,6 +570,7 @@ async function reconnectDocument(document: DuckDBDocument, forceReadOnly: boolea
     forceReadOnly,
     siblingPath,
     numberLocale: numberLocaleSetting(),
+    nullText: nullTextSetting(),
   });
   if (document.disposed) {
     // dispose() fired while this reconnect was in flight — don't swap a
@@ -877,6 +893,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
       const file = await DuckDbFile.open(uri.fsPath, forceKind, {
         siblingPath,
         numberLocale: numberLocaleSetting(),
+        nullText: nullTextSetting(),
       });
       if (file.isReadOnly()) {
         vscode.window.showWarningMessage(
