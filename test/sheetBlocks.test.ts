@@ -5,6 +5,7 @@ import {
   dedupe,
   needsBlockHandling,
   notesText,
+  sheetFragments,
   splitBlocks,
   type Cell,
 } from '../src/sheetBlocks';
@@ -173,4 +174,48 @@ test('nothing here mutates its input', () => {
   analyseSheet(rows);
   splitBlocks(rows);
   assert.equal(JSON.stringify(rows), snapshot);
+});
+
+test('every rectangle the main table does not cover comes back as a fragment', () => {
+  const rows: Cell[][] = [
+    ['Note: not an official release', null, null],
+    [],
+    ['Series', 'Convention', 'Mnemonic'],
+    ['Zero-coupon', 'Continuous', 'SVENYXX'],
+    [],
+    ['#of Years to Maturity', null, null],
+    ['Date', 'one', 'two'],
+    ['2024-01-01', 1, 2],
+    ['2024-01-02', 3, 4],
+  ];
+  const shape = analyseSheet(rows);
+  assert.equal(shape.table?.headerRow, 6, 'the data block is the table');
+
+  assert.deepEqual(sheetFragments(shape), [
+    // The footnote: one cell, so one column -- not the sheet's three.
+    { startRow: 0, endRow: 1, firstCol: 0, lastCol: 0, hasHeader: false },
+    // The definitions table, header and all.
+    { startRow: 2, endRow: 4, firstCol: 0, lastCol: 2, hasHeader: true },
+    // The caption, which is inside the main table's own block.
+    { startRow: 5, endRow: 6, firstCol: 0, lastCol: 0, hasHeader: false },
+  ]);
+});
+
+test('a sheet needing no interpretation has no fragments', () => {
+  const shape = analyseSheet([['Date', 'Value'], ['2024-01-01', 1]]);
+  assert.deepEqual(sheetFragments(shape), []);
+});
+
+test('a fragment is measured from its cells, never from a promoted header', () => {
+  // headerText pads with `_colN` placeholders, which are not blank: measuring
+  // the extent from them would report every block as spanning the sheet.
+  const rows: Cell[][] = [
+    ['a', 'b', null],
+    [1, 2, 3],
+    [],
+    ['x', 'y', null],
+  ];
+  const fragments = sheetFragments(analyseSheet(rows));
+  assert.equal(fragments.length, 1);
+  assert.equal(fragments[0].lastCol, 1, 'the second block reaches column B, not C');
 });

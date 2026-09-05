@@ -21,9 +21,19 @@
  * what that function does even with `discard_footnote_blocks = False`. The
  * things behind that flag -- `discard_footnote_blocks`,
  * `_looks_like_metadata_footer_block` (etl_shape.py:980), and every "is this
- * block worth keeping" heuristic -- are deliberately NOT ported. The viewer
- * only views: nothing is dropped, the preamble stays reachable, and the
- * caller can always ask for the sheet exactly as it is on disk.
+ * block worth keeping" heuristic -- are deliberately NOT ported.
+ *
+ * AND SAYING THAT IS NOT ENOUGH. The first version of this file picked the
+ * widest block, called the rest `notes`, and handed the caller a list of
+ * strings -- which the caller showed as three lines of a toast. Nothing was
+ * "dropped" in the sense that no code deleted it, and it was still gone: there
+ * was no object anywhere holding the footnote at the top of `Raw_Data`, so it
+ * could not be read, sorted, exported or plotted. Reported as exactly that.
+ *
+ * So `pickTable` still names the block the sheet is ABOUT -- something has to
+ * be the object called `Raw_Data` -- and `sheetFragments` below hands back
+ * every other rectangle on the sheet with the bounds needed to open each one
+ * as an object of its own. A sheet holding six things offers six things.
  *
  * WHERE THIS DIVERGES FROM ETL, and why. ETL decides "is the first row of
  * this block a header?" from the row itself -- all-strings, or a date-like
@@ -62,6 +72,31 @@ export interface SheetBlock {
   rows: Cell[][];
   /** The block's modal populated width. */
   width: number;
+  /**
+   * The columns this block actually occupies, as 0-based indices into the rows
+   * it was given. `-1` for both when the block holds nothing.
+   *
+   * The block's own extent, not the sheet's: `Raw_Data`'s footnote sits alone
+   * in column B of a sheet 100 columns wide, and reading it across the sheet's
+   * width would give one sentence and 99 empty columns. A caller turning a
+   * block into a range needs the block's own bounds.
+   */
+  firstCol: number;
+  lastCol: number;
+}
+
+/** The columns any of these rows populate, as 0-based indices. */
+function columnExtent(rows: readonly Cell[][]): { firstCol: number; lastCol: number } {
+  let firstCol = -1;
+  let lastCol = -1;
+  for (const row of rows) {
+    for (let i = 0; i < row.length; i++) {
+      if (isBlank(row[i])) continue;
+      if (firstCol === -1 || i < firstCol) firstCol = i;
+      if (i > lastCol) lastCol = i;
+    }
+  }
+  return { firstCol, lastCol };
 }
 
 export interface SheetShape {
@@ -199,6 +234,8 @@ export function splitBlocks(
       }
     }
 
+    const extent = columnExtent(body);
+
     if (headerIdx === -1) {
       return {
         startRow: start,
@@ -208,6 +245,7 @@ export function splitBlocks(
         preamble: [],
         rows: body,
         width,
+        ...extent,
       };
     }
 
@@ -223,6 +261,7 @@ export function splitBlocks(
       preamble: body.slice(0, headerIdx),
       rows: body.slice(headerIdx + 1),
       width,
+      ...extent,
     };
   });
 }
@@ -270,6 +309,80 @@ export function analyseSheet(
 export function needsBlockHandling(shape: SheetShape): boolean {
   if (!shape.table) return false;
   return shape.notes.length > 0 || shape.table.headerRow !== 0 || shape.table.preamble.length > 0;
+}
+
+/**
+ * One rectangle of a sheet that is not the main table.
+ *
+ * Everything here is an INDEX into the rows that were analysed, not an Excel
+ * address — the caller knows where its sample started and converts. Each one is
+ * meant to become its own object in the catalog, so that a sheet holding six
+ * things offers six things.
+ */
+export interface SheetFragment {
+  /** 0-based, into the analysed rows. */
+  startRow: number;
+  /** 0-based, exclusive. */
+  endRow: number;
+  /** 0-based column indices into those rows, inclusive. */
+  firstCol: number;
+  lastCol: number;
+  /**
+   * Whether the fragment's first row is a header for the rows under it.
+   *
+   * False for a caption, a footnote, or any block no header could be promoted
+   * for — read those with `header = false`, or a lone sentence becomes a
+   * column name and the fragment comes back with no rows at all.
+   */
+  hasHeader: boolean;
+}
+
+/**
+ * Every part of the sheet the main table does not cover, in sheet order.
+ *
+ * Two sources: the rows above the main table's header inside its own block (a
+ * spanning label, a caption), and every other block. A block that has both a
+ * caption and a header of its own yields two fragments for the same reason the
+ * main table does — the caption is not a column name.
+ */
+export function sheetFragments(shape: SheetShape): SheetFragment[] {
+  const out: SheetFragment[] = [];
+  const push = (startRow: number, endRow: number, rows: readonly Cell[][], hasHeader: boolean) => {
+    if (endRow <= startRow) return;
+    // Measured from the cells, never from a promoted header: headerText() pads
+    // with `_colN` placeholders, which are not blank, so a header would report
+    // the block as spanning every column the widest row of the sheet reaches.
+    const { firstCol, lastCol } = columnExtent(rows);
+    if (firstCol === -1) return;
+    out.push({ startRow, endRow, firstCol, lastCol, hasHeader });
+  };
+
+  for (const b of shape.blocks) {
+    if (b === shape.table) {
+      // Only its preamble: the table itself is the object the sheet is named for.
+      push(b.startRow, b.headerRow ?? b.startRow, b.preamble, false);
+      continue;
+    }
+    if (b.headerRow === null) {
+      push(b.startRow, b.endRow, b.rows, false);
+      continue;
+    }
+    push(b.startRow, b.headerRow, b.preamble, false);
+    // The block's own extent for the headed part: its header row's cells are
+    // only available as promoted text, and the data rows alone can leave a
+    // trailing labelled-but-empty column out.
+    if (b.endRow > b.headerRow && b.firstCol !== -1) {
+      out.push({
+        startRow: b.headerRow,
+        endRow: b.endRow,
+        firstCol: b.firstCol,
+        lastCol: b.lastCol,
+        hasHeader: true,
+      });
+    }
+  }
+
+  return out.sort((a, z) => a.startRow - z.startRow);
 }
 
 /** Preamble and note rows as display text, for the "Sheet notes" panel. */

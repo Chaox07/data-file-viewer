@@ -17,7 +17,7 @@ import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
 import { KNOWN_FREQUENCIES, type SeriesFrequency } from './chartSpec';
 import { csvLocaleOptions, decideFile, type NumberLocale } from './numericLocale';
 import { listSheets, readSheetDimension } from './xlsxSheets';
-import { analyseSheet, needsBlockHandling, notesText, type Cell } from './sheetBlocks';
+import { analyseSheet, needsBlockHandling, sheetFragments, type Cell } from './sheetBlocks';
 import {
   EXCEL_ERROR_TOKENS,
   classifyTextColumn,
@@ -28,7 +28,7 @@ import {
   markerResidueExpr,
   nonMarkerCountExpr,
 } from './textColumns';
-import { patchCell as patchXlsxCell } from './xlsxWrite';
+import { patchCell as patchXlsxCell, columnIndexOf, columnLettersOf } from './xlsxWrite';
 
 export type StatsKind = 'numeric' | 'datetime' | 'other';
 
@@ -91,7 +91,19 @@ export interface DuckDbFileOpenOptions {
    * shows the file's literal text, which is what makes it reversible.
    */
   nullText?: readonly string[];
+  /**
+   * How much of a worksheet's structure to offer.
+   *
+   * `"split"` (the default) gives every block on the sheet its own object: the
+   * table the sheet is about under the sheet's name, and each caption, footnote
+   * and secondary table beside it. `"single"` opens only the main table, which
+   * leaves the rest of the sheet with nowhere to be. `"raw"` interprets nothing
+   * — one object per sheet, every declared row and column, all text.
+   */
+  sheetBlocks?: SheetBlockMode;
 }
+
+export type SheetBlockMode = 'split' | 'single' | 'raw';
 
 /** What the locale sniff concluded, for the notice the viewer shows. */
 export interface NumberLocaleReport {
@@ -166,8 +178,27 @@ interface SheetShapeInfo {
   firstCol: string;
   /** Last column the sheet declares. */
   lastCol: string;
-  /** Preamble/note lines, kept rather than discarded. */
-  notes: string[];
+  /** Every other rectangle on the sheet, each one its own object. */
+  fragments: SheetFragmentInfo[];
+}
+
+/**
+ * One block of a sheet that is not the main table, as an Excel address.
+ *
+ * `sheetFragments` works in indices into the sample; this is the same thing
+ * converted to the addresses `read_xlsx`'s `range` speaks, which is the only
+ * form that can be handed back to DuckDB.
+ */
+interface SheetFragmentInfo {
+  /** 1-based Excel row, inclusive at both ends. */
+  startRow: number;
+  endRow: number;
+  firstCol: string;
+  lastCol: string;
+  /** `header = true` when the fragment's first row names its columns. */
+  hasHeader: boolean;
+  /** What this object is called after the sheet's name: `(rows 4-9)`. */
+  suffix: string;
 }
 
 /** How many rows to sample when locating a sheet's header. */
@@ -206,12 +237,31 @@ async function sniffSheetShape(
     // be trusted when the block ended before the sample did, because a block
     // that reaches the end of the sample may simply have been cut off by it.
     const tableEndedInSample = shape.table.endRow < rows.length;
+    // The sample was read from row 1 of the sheet's own first column, so a row
+    // at index i is Excel row i+1 and a column at index j is j columns right of
+    // dim.firstCol. Verified against the workbook: `range='B1:D7'` on
+    // used-YieldCurve returns its row 2 as out[1] and its row 6 as out[5].
+    const colBase = columnIndexOf(dim.firstCol);
+    const fragments: SheetFragmentInfo[] = sheetFragments(shape).map((f) => {
+      const startRow = f.startRow + 1;
+      // endRow is an exclusive 0-based index, which is already the 1-based
+      // inclusive last row.
+      const endRow = f.endRow;
+      return {
+        startRow,
+        endRow,
+        firstCol: columnLettersOf(colBase + f.firstCol),
+        lastCol: columnLettersOf(colBase + f.lastCol),
+        hasHeader: f.hasHeader,
+        suffix: startRow === endRow ? `(row ${startRow})` : `(rows ${startRow}-${endRow})`,
+      };
+    });
     return {
       headerExcelRow: (shape.table.headerRow ?? 0) + 1,
       lastRow: tableEndedInSample ? shape.table.endRow : dim.lastRow,
       firstCol: dim.firstCol,
       lastCol: dim.lastCol,
-      notes: notesText(shape),
+      fragments,
     };
   } catch {
     // A sheet we cannot sample is read the way it always was.
@@ -238,6 +288,47 @@ function xlsxReadExpr(
     `read_xlsx('${filePathLiteral}', sheet = '${sheetLiteral}', ` +
     `range = '${shape.firstCol}${shape.headerExcelRow}:${shape.lastCol}${shape.lastRow}', ` +
     `header = true, ignore_errors = true)`
+  );
+}
+
+/**
+ * The read for one block that is not the sheet's main table.
+ *
+ * `header = false` names the columns after their Excel letters -- B, C, D --
+ * which is exactly what a caption or a footnote should be called, and it stops
+ * a lone sentence from becoming a column name over zero rows.
+ */
+function xlsxFragmentExpr(
+  filePathLiteral: string,
+  sheetLiteral: string,
+  fragment: SheetFragmentInfo
+): string {
+  const range = `${fragment.firstCol}${fragment.startRow}:${fragment.lastCol}${fragment.endRow}`;
+  const shape = fragment.hasHeader ? 'header = true' : 'header = false, all_varchar = true';
+  return (
+    `read_xlsx('${filePathLiteral}', sheet = '${sheetLiteral}', ` +
+    `range = '${range}', ${shape}, ignore_errors = true)`
+  );
+}
+
+/**
+ * The sheet with nothing decided about it: every declared row and column, as
+ * text, columns named after their Excel letters.
+ *
+ * The answer to "what is actually in the file" -- and the reason the split
+ * above is an interpretation the user can check rather than one they have to
+ * take on trust. Starts at row 1 rather than at the dimension's first row,
+ * because "the sheet as it is" includes its empty top.
+ */
+function xlsxRawExpr(
+  filePathLiteral: string,
+  sheetLiteral: string,
+  dim: SheetDimension | undefined
+): string {
+  const range = dim ? `, range = '${dim.firstCol}1:${dim.lastCol}${dim.lastRow}'` : '';
+  return (
+    `read_xlsx('${filePathLiteral}', sheet = '${sheetLiteral}'${range}, ` +
+    `header = false, all_varchar = true, ignore_errors = true)`
   );
 }
 
@@ -272,6 +363,15 @@ interface ViewSource {
   cellCount?: number;
   /** True once the name resolves to a real table holding the data, not a view. */
   cached?: boolean;
+  /**
+   * A block of a sheet that is not the sheet's main table.
+   *
+   * Read-only (a write would have to find its row by header text, and two
+   * blocks on one sheet can carry the same header), never cached, and not put
+   * through interpretTextColumns -- which costs two full package reads per
+   * object against a handful of note rows.
+   */
+  derived?: boolean;
 }
 
 function viewBodySql(source: ViewSource, filePath: string, tolerateErrors: boolean): string {
@@ -289,13 +389,6 @@ function viewBodySql(source: ViewSource, filePath: string, tolerateErrors: boole
  */
 const MAX_CACHED_CELLS = 10_000_000;
 
-/** Column letters to a 0-based index, so "AA" comes after "Z" rather than before it. */
-function columnIndex(letters: string): number {
-  let n = 0;
-  for (const ch of letters) n = n * 26 + (ch.charCodeAt(0) - 64);
-  return n - 1;
-}
-
 function declaredCellCount(dim: {
   firstRow: number;
   lastRow: number;
@@ -303,8 +396,27 @@ function declaredCellCount(dim: {
   lastCol: string;
 }): number {
   const rows = Math.max(0, dim.lastRow - dim.firstRow + 1);
-  const cols = Math.max(0, columnIndex(dim.lastCol) - columnIndex(dim.firstCol) + 1);
+  const cols = Math.max(0, columnIndexOf(dim.lastCol) - columnIndexOf(dim.firstCol) + 1);
   return rows * cols;
+}
+
+/**
+ * `name`, or the first suffixed variant of it nothing else has claimed.
+ *
+ * A workbook may hold a sheet literally called `Data (rows 4-9)` beside a sheet
+ * called `Data`, and two objects cannot share a name. The sheet keeps the name
+ * it has in Excel; the derived block is the one that moves -- which is why
+ * `isTaken` has to know every sheet name in the workbook up front, not just the
+ * ones opened so far. Without that, a block of the FIRST sheet claimed the
+ * name, `create view` for the real sheet failed, and the sheet was reported
+ * unreadable: a whole sheet lost to a naming collision.
+ */
+function uniqueName(name: string, isTaken: (candidate: string) => boolean): string {
+  if (!isTaken(name)) return name;
+  for (let n = 2; ; n++) {
+    const candidate = `${name}_${n}`;
+    if (!isTaken(candidate)) return candidate;
+  }
 }
 
 let nextLoadId = 0;
@@ -1160,6 +1272,22 @@ const EDITABLE_SELECT_RE = new RegExp(
 );
 const FORBIDDEN_KEYWORDS_RE = /\b(join|group\s+by|distinct|union|intersect|except|using|window)\b/i;
 
+/**
+ * The one table a plain `select * from X` reads, or undefined for anything else.
+ *
+ * Deliberately not checkEditableSelect: that answers "may this be written to",
+ * which is false for a read-only file and for a block of a sheet, and the
+ * caller here only wants to know WHICH table is on screen. Used to give each
+ * table its own chart tab.
+ */
+export function baseTableOfSelect(sql: string | undefined): string | undefined {
+  if (!sql) return undefined;
+  const match = EDITABLE_SELECT_RE.exec(sql.trim());
+  if (!match || FORBIDDEN_KEYWORDS_RE.test(sql)) return undefined;
+  const raw = match[1];
+  return raw.startsWith('"') ? raw.slice(1, -1).replace(/""/g, '"') : raw;
+}
+
 export class DuckDbFile {
   private lastBackupPath: string | undefined;
   private backupAttached = false;
@@ -1264,6 +1392,8 @@ export class DuckDbFile {
     // repair and by the Safe Mode backup copy — see ViewSource.
     const viewSources = new Map<string, ViewSource>();
     const viewLabels = new Map<string, string>();
+    /** How much of a worksheet's structure to offer; see DuckDbFileOpenOptions. */
+    const blockMode: SheetBlockMode = options?.sheetBlocks ?? 'split';
     const looksArrow = /\.(arrows?|feather)$/i.test(path);
     const isFeather = looksArrow && (await isFeatherEncoding(path));
     const isArrow = looksArrow && !isFeather;
@@ -1477,6 +1607,8 @@ export class DuckDbFile {
       }
       const filePath = path.replace(/'/g, "''");
       const failures: string[] = [];
+      // Every name Excel itself claims, known before the first block is named.
+      const sheetNames = new Set(sheets.map((s) => s.name));
       for (const sheet of sheets) {
         // read_xlsx addresses a sheet by NAME, so the sheet name is a SQL
         // string literal here and a quoted identifier for the view -- two
@@ -1501,24 +1633,63 @@ export class DuckDbFile {
           // Read once per sheet and used twice: to find the header row, and to
           // decide whether the sheet is small enough to hold in memory.
           const dim = await readSheetDimension(path, sheet.path);
-          const shape = await sniffSheetShape(connection, filePath, asLiteral, dim);
+          const shape =
+            blockMode === 'raw'
+              ? undefined
+              : await sniffSheetShape(connection, filePath, asLiteral, dim);
           const source: ViewSource = {
             sourcePath: path,
-            readExpr: (p, tolerate) =>
-              xlsxReadExpr(p.replace(/'/g, "''"), asLiteral, shape, tolerate),
+            readExpr:
+              blockMode === 'raw'
+                ? (p) => xlsxRawExpr(p.replace(/'/g, "''"), asLiteral, dim)
+                : (p, tolerate) => xlsxReadExpr(p.replace(/'/g, "''"), asLiteral, shape, tolerate),
             cellCount: dim ? declaredCellCount(dim) : undefined,
           };
           await connection.run(`create view "${asIdent}" as ${viewBodySql(source, path, false)}`);
           viewSources.set(sheet.name, source);
           viewLabels.set(sheet.name, `Sheet "${sheet.name}"`);
-          if (shape && shape.notes.length > 0) {
+          xlsxSheetPaths.set(sheet.name, sheet.path);
+
+          // Everything else on the sheet, each as its own object.
+          //
+          // Without this the sheet's captions, footnotes and secondary tables
+          // have nowhere to be: naming the main table is a choice, and a
+          // viewer that makes it and then says nothing has deleted the rest as
+          // far as anyone using it can tell. Reported as exactly that, about
+          // the footnote at the top of Raw_Data.
+          const fragments = blockMode === 'split' ? (shape?.fragments ?? []) : [];
+          const names: string[] = [];
+          for (const fragment of fragments) {
+            const name = uniqueName(
+              `${sheet.name} ${fragment.suffix}`,
+              (candidate) => viewSources.has(candidate) || sheetNames.has(candidate)
+            );
+            const fragmentSource: ViewSource = {
+              sourcePath: path,
+              readExpr: (p) => xlsxFragmentExpr(p.replace(/'/g, "''"), asLiteral, fragment),
+              derived: true,
+            };
+            try {
+              await connection.run(
+                `create view ${quoteIdent(name)} as ${viewBodySql(fragmentSource, path, false)}`
+              );
+              viewSources.set(name, fragmentSource);
+              viewLabels.set(name, `"${name}"`);
+              names.push(name);
+            } catch {
+              // A block we cannot address must not cost the sheet it is on.
+            }
+          }
+          if (shape) {
             openWarnings.push(
               `Sheet "${sheet.name}": the table starts at row ${shape.headerExcelRow}. ` +
-                `The rows above it are kept as notes: ${shape.notes.slice(0, 3).join(' / ')}` +
-                (shape.notes.length > 3 ? ` (+${shape.notes.length - 3} more)` : '')
+                (names.length > 0
+                  ? `The rest of the sheet is listed separately, as ${names
+                      .map((n) => `"${n}"`)
+                      .join(' and ')}.`
+                  : `Nothing else on the sheet could be addressed as a block.`)
             );
           }
-          xlsxSheetPaths.set(sheet.name, sheet.path);
         } catch (err) {
           // One unreadable sheet (a chart sheet, a macro sheet, an empty one)
           // must not cost the user the rest of the workbook.
@@ -1577,6 +1748,10 @@ export class DuckDbFile {
     // throw inside the loop is caught there as "this sheet is unreadable".
     const nullText = options?.nullText ?? EXCEL_ERROR_TOKENS;
     for (const [view, source] of viewSources) {
+      // Not the sheet fragments: two full package reads each (a sample and a
+      // whole-column verification), against a caption or five rows of
+      // definitions. See ViewSource.derived.
+      if (source.derived) continue;
       openWarnings.push(
         ...(await interpretTextColumns(connection, view, viewLabels.get(view) ?? view, source, nullText))
       );
@@ -2012,18 +2187,20 @@ export class DuckDbFile {
 
     this.xlsxErrorsTolerated = true;
     const repaired: string[] = [];
-    for (const name of this.xlsxSheetPaths.keys()) {
-      const source = this.viewSources.get(name);
-      if (!source) continue;
-      const asIdent = name.replace(/"/g, '""');
+    for (const [name, source] of this.viewSources) {
       try {
         // Rebuilt from the sheet's own ViewSource, not from a fresh
         // read_xlsx(): a sheet whose header is not row 1 is read through a
         // range, and re-reading it without one would put the view back to the
         // preamble block — three columns and one row — to rescue a cell.
-        await this.connection.run(
-          `create or replace view "${asIdent}" as ${viewBodySql(source, source.sourcePath, true)}`
-        );
+        const body = viewBodySql(source, source.sourcePath, true);
+        if (source.cached) {
+          // A cached sheet is a TABLE, and `create or replace view` on a table
+          // is an error rather than a replacement.
+          await replaceWithTable(this.connection, name, body, true);
+        } else {
+          await this.connection.run(`create or replace view ${quoteIdent(name)} as ${body}`);
+        }
         repaired.push(name);
       } catch {
         // Leave the original view in place; the caller's rethrow still reports
@@ -2345,10 +2522,11 @@ export class DuckDbFile {
       // row, same error-marker interpretation. Spelling the read out again
       // here is what made a shaped sheet diff its 33 numeric columns against
       // the backup's 3 preamble ones.
+      // Every object the live catalog holds, not just the sheets: a sheet's
+      // blocks are objects too, and one missing from the backup side is
+      // reported as NEW by compareToBackup on a file nobody has touched.
       let created = 0;
-      for (const name of this.xlsxSheetPaths.keys()) {
-        const source = this.viewSources.get(name);
-        if (!source) continue;
+      for (const [name, source] of this.viewSources) {
         const asIdent = name.replace(/"/g, '""');
         try {
           await this.connection.run(
@@ -2569,6 +2747,10 @@ export class DuckDbFile {
     const found =
       tables.find((t) => t === tableName) ?? tables.find((t) => t.toLowerCase() === tableName.toLowerCase());
     if (!found) return { editable: false };
+    // A block of a sheet is read-only (see ViewSource.derived), and the grid
+    // has to know that BEFORE offering the cell: an editable-looking cell that
+    // refuses on save is worse than one that was never offered.
+    if (this.viewSources.get(found)?.derived) return { editable: false };
 
     // Column list for the UPDATE is re-derived from the live table, not
     // parsed out of the SELECT text.
@@ -2685,6 +2867,17 @@ export class DuckDbFile {
   ): Promise<number> {
     const sheetPath = this.xlsxSheetPaths.get(table);
     if (!sheetPath) {
+      // A block of a sheet is addressed by a range, and the writer finds its
+      // row by matching the header text down the sheet -- so an edit here could
+      // land in a different block that happens to carry the same header. Read
+      // it here, edit it in the sheet it belongs to.
+      if (this.viewSources.get(table)?.derived) {
+        throw new Error(
+          `"${table}" is one block of a sheet, opened for reading. Edit the cell in the ` +
+            `sheet's own table instead — a block is addressed by a range, and writing ` +
+            `through one could put the value in a different block with the same header.`
+        );
+      }
       throw new Error(`"${table}" is not a sheet of this workbook, so it cannot be edited.`);
     }
 

@@ -9,6 +9,8 @@ import {
   FNV_OFFSET_BASIS,
   FileKind,
   QueryDiff,
+  SheetBlockMode,
+  baseTableOfSelect,
   TopValuesStats,
   fnv1aFold,
   hasTrailingLimit,
@@ -63,6 +65,12 @@ function nullTextSetting(): readonly string[] {
   // hand-edited settings.json with a string in it) falls back to the default.
   if (!Array.isArray(value)) return EXCEL_ERROR_TOKENS;
   return value.filter((v): v is string => typeof v === 'string' && v.trim() !== '');
+}
+
+/** How much of a worksheet's structure to offer; see DuckDbFileOpenOptions. */
+function sheetBlocksSetting(): SheetBlockMode {
+  const value = vscode.workspace.getConfiguration('dataFileViewer').get<unknown>('sheetBlocks', 'split');
+  return value === 'single' || value === 'raw' ? value : 'split';
 }
 
 // Most points a chart will draw. This is the viewer's OWN ceiling, not the
@@ -571,6 +579,7 @@ async function reconnectDocument(document: DuckDBDocument, forceReadOnly: boolea
     siblingPath,
     numberLocale: numberLocaleSetting(),
     nullText: nullTextSetting(),
+    sheetBlocks: sheetBlocksSetting(),
   });
   if (document.disposed) {
     // dispose() fired while this reconnect was in flight — don't swap a
@@ -894,6 +903,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
         siblingPath,
         numberLocale: numberLocaleSetting(),
         nullText: nullTextSetting(),
+        sheetBlocks: sheetBlocksSetting(),
       });
       if (file.isReadOnly()) {
         vscode.window.showWarningMessage(
@@ -969,8 +979,15 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
       | { command: 'runCombinedQuery'; table: string }
       | { command: 'chartQuery'; xColumn: string; xIsText: boolean; yColumns: string[] };
 
-    // Created on the first plot click and reused after that; see ChartPanel.
-    let chartPanel: ChartPanel | undefined;
+    // One chart tab per TABLE, created on that table's first plot click.
+    //
+    // Plotting another column of the same table still replaces that table's
+    // chart -- the reason for reusing a panel is that a column clicked by
+    // mistake should not have to be tidied up afterwards, and that is about
+    // columns. Two tables are a different matter: a workbook sheet now offers
+    // its secondary tables as objects of their own, and "plot this one, then
+    // plot that one, and look at both" is the whole point of that.
+    const chartPanels = new Map<string, ChartPanel>();
 
     const messageSub = webview.onDidReceiveMessage(async (message: IncomingMessage) => {
       if (message.command === 'ready') {
@@ -1241,8 +1258,22 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
         // of it rather than a replacement.
         if (!document.lastSql) return;
         const cap = getChartMaxPoints();
-        const label = message.yColumns.length === 1 ? message.yColumns[0] : `${message.yColumns.length} series`;
-        chartPanel ??= new ChartPanel(this.context.extensionUri, basename(document.uri.fsPath));
+        const series = message.yColumns.length === 1 ? message.yColumns[0] : `${message.yColumns.length} series`;
+        // Keyed by the table being plotted, so a second table opens a second
+        // tab instead of taking over the first one's. A query somebody typed
+        // has no base table and shares one key -- it is one thing on screen.
+        // lastQueriedBaseTable is only set for a table that may be WRITTEN to,
+        // which a block of a sheet and every read-only file are not -- so the
+        // key comes from the SQL on screen instead. Otherwise every block of
+        // every sheet would share one chart tab.
+        const chartTable = document.lastQueriedBaseTable ?? baseTableOfSelect(document.lastSql);
+        const chartKey = chartTable ?? '(query)';
+        const label = chartTable ? `${chartTable} — ${series}` : series;
+        let chartPanel = chartPanels.get(chartKey);
+        if (!chartPanel) {
+          chartPanel = new ChartPanel(this.context.extensionUri, basename(document.uri.fsPath));
+          chartPanels.set(chartKey, chartPanel);
+        }
         try {
           const result = await document.runExclusive(() =>
             document.file.runChartQuery(
@@ -1452,8 +1483,8 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
     webviewPanel.onDidDispose(() => {
       messageSub.dispose();
       // A chart of a document nobody has open is furniture.
-      chartPanel?.dispose();
-      chartPanel = undefined;
+      for (const panel of chartPanels.values()) panel.dispose();
+      chartPanels.clear();
       // The panel going away is the end of anyone being able to see a tick's
       // result, so stop scheduling them. Document disposal usually follows
       // immediately, but nothing guarantees it happens first.
