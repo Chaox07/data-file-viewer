@@ -384,21 +384,3 @@ export function sheetFragments(shape: SheetShape): SheetFragment[] {
 
   return out.sort((a, z) => a.startRow - z.startRow);
 }
-
-/** Preamble and note rows as display text, for the "Sheet notes" panel. */
-export function notesText(shape: SheetShape): string[] {
-  const lines: string[] = [];
-  const emit = (rows: readonly Cell[][]) => {
-    for (const r of rows) {
-      const cells = r.filter((v) => !isBlank(v)).map((v) => String(v).trim());
-      if (cells.length > 0) lines.push(cells.join(' | '));
-    }
-  };
-  if (shape.table) emit(shape.table.preamble);
-  for (const b of shape.notes) {
-    if (b.header) lines.push(b.header.filter((h) => !h.startsWith('_col')).join(' | '));
-    emit(b.preamble);
-    emit(b.rows);
-  }
-  return lines;
-}

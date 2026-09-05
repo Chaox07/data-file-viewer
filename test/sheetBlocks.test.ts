@@ -4,7 +4,6 @@ import {
   analyseSheet,
   dedupe,
   needsBlockHandling,
-  notesText,
   sheetFragments,
   splitBlocks,
   type Cell,
@@ -71,11 +70,16 @@ test('the spanning label is kept as preamble, not promoted and not dropped', () 
   const shape = analyseSheet(USED_YIELD_CURVE);
   // Not the header...
   assert.notEqual(shape.table!.header?.[0], '#of Years to Maturity');
-  // ...and not gone either. The viewer only views.
-  const notes = notesText(shape).join('\n');
-  assert.match(notes, /#of Years to Maturity/);
-  assert.match(notes, /Series \| Compounding Convention/);
-  assert.match(notes, /Zero-coupon yield/);
+  // ...and not gone either. Reachable, which is the only sense of "kept"
+  // that counts: a fragment covers the label row, and another covers the
+  // Series block above it, so both become objects a query can name.
+  const covered = new Set<number>();
+  for (const f of sheetFragments(shape)) {
+    for (let r = f.startRow; r < f.endRow; r++) covered.add(r);
+  }
+  assert.ok(covered.has(4), 'the "#of Years to Maturity" label row');
+  assert.ok(covered.has(1) && covered.has(2), 'the Series block');
+  assert.equal(covered.has(5), false, 'the header belongs to the table, not to a fragment');
 });
 
 test('a naive "first row after the blank" rule would have got this wrong', () => {
@@ -95,11 +99,18 @@ test('Raw_Data: the 100-wide block wins over the note and the legend', () => {
   assert.deepEqual(shape.table!.header?.slice(0, 3), ['Date', 'BETA0', 'BETA1']);
   assert.equal(shape.table!.width, 100);
   assert.equal(shape.table!.rows.length, 2);
-  // The note and the 3-wide series legend are both kept.
+  // The note and the 3-wide series legend are both kept -- as fragments, each
+  // of which becomes a table of its own.
   assert.equal(shape.notes.length, 2);
-  const notes = notesText(shape).join('\n');
-  assert.match(notes, /not an official Federal Reserve/);
-  assert.match(notes, /Par yield/);
+  const fragments = sheetFragments(shape);
+  assert.equal(fragments.length, 2);
+  assert.deepEqual(
+    fragments.map((f) => [f.startRow, f.endRow, f.hasHeader]),
+    [
+      [1, 2, false], // the footnote sentence
+      [3, 7, true], // the series legend, header and all
+    ]
+  );
 });
 
 test('an ordinary single-block sheet is untouched', () => {
