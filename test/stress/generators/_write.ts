@@ -293,6 +293,24 @@ export interface SheetSpec {
   formulas?: Record<string, string>;
   /** Style index applied to a cell, keyed "row-col" (0-based, within rows). */
   styles?: Record<string, number>;
+  /**
+   * A `<dimension ref="...">` to declare, verbatim and unchecked.
+   *
+   * Omitted by default, which is itself a real shape -- the element is
+   * optional and plenty of writers skip it. Set it to declare a rectangle that
+   * does NOT match the cells: Excel over-declares constantly, and anything
+   * that treats this element as the truth about how wide a sheet is will
+   * rewrite sheets that were being read perfectly well.
+   */
+  dimension?: string;
+  /**
+   * Extra `<c r="I3"/>` elements: a cell that exists and holds nothing.
+   *
+   * Distinct from a `null` in `rows`, which writes no element at all. Excel
+   * leaves these behind wherever formatting was once applied, and they are the
+   * difference between counting cells and counting values.
+   */
+  emptyCells?: string[];
 }
 
 export function columnLetters(index: number): string {
@@ -335,6 +353,9 @@ function sheetXml(spec: SheetSpec): string {
         cells.push(`<c r="${ref}"${s} t="inlineStr">${f}<is><t>${escapeXml(String(value))}</t></is></c>`);
       }
     });
+    for (const ref of spec.emptyCells ?? []) {
+      if (Number(/\d+$/.exec(ref)?.[0]) === r + 1) cells.push(`<c r="${ref}"/>`);
+    }
     rows.push(`<row r="${r + 1}">${cells.join('')}</row>`);
   });
   const merges = (spec.merges ?? []).length
@@ -342,10 +363,11 @@ function sheetXml(spec: SheetSpec): string {
         .map((ref) => `<mergeCell ref="${ref}"/>`)
         .join('')}</mergeCells>`
     : '';
+  const dimension = spec.dimension ? `<dimension ref="${spec.dimension}"/>` : '';
   return (
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
-    `<sheetData>${rows.join('')}</sheetData>${merges}</worksheet>`
+    `${dimension}<sheetData>${rows.join('')}</sheetData>${merges}</worksheet>`
   );
 }
 

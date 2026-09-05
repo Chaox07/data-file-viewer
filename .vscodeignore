@@ -14,3 +14,10 @@ node_modules/codemirror/**
 node_modules/crelt/**
 node_modules/style-mod/**
 node_modules/w3c-keyname/**
+
+# Tests, and the stress runner's generated corpus. `test/stress/_work` holds a
+# run's temp files and its report — 41 MB of them after one `npm run stress`,
+# which is otherwise packaged into the extension users install.
+test/**
+out-test/**
+tsconfig.test.json

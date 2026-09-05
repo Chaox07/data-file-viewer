@@ -273,8 +273,10 @@ registerCase({
  * pass it on, and a CSV that is entirely whitespace is far more likely a
  * failed write than intentional data.
  *
- * Pinned rather than fixed because refusing blank CSVs is a product decision
- * about a format the viewer opens constantly, not a defect to quietly patch.
+ * Refused now, rather than passed on. That is a product decision about a format
+ * the viewer opens constantly, and it was taken deliberately: the precedent is
+ * assertArrowStreamComplete, which already refuses a truncated Arrow stream for
+ * the same reason rather than drawing the empty grid read_arrow would give it.
  */
 for (const [slug, body, description] of [
   ['whitespace', '   \n\n\t  \n', 'two invented columns and a row containing "  "'],
@@ -284,9 +286,8 @@ for (const [slug, body, description] of [
     name: `damage_blank_csv_${slug}`,
     family: 'damage',
     expect: {
-      note: `a CSV holding only ${slug} must not produce rows`,
-      rows: 0,
-      knownBug: `read_csv_auto turns a blank CSV into ${description}, so a file with no data draws a grid with data in it, unannounced`,
+      note: `a CSV holding only ${slug} is refused, rather than read as ${description}`,
+      refuses: /holds no data|is empty/,
     },
     build: async (ctx) => {
       const path = join(ctx.dir, `blank-${slug}.csv`);

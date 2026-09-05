@@ -284,19 +284,18 @@ registerCase({
  * that same `""` back as NULL. So a cell that held "" is displayed as empty,
  * and if the user saves the file the empty string is gone for good.
  *
- * Pinned rather than fixed: the behaviour is read_csv's, not the viewer's, and
- * forcing it off across the board would change how every genuinely-missing
- * field in every CSV is read, which is a much larger decision than this
- * warrants. The pin is what makes it visible -- and if DuckDB ever changes it,
- * the case turns into an XPASS and says so.
+ * Was pinned on the belief that fixing it meant changing how every
+ * genuinely-missing field in every CSV is read. It did not: `read_csv`'s
+ * `allow_quoted_nulls` covers QUOTED fields only, so turning it off rescues ""
+ * and leaves an unquoted empty field between two commas reading as NULL, which
+ * is what everyone means by it. See CSV_READ_OPTIONS in duckdbConnection.ts.
  */
 registerCase({
   name: 'shapes_csv_empty_string_becomes_null',
   family: 'shapes',
   expect: {
-    note: 'an empty string written to a CSV reads back as NULL',
+    note: 'an empty string written to a CSV reads back as an empty string, not NULL',
     table: { columns: ['id', 'text'], rows: [[1, '']] },
-    knownBug: 'read_csv reads a quoted empty string ("") as NULL, so "" and missing are indistinguishable after a round trip',
   },
   build: async (ctx) => ({
     path: await w.csvFile(join(ctx.dir, 'empty.csv'), {
@@ -313,25 +312,33 @@ registerCase({
 /**
  * A title row above the header collapses the whole sheet to one column.
  *
- * read_xlsx takes the first row of the sheet as the header, full stop. A
- * workbook whose sheet opens with a merged title banner -- which is most
- * workbooks a human made -- therefore reads as a single column named after the
- * title, with the real header sitting in the data as row 1.
+ * read_xlsx picks its region by scanning for the first row of consecutive
+ * non-empty cells and taking it as the header. A workbook whose sheet opens
+ * with a title banner -- which is most workbooks a human made -- therefore
+ * reads as a single column named after the title, with the real header sitting
+ * in the data below it.
  *
- * This is the worst category in this suite's ranking: the file opens, the grid
- * draws, and what it shows is not the table. Nothing warns the user. It is
- * pinned rather than fixed because the fix is a real feature (offer a header
- * row / range, the way read_xlsx's own options allow) and not a one-line
- * change, but it should not go unrecorded in the meantime.
+ * Fixed by showing the sheet's own rectangle instead: when the view covers
+ * fewer columns than the sheet's `<dimension>` declares, it is rebuilt over the
+ * whole thing with no header at all, and the user is told. So `id`, `label` and
+ * `amount` are still visible here -- as the DATA they always were, in a grid
+ * whose columns are the spreadsheet's own letters. That is the point: the
+ * viewer no longer decides where the header is, it shows what is there.
+ *
+ * No header is guessed, deliberately. The real file this came from
+ * (~/Desktop/scatter/YieldCurve_Data.xlsx) is why: its row 4 reads exactly like
+ * a header -- `Series | Compounding Convention | Mnemonic(s)` -- and is a
+ * legend for the 100 columns of data further down.
  */
 registerCase({
   name: 'shapes_xlsx_title_row_above',
   family: 'shapes',
   expect: {
-    note: 'a workbook with a title row above the header still shows the real table',
-    hasColumns: ['id', 'label', 'amount'],
-    knownBug:
-      'read_xlsx always treats sheet row 1 as the header, so a title banner above the table collapses the sheet to one column and the real header becomes data — shown with no warning',
+    note: 'a workbook with a title row above the header shows the whole sheet, and says so',
+    // The banner, the header-as-data, and both data rows -- nothing dropped.
+    rows: 4,
+    hasColumns: ['A', 'B', 'C'],
+    says: [/laid out|read as empty/],
   },
   build: async (ctx) => ({
     path: await w.xlsxFile(join(ctx.dir, 'title.xlsx'), [

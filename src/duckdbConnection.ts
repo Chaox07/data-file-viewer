@@ -15,7 +15,7 @@ import { createWriteStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
 import { KNOWN_FREQUENCIES, type SeriesFrequency } from './chartSpec';
-import { listSheets } from './xlsxSheets';
+import { listSheets, readSheetExtents, scanSheetExtent, type SheetExtent, type XlsxSheet } from './xlsxSheets';
 import { patchCell as patchXlsxCell } from './xlsxWrite';
 
 export type StatsKind = 'numeric' | 'datetime' | 'other';
@@ -111,6 +111,53 @@ async function assertArrowStreamComplete(path: string): Promise<void> {
 }
 
 /**
+ * `""` in a CSV is an empty string, not a missing value.
+ *
+ * `read_csv` defaults `allow_quoted_nulls` to true, which reads a QUOTED empty
+ * field as NULL -- so an empty string cannot survive a round trip through this
+ * viewer, and "" and "no value here" become indistinguishable. Turning it off
+ * only affects quoted fields: an unquoted empty field between two commas still
+ * reads as NULL, which is what everyone means by it. So this does not change
+ * how genuinely-missing values are read, which was the objection that kept it
+ * unfixed.
+ */
+const CSV_READ_OPTIONS = ', allow_quoted_nulls = false';
+
+/** Largest file worth reading in full to find out whether it is all whitespace. */
+const BLANK_CSV_SCAN_LIMIT = 1024 * 1024;
+
+/**
+ * Refuse a CSV with nothing in it, rather than showing the rows it invents.
+ *
+ * Measured: `read_csv_auto` on `"   \n\n\t  \n"` returns two invented columns
+ * and a row containing `"  "`; on `"\n\n\n"`, one column and two rows of null.
+ * A file with no data in it draws a grid with data in it, and nothing says the
+ * file was blank -- which is the silent-misread category, the worst outcome
+ * here. A CSV that is entirely whitespace is far more often a write that failed
+ * than a deliberate empty file.
+ *
+ * Same shape and same reasoning as assertArrowStreamComplete above, which
+ * already refuses a truncated Arrow stream rather than drawing an empty grid.
+ *
+ * Only files small enough to read are checked. A large file cannot be all
+ * whitespace in any realistic sense, and reading it to prove otherwise would
+ * cost every CSV open.
+ */
+async function assertCsvHasContent(path: string): Promise<void> {
+  const { size } = await stat(path);
+  if (size > BLANK_CSV_SCAN_LIMIT) return;
+  const text = await readFile(path, 'utf8');
+  if (!/^\s*$/.test(text)) return;
+  throw new Error(
+    size === 0
+      ? `"${basename(path)}" is empty (0 bytes), so there is nothing to show.`
+      : `"${basename(path)}" holds no data — all ${size} bytes of it are blank lines and ` +
+          `spaces. Read as a CSV it would produce invented columns and rows that are not in ` +
+          `the file, so it is refused instead. This usually means a write that did not finish.`
+  );
+}
+
+/**
  * Tell the two Arrow encodings apart by their leading magic bytes.
  *
  * Arrow has two byte layouts that share a name, and which one a file is
@@ -143,6 +190,82 @@ const FEATHER_V1_MAGIC = Buffer.from('FEA1', 'ascii');
 function isCellParseError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   return /Failed to parse cell|Could not convert string/i.test(message);
+}
+
+/**
+ * Every value Excel puts in a cell it could not compute.
+ *
+ * A closed set, and the only reliable way to tell one from a word somebody
+ * typed: DuckDB reports both through the same message ("Could not convert
+ * string '#REF!' to DOUBLE" and "Could not convert string 'n/a' to DOUBLE"), so
+ * the message shape says nothing about which happened. Confirmed by the stress
+ * suite, which failed the first attempt at this for exactly that reason.
+ */
+const EXCEL_ERROR_VALUE_RE = /^#(DIV\/0!|N\/A|REF!|VALUE!|NAME\?|NUM!|NULL!|SPILL!|CALC!|FIELD!|BLOCKED!|CONNECT!|UNKNOWN!|GETTING_DATA)$/i;
+
+/**
+ * Say what the `ignore_errors` repair actually rescued, from the error itself.
+ *
+ * The single sentence this replaces blamed "#DIV/0!, #N/A, #REF! and the like"
+ * for EVERY repair, and at least three things that are not Excel errors trigger
+ * one: a footnote written directly under a table, a stray unit label, and a word
+ * the user typed into a numeric column themselves -- the last being the worst,
+ * because the file is right and the message accuses Excel of a value the reader
+ * put there thirty seconds earlier.
+ *
+ * So the value is what decides, not the message: when it is one of Excel's own
+ * error values the original wording holds and now names the one it found;
+ * anything else is described as what it is.
+ */
+function describeCellRepair(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  const conversion = /Could not convert string '([\s\S]*?)' to (\w+)/i.exec(message);
+  const value = conversion?.[1];
+  if (value !== undefined && !EXCEL_ERROR_VALUE_RE.test(value.trim())) {
+    const shown = value.length > 60 ? `${value.slice(0, 60)}…` : value;
+    return (
+      `A value in this workbook ("${shown}") is not a ${conversion![2].toLowerCase()}, but the ` +
+        `column holding it reads as one — so that cell is shown empty. This is not an Excel ` +
+        `error value; the workbook itself is unchanged, and every other value is as it was.`
+    );
+  }
+  const named = value ? ` (${value.trim()})` : '';
+  return (
+    `This workbook holds cell values Excel could not compute${named} — #DIV/0!, #N/A, #REF! ` +
+      `and the like. They are shown as empty cells; every other value is unchanged.`
+  );
+}
+
+/**
+ * The one place a `read_xlsx(...)` call is composed.
+ *
+ * Three separate places build sheet views -- open(), the ignore_errors repair,
+ * and Safe Mode's backup catalog -- and they have to agree, because the diff
+ * pairs the live and backup catalogs up by table name and compares them column
+ * by column. A sheet read one way on one side and another way on the other does
+ * not report "these differ"; it reports whichever nonsense the column
+ * alignment produces. They were three hand-built strings that had already
+ * drifted once (the backup path had no branch for a workbook at all, which is
+ * what took Safe Mode down in the field).
+ */
+function xlsxReadSql(
+  filePath: string,
+  sheetName: string,
+  options: XlsxSheetOptions | undefined,
+  tolerateErrors: boolean
+): string {
+  const args = [quoteLiteral(filePath), `sheet = ${quoteLiteral(sheetName)}`];
+  if (options?.rawRectangle) {
+    // header = false is what makes the banner row visible as data instead of
+    // becoming the column names; the range is what makes the other 99 columns
+    // exist at all. Neither works without the other.
+    args.push(`range = ${quoteLiteral(options.rawRectangle)}`, 'header = false');
+  }
+  if (options?.allVarchar) args.push('all_varchar = true');
+  // Redundant under all_varchar (nothing can fail to convert to VARCHAR), and
+  // harmful with it: it would silence a genuine read failure for no gain.
+  if (tolerateErrors && !options?.allVarchar) args.push('ignore_errors = true');
+  return `read_xlsx(${args.join(', ')})`;
 }
 
 async function isFeatherEncoding(path: string): Promise<boolean> {
@@ -638,6 +761,23 @@ const EDITABLE_SELECT_RE = new RegExp(
 );
 const FORBIDDEN_KEYWORDS_RE = /\b(join|group\s+by|distinct|union|intersect|except|using|window)\b/i;
 
+/**
+ * What a single sheet needs beyond `read_xlsx(file, sheet => name)`.
+ *
+ * Both flags describe a sheet the defaults get WRONG, and both are set after
+ * the fact -- one at open, one on the user's say-so -- which is why they live
+ * in a map rather than being decided once for the workbook.
+ */
+interface XlsxSheetOptions {
+  /**
+   * The sheet's full rectangle, from its own `<dimension>`, read with no header
+   * at all. Set when read_xlsx's region detection missed most of the sheet.
+   */
+  rawRectangle?: string;
+  /** Read every column as text, so a value that is not a number still shows. */
+  allVarchar?: boolean;
+}
+
 export class DuckDbFile {
   private lastBackupPath: string | undefined;
   private backupAttached = false;
@@ -673,8 +813,114 @@ export class DuckDbFile {
      * Carried from open() because listSheets had already read it, and because
      * an edit has to reach the right part of the zip knowing only the view name.
      */
-    private readonly xlsxSheetPaths: Map<string, string> = new Map()
+    private readonly xlsxSheetPaths: Map<string, string> = new Map(),
+    /**
+     * Sheet name -> the read_xlsx options that sheet needs beyond the defaults.
+     * See xlsxReadSql: this map is the only thing that varies between the three
+     * places a sheet view is built, which is what keeps them agreeing.
+     */
+    private readonly xlsxSheetOptions: Map<string, XlsxSheetOptions> = new Map()
   ) {}
+
+  /**
+   * Re-read any sheet whose view covers less of it than the sheet claims.
+   *
+   * `read_xlsx` picks its region by scanning down for the first row of
+   * consecutive non-empty cells and taking that row as the header. A workbook a
+   * human made -- a title, a disclaimer paragraph, a blank spacer row -- breaks
+   * that assumption in the worst possible way: the banner is ONE cell, so the
+   * region becomes one column wide, and reading stops at the first empty row.
+   * The file opens, the grid draws, and it shows an empty table. Measured on
+   * ~/Desktop/scatter/YieldCurve_Data.xlsx: `Raw_Data` is 16,814 x 100 and read
+   * as 0 x 1, its single column named after a Federal Reserve disclaimer;
+   * `used-YieldCurve` is 16,809 x 33 and read as 1 x 3. Neither said anything.
+   *
+   * The sheet's own `<dimension>` is the second opinion. When it says there are
+   * more columns than the view has, the view is rebuilt over the whole
+   * rectangle with no header at all -- every row and column, columns named for
+   * their spreadsheet letters. Not a guess at where the header is: this file is
+   * exactly why guessing is a bad idea, since `Raw_Data`'s row 4 reads like a
+   * header (`Series | Compounding Convention | Mnemonic(s)`) and is a legend.
+   *
+   * `all_varchar` comes along necessarily rather than by choice. Once the
+   * banner row is data, its column holds a paragraph of prose above a column of
+   * numbers, and type inference refuses the sheet outright ("Could not convert
+   * string 'Note: This is not an official...' to DOUBLE"). The alternative,
+   * `ignore_errors`, would read the banner as NULL -- blanking the very row
+   * that explains why the sheet looks like this.
+   *
+   * Comparing COLUMNS only, because a view's column count is free (the schema
+   * is already bound) while its row count is a full scan of the sheet. The
+   * narrower case where a banner happens to span every column is caught later,
+   * on a query that comes back empty -- see runQuery.
+   */
+  private static async showFullSheetWhereRegionWasMissed(
+    connection: DuckDBConnection,
+    path: string,
+    sheets: readonly XlsxSheet[],
+    options: Map<string, XlsxSheetOptions>
+  ): Promise<string[]> {
+    let extents: Map<string, SheetExtent>;
+    try {
+      extents = await readSheetExtents(path, sheets.map((s) => s.path));
+    } catch {
+      return []; // No second opinion available -- believe DuckDB, as before.
+    }
+
+    const warnings: string[] = [];
+    for (const sheet of sheets) {
+      let extent = extents.get(sheet.path);
+      if (!extent) continue;
+      const asIdent = sheet.name.replace(/"/g, '""');
+      let viewColumns: number;
+      try {
+        // Binds the schema; does not scan the sheet.
+        const probe = await connection.runAndReadAll(`select * from "${asIdent}" limit 0`);
+        viewColumns = probe.columnNames().length;
+      } catch {
+        continue;
+      }
+      // Against the widest row that actually holds values, NOT against the
+      // declared rectangle -- see SheetExtent.contentColumns. Comparing with
+      // the rectangle rewrote five good sheets of a workbook in daily use,
+      // every one of them because `<dimension>` claimed a trailing column that
+      // holds nothing.
+      if (!extent.contentColumns || viewColumns >= extent.contentColumns) continue;
+
+      if (!extent.exact) {
+        // Column count wrong, last row unknown -- and a range must have one, so
+        // this is where the whole sheet gets read. Only for a sheet already
+        // known to be mis-read, and only when it declared no dimension.
+        const scanned = await scanSheetExtent(path, sheet.path).catch(() => undefined);
+        if (!scanned) continue;
+        extent = scanned;
+      }
+
+      const opts: XlsxSheetOptions = { rawRectangle: extent.ref, allVarchar: true };
+      try {
+        await connection.run(
+          `create or replace view "${asIdent}" as select * from ${xlsxReadSql(path, sheet.name, opts, false)}`
+        );
+      } catch {
+        // Better the partial view than none: leave what opened in place.
+        continue;
+      }
+      options.set(sheet.name, opts);
+      warnings.push(
+        `Sheet "${sheet.name}" does not begin with a header row: read the usual way it showed ` +
+          `${viewColumns} of its ${extent.contentColumns} columns. It is now shown exactly as ` +
+          `the sheet is laid out — all ${extent.rows} rows and ${extent.columns} columns, named ` +
+          `by their spreadsheet letters, starting at row ${extent.firstRow}. Read as text, and ` +
+          `view-only, because without a header there is no way to know what an edit would change.`
+      );
+    }
+    return warnings;
+  }
+
+  /** Whether this sheet is shown as its raw rectangle — see showFullSheetWhereRegionWasMissed. */
+  private isRawRectangleSheet(name: string): boolean {
+    return this.xlsxSheetOptions.get(name)?.rawRectangle !== undefined;
+  }
 
   isReadOnly(): boolean {
     return this.readOnly;
@@ -724,8 +970,9 @@ export class DuckDbFile {
     // that are not visible in the grid, such as a cell shown as empty because
     // the workbook holds #DIV/0! there.
     const openWarnings: string[] = [];
-    // Populated for .xlsx only; see the constructor parameter of the same name.
+    // Populated for .xlsx only; see the constructor parameters of the same names.
     const xlsxSheetPaths = new Map<string, string>();
+    const xlsxSheetOptions = new Map<string, XlsxSheetOptions>();
     const looksArrow = /\.(arrows?|feather)$/i.test(path);
     const isFeather = looksArrow && (await isFeatherEncoding(path));
     const isArrow = looksArrow && !isFeather;
@@ -815,8 +1062,11 @@ export class DuckDbFile {
     if (isCsv) {
       // Same single-view treatment as Parquet — auto-detects delimiter,
       // header presence, and column types.
+      await assertCsvHasContent(path);
       const filePath = path.replace(/'/g, "''");
-      await connection.run(`create view "${mainObjectName}" as select * from read_csv_auto('${filePath}')`);
+      await connection.run(
+        `create view "${mainObjectName}" as select * from read_csv_auto('${filePath}'${CSV_READ_OPTIONS})`
+      );
     }
 
     if (isDta) {
@@ -888,18 +1138,16 @@ export class DuckDbFile {
       if (sheets.length === 0) {
         throw new Error(`"${basename(path)}" declares no readable sheets.`);
       }
-      const filePath = path.replace(/'/g, "''");
       const failures: string[] = [];
       for (const sheet of sheets) {
         // read_xlsx addresses a sheet by NAME, so the sheet name is a SQL
         // string literal here and a quoted identifier for the view -- two
         // different escapes, and mixing them up is how a sheet called
         // O'Brien's Data breaks the whole workbook.
-        const asLiteral = sheet.name.replace(/'/g, "''");
         const asIdent = sheet.name.replace(/"/g, '""');
         try {
           await connection.run(
-            `create view "${asIdent}" as select * from read_xlsx('${filePath}', sheet = '${asLiteral}')`
+            `create view "${asIdent}" as select * from ${xlsxReadSql(path, sheet.name, undefined, false)}`
           );
           xlsxSheetPaths.set(sheet.name, sheet.path);
         } catch (err) {
@@ -912,6 +1160,14 @@ export class DuckDbFile {
         throw new Error(
           `None of the ${sheets.length} sheet(s) in "${basename(path)}" could be read.`
         );
+      }
+      for (const warning of await DuckDbFile.showFullSheetWhereRegionWasMissed(
+        connection,
+        path,
+        sheets.filter((s) => xlsxSheetPaths.has(s.name)),
+        xlsxSheetOptions
+      )) {
+        openWarnings.push(warning);
       }
     }
 
@@ -978,7 +1234,8 @@ export class DuckDbFile {
       options?.siblingPath,
       featherTempDir,
       openWarnings,
-      xlsxSheetPaths
+      xlsxSheetPaths,
+      xlsxSheetOptions
     );
   }
 
@@ -1294,7 +1551,11 @@ export class DuckDbFile {
    */
   async runQuery(sql: string, maxRows = 0): Promise<QueryResult> {
     try {
-      return await this.runQueryOnce(sql, maxRows);
+      const result = await this.runQueryOnce(sql, maxRows);
+      if (result.rows.length === 0 && (await this.showFullSheetThatReadAsEmpty(sql))) {
+        return await this.runQueryOnce(sql, maxRows);
+      }
+      return result;
     } catch (err) {
       // A workbook cell Excel could not compute -- #DIV/0!, #N/A, #REF! -- in
       // an otherwise numeric column. read_xlsx types the column from its
@@ -1308,6 +1569,56 @@ export class DuckDbFile {
       if (!(await this.repairXlsxViewsForCellErrors(err))) throw err;
       return await this.runQueryOnce(sql, maxRows);
     }
+  }
+
+  /**
+   * The other half of showFullSheetWhereRegionWasMissed, for the case its
+   * column test cannot see.
+   *
+   * A title banner that happens to span every column leaves the view with the
+   * right column COUNT and the wrong contents -- the banner became the header,
+   * and reading stopped at the blank row under it. The column comparison at
+   * open passes; what gives it away is the sheet coming back empty while its
+   * `<dimension>` claims thousands of rows.
+   *
+   * Lazy, and only on an empty result, because the alternative is a full scan
+   * of every sheet of every workbook at open to find out whether it was needed.
+   * A genuinely empty sheet costs one dimension read, once.
+   */
+  private async showFullSheetThatReadAsEmpty(sql: string): Promise<boolean> {
+    if (this.kind !== 'xlsx') return false;
+    const match = EDITABLE_SELECT_RE.exec(sql.trim());
+    if (!match) return false; // Not a plain read of one sheet; nothing to name.
+    const raw = match[1];
+    const name = raw.startsWith('"') ? raw.slice(1, -1).replace(/""/g, '"') : raw;
+    const sheetPath = this.xlsxSheetPaths.get(name);
+    if (!sheetPath || this.xlsxSheetOptions.has(name)) return false;
+
+    let extent: SheetExtent | undefined;
+    try {
+      extent = (await readSheetExtents(this.path, [sheetPath])).get(sheetPath);
+      if (extent && !extent.exact) extent = await scanSheetExtent(this.path, sheetPath);
+    } catch {
+      return false;
+    }
+    if (!extent || extent.rows <= 1) return false;
+
+    const asIdent = name.replace(/"/g, '""');
+    const opts: XlsxSheetOptions = { rawRectangle: extent.ref, allVarchar: true };
+    try {
+      await this.connection.run(
+        `create or replace view "${asIdent}" as select * from ${xlsxReadSql(this.path, name, opts, false)}`
+      );
+    } catch {
+      return false;
+    }
+    this.xlsxSheetOptions.set(name, opts);
+    this.lateWarnings.push(
+      `Sheet "${name}" read as empty, but the sheet itself declares ${extent.rows} rows. It is ` +
+        `now shown exactly as it is laid out — every row and column, named by their ` +
+        `spreadsheet letters, read as text and view-only.`
+    );
+    return true;
   }
 
   /**
@@ -1335,15 +1646,13 @@ export class DuckDbFile {
     if (!isCellParseError(err)) return false;
 
     this.xlsxErrorsTolerated = true;
-    const filePath = this.path.replace(/'/g, "''");
     const repaired: string[] = [];
     for (const name of this.xlsxSheetPaths.keys()) {
-      const asLiteral = name.replace(/'/g, "''");
       const asIdent = name.replace(/"/g, '""');
       try {
         await this.connection.run(
           `create or replace view "${asIdent}" as select * from ` +
-            `read_xlsx('${filePath}', sheet = '${asLiteral}', ignore_errors = true)`
+            xlsxReadSql(this.path, name, this.xlsxSheetOptions.get(name), true)
         );
         repaired.push(name);
       } catch {
@@ -1354,10 +1663,7 @@ export class DuckDbFile {
     if (repaired.length === 0) return false;
     // Recorded rather than printed: a cell quietly becoming blank has to be
     // said out loud, and the provider is what has a UI to say it in.
-    this.lateWarnings.push(
-      `This workbook holds cell values Excel could not compute (#DIV/0!, #N/A, #REF! ` +
-        `and the like). They are shown as empty cells; every other value is unchanged.`
-    );
+    this.lateWarnings.push(describeCellRepair(err));
     return true;
   }
 
@@ -1660,18 +1966,18 @@ export class DuckDbFile {
       // uses -- the diff pairs the two catalogs up by table name. Reading a
       // workbook with read_csv_auto, which is what the old fallback did, fails
       // on the ZIP header and takes Safe Mode down with it.
-      const literalPath = quoteLiteral(backupPath);
-      // If this workbook already needed ignore_errors to be readable, its
-      // backup needs it too -- otherwise the diff throws on the same
-      // uncomputable cell that the live side is already tolerating.
-      const tolerate = this.xlsxErrorsTolerated ? ', ignore_errors = true' : '';
+      // Every option the live side is reading with applies here too, or the
+      // diff compares two differently-shaped readings of the same sheet:
+      // ignore_errors, because otherwise the backup throws on the same
+      // uncomputable cell the live side is tolerating, and the raw rectangle,
+      // because a 100-column reading against a 1-column one aligns nothing.
       let created = 0;
       for (const name of this.xlsxSheetPaths.keys()) {
-        const asLiteral = name.replace(/'/g, "''");
         const asIdent = name.replace(/"/g, '""');
         try {
           await this.connection.run(
-            `create view "${asIdent}" as select * from read_xlsx(${literalPath}, sheet = '${asLiteral}'${tolerate})`
+            `create view "${asIdent}" as select * from ` +
+              xlsxReadSql(backupPath, name, this.xlsxSheetOptions.get(name), this.xlsxErrorsTolerated)
           );
           created++;
         } catch {
@@ -1703,8 +2009,14 @@ export class DuckDbFile {
           : this.kind === 'arrow' || this.kind === 'feather'
             ? 'read_arrow'
             : 'read_csv_auto';
+    // The live side's CSV options apply here too, or every empty string in the
+    // file reads as NULL on one side and "" on the other, and the diff reports
+    // a changed cell in every one of them.
+    const readOptions = this.kind === 'csv' ? CSV_READ_OPTIONS : '';
     await this.connection.run(
-      `create view ${quoteIdent(this.mainObjectName)} as select * from ${readFn}(${quoteLiteral(readPath)})`
+      `create view ${quoteIdent(this.mainObjectName)} as select * from ${readFn}(${quoteLiteral(
+        readPath
+      )}${readOptions})`
     );
   }
 
@@ -1753,13 +2065,68 @@ export class DuckDbFile {
 
       const qualifiedLive = `${quoteIdent(this.catalogName)}.main.${quoteIdent(table)}`;
       const qualifiedBackup = `backup_cmp.main.${quoteIdent(table)}`;
-      const diffReader = await this.connection.runAndReadAll(
-        `select count(*) from ((select * from ${qualifiedLive} except select * from ${qualifiedBackup}) union all (select * from ${qualifiedBackup} except select * from ${qualifiedLive}))`
-      );
-      const diffCount = Number(diffReader.getRows()[0][0]);
+      const sql = `select count(*) from ((select * from ${qualifiedLive} except select * from ${qualifiedBackup}) union all (select * from ${qualifiedBackup} except select * from ${qualifiedLive}))`;
+      let diffCount: number;
+      try {
+        diffCount = Number((await this.connection.runAndReadAll(sql)).getRows()[0][0]);
+      } catch (err) {
+        // One sheet holding an uncomputable cell used to end the whole
+        // comparison -- and this runs for the sidebar, so every OTHER sheet
+        // lost its change badge because of a #DIV/0! in one of them. Same
+        // shape as the field failure this file already carries a fix for: a
+        // single unreadable sheet must not cost the user the rest.
+        //
+        // runQuery's repair never fires here, because these queries do not go
+        // through it. So it is invoked directly, and the backup's views are
+        // rebuilt to match -- both sides have to read a sheet the same way or
+        // the EXCEPT compares two different readings of it.
+        const repaired = (await this.repairXlsxViewsForCellErrors(err)) && (await this.refreshBackupXlsxViews());
+        try {
+          if (!repaired) throw err;
+          diffCount = Number((await this.connection.runAndReadAll(sql)).getRows()[0][0]);
+        } catch {
+          // Genuinely cannot be compared. Left out of the map rather than
+          // guessed at: the sidebar shows no badge, which is what "we do not
+          // know" looks like. Claiming 'unchanged' would be a lie the user
+          // would act on.
+          continue;
+        }
+      }
       status[table] = diffCount === 0 ? 'unchanged' : 'changed';
     }
     return status;
+  }
+
+  /**
+   * Rebuild the backup catalog's sheet views with the options in force now.
+   *
+   * The backup's views are built once, when the backup is taken. Anything that
+   * changes how the live side reads a sheet afterwards -- the ignore_errors
+   * repair, or a sheet re-read as text -- leaves the two sides reading the same
+   * file differently, and a diff between them then reports differences that are
+   * in the reading rather than in the data.
+   */
+  private async refreshBackupXlsxViews(): Promise<boolean> {
+    if (this.kind !== 'xlsx' || !this.lastBackupPath || !this.backupAttached) return false;
+    const backupPath = this.lastBackupPath;
+    await this.connection.run('use backup_cmp');
+    try {
+      for (const name of this.xlsxSheetPaths.keys()) {
+        const asIdent = name.replace(/"/g, '""');
+        await this.connection
+          .run(
+            `create or replace view "${asIdent}" as select * from ` +
+              xlsxReadSql(backupPath, name, this.xlsxSheetOptions.get(name), this.xlsxErrorsTolerated)
+          )
+          .catch(() => undefined);
+      }
+    } finally {
+      // The lesson from the field failure, applied here too: a throw between
+      // the USE above and this line strands the connection in backup_cmp, and
+      // every later query reports the user's own tables as missing.
+      await this.connection.run(`use ${quoteIdent(this.catalogName)}`);
+    }
+    return true;
   }
 
   /**
@@ -1889,6 +2256,14 @@ export class DuckDbFile {
       tables.find((t) => t === tableName) ?? tables.find((t) => t.toLowerCase() === tableName.toLowerCase());
     if (!found) return { editable: false };
 
+    // A raw-rectangle sheet's columns are the spreadsheet's own letters, not
+    // the sheet's header -- there is no header, which is the entire point. An
+    // edit reaches the workbook by matching the grid's column NAME against the
+    // header row in the XML (see xlsxWrite.patchCell), so there is nothing here
+    // for it to match, and a near-miss would write to the wrong column of
+    // somebody's spreadsheet. View-only until a header is what it has.
+    if (this.isRawRectangleSheet(found)) return { editable: false };
+
     // Column list for the UPDATE is re-derived from the live table, not
     // parsed out of the SELECT text.
     const colsReader = await this.connection.runAndReadAll(
@@ -2006,6 +2381,18 @@ export class DuckDbFile {
     if (!sheetPath) {
       throw new Error(`"${table}" is not a sheet of this workbook, so it cannot be edited.`);
     }
+    // checkEditableSelect refuses these already, so reaching here means the
+    // gate was bypassed. Refused twice on purpose: the columns of a
+    // raw-rectangle sheet are spreadsheet letters rather than the sheet's own
+    // header, so patchCell has nothing to match and the cost of being wrong is
+    // a value written into the wrong column of somebody's workbook.
+    if (this.isRawRectangleSheet(table)) {
+      throw new Error(
+        `"${table}" is shown as the sheet's raw layout because no header row could be found, ` +
+          `so its columns are spreadsheet letters rather than names from the sheet. There is no ` +
+          `way to know which column an edit belongs to, so this sheet is view-only.`
+      );
+    }
 
     const whereCols = Object.keys(rowValues);
     const whereClause = whereCols
@@ -2044,9 +2431,79 @@ export class DuckDbFile {
       expectedCurrent: rowValues[column],
       newValue,
     });
+    await this.warnIfEditWillNotReadBack(table, column, newValue);
     // The view is `read_xlsx(...)`, re-read on every query, so the next one
     // already sees the file as it now is. Nothing to invalidate.
     return 1;
+  }
+
+  /**
+   * Text typed into a numeric column: the write is right, the read is not.
+   *
+   * Verified in the XML -- the cell becomes an inline string holding the text,
+   * and Excel displays it. But the column is numeric, so on the next read
+   * `read_xlsx` infers DOUBLE from the remaining numbers, refuses the text, and
+   * the `ignore_errors` repair blanks it. The user types a value and watches
+   * the cell go empty while the file on disk is correct.
+   *
+   * Refusing the edit was the alternative and would be wrong: the edit is
+   * legitimate and Excel honours it. So it is written, and then said plainly --
+   * including the way out, which the provider offers as a button.
+   */
+  private async warnIfEditWillNotReadBack(table: string, column: string, newValue: unknown): Promise<void> {
+    if (typeof newValue !== 'string' || newValue === '') return;
+    if (this.xlsxSheetOptions.get(table)?.allVarchar) return; // already read as text
+    let type: string;
+    try {
+      const reader = await this.connection.runAndReadAll(
+        `select column_type from (describe select ${quoteIdent(column)} from ${quoteIdent(table)})`
+      );
+      type = String(reader.getRows()[0]?.[0] ?? '');
+    } catch {
+      return;
+    }
+    if (!/^(TINY|SMALL|BIG|HUGE|U?)INT|^INTEGER$|^DOUBLE$|^FLOAT$|^REAL$|^DECIMAL/i.test(type)) return;
+
+    this.lateWarnings.push(
+      `"${newValue}" was saved into "${column}" of sheet "${table}" — the workbook now holds it ` +
+        `and Excel will show it. This viewer will show that cell as empty, because it reads ` +
+        `"${column}" as a ${type.toLowerCase()} column and the text is not one.`
+    );
+    this.pendingReadAsTextSheet = table;
+  }
+
+  /**
+   * The sheet a "read this sheet as text" offer would apply to, if the last
+   * edit raised one. Drained like takeLateWarnings, and for the same reason:
+   * the offer belongs beside the warning that explains it.
+   */
+  private pendingReadAsTextSheet: string | undefined;
+
+  takeReadAsTextOffer(): string | undefined {
+    const sheet = this.pendingReadAsTextSheet;
+    this.pendingReadAsTextSheet = undefined;
+    return sheet;
+  }
+
+  /**
+   * Re-read one sheet with every column as text, on the user's say-so.
+   *
+   * Scoped to the one sheet because the cost is real -- a text column cannot be
+   * sorted numerically, summarised, or charted -- and it is the whole reason
+   * the automatic repair uses `ignore_errors` instead. Offering it per sheet
+   * makes it the user's trade rather than the viewer's.
+   */
+  async readSheetAsText(sheet: string): Promise<void> {
+    if (this.kind !== 'xlsx') throw new Error('Only a workbook sheet can be read as text.');
+    if (!this.xlsxSheetPaths.has(sheet)) {
+      throw new Error(`"${sheet}" is not a sheet of this workbook.`);
+    }
+    const options: XlsxSheetOptions = { ...this.xlsxSheetOptions.get(sheet), allVarchar: true };
+    const asIdent = sheet.replace(/"/g, '""');
+    await this.connection.run(
+      `create or replace view "${asIdent}" as select * from ${xlsxReadSql(this.path, sheet, options, false)}`
+    );
+    this.xlsxSheetOptions.set(sheet, options);
   }
 
   /**
