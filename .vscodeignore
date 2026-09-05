@@ -14,3 +14,9 @@ node_modules/codemirror/**
 node_modules/crelt/**
 node_modules/style-mod/**
 node_modules/w3c-keyname/**
+
+# The stress corpus and its generated _work directory: megabytes of fixtures
+# that exist to be read by the suite, never by the extension.
+test/**
+out-test/**
+tsconfig.test.json
