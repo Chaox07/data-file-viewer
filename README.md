@@ -503,6 +503,25 @@ code --install-extension data-file-viewer-0.0.1.vsix
 do not copy it across machines. Build separately per platform, or use the
 GitHub Actions workflow below to get both automatically.
 
+**If `vsce` packages 9 files and 460 KB instead of ~1500 files and ~42 MB,
+check the path you are building from.** That build has no `node_modules`, so
+the extension installs and then fails on first use with a missing
+`@duckdb/node-api`. `vsce` locates dependencies by running `npm ls --parseable`
+and globbing each path it prints; if anything rewrites that output — a sandbox
+that redacts part of the working directory, for instance — every path it is
+handed does not exist, every glob returns nothing, and it reports no error,
+because zero files is not a failure to it. `vsce ls` is the quick check: it
+should print about 1500 lines. `vsce ls --no-dependencies` printing 7 while
+`vsce ls` prints 0 is the signature. Build from an ordinary path.
+
+A correct package contains `extension/dist/extension.js`, a
+`extension/node_modules/@duckdb/node-bindings-*/duckdb.node`, and no
+`extension/test/` or `extension/out-test/` entries at all:
+
+```sh
+unzip -l data-file-viewer-*.vsix | grep -c "extension/out-test/"   # must be 0
+```
+
 ## CI (GitHub Actions)
 
 `.github/workflows/build.yml` builds a macOS and a Windows `.vsix` on every
