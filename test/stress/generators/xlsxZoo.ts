@@ -149,6 +149,88 @@ for (const [slug, sheet, note] of SHAPES) {
   });
 }
 
+/**
+ * Footnotes UNDER a table that are WIDER than the table they annotate.
+ *
+ * The TCMB/EVDS shape, and it is not hypothetical: `efektif_kur` in the user's
+ * merged_excel.xlsx holds 124 rows of two columns and then five three-column
+ * note rows beneath them. Anything that judges a sheet by its WIDEST row reads
+ * that as a two-column table missing a column, which is how a correctly-read
+ * sheet gets "rescued" into an all-text rectangle. The modal width is what
+ * ignores them, and this is the shape that argues for it.
+ *
+ * Both halves are asserted. The table is found with its own two columns and
+ * neither note row swept into it -- and the notes are still THERE, on the sheet,
+ * at the rows the file puts them, because the sheet is shown whole. A viewer
+ * that got the first half right by discarding the second would pass a test that
+ * only looked at the table.
+ *
+ * What is deliberately NOT asserted is that the note block is recognised as a
+ * footer. This particular one cannot be, and neither this code nor the ETL it
+ * is ported from pretends otherwise: the classifier's tell for the EVDS shape
+ * is a SECTION HEADING -- a row whose only populated cell is a word like
+ * "Notlar" -- and the block here has none, its labels sitting in the second
+ * column under a first column of series codes. So it may be offered as a
+ * second table. That is a cosmetic extra entry, not a misread: the rows are
+ * still on the sheet where the file puts them, and the DATA table above is
+ * unaffected, which is what this pins.
+ */
+registerCase({
+  name: 'xlsx_footnotes_wider_than_the_table',
+  family: 'xlsxZoo',
+  expect: {
+    note: 'notes below a table, occupying more columns than the table itself',
+    table: {
+      columns: ['Date', 'value'],
+      rows: [
+        ['1996-1Q', 1.5],
+        ['1996-2Q', 2.5],
+      ],
+    },
+  },
+  build: async (ctx) => ({
+    path: await w.xlsxFile(join(ctx.dir, 'wide_notes.xlsx'), [
+      {
+        name: 'data',
+        rows: [
+          ['Date', 'value'],
+          ['1996-1Q', 1.5],
+          ['1996-2Q', 2.5],
+          [],
+          ['TP.RK.T1.Y', 'Veri Kaynağı', 'TCMB'],
+          ['TP.RK.T1.Y', 'Gözlem', 'Bitiş'],
+        ],
+      },
+    ]),
+  }),
+  check: async (file, ctx) => {
+    // The notes are on the sheet, where the file puts them: rows 5 and 6,
+    // three columns wide, unmoved and unsummarised.
+    const sheet = await file.runQuery('select * from "data"');
+    if (sheet.rows.length !== 6) {
+      ctx.fail('silent-misread', `the sheet reads ${sheet.rows.length} rows, expected 6`);
+      return;
+    }
+    if (String(sheet.rows[4][2] ?? '') !== 'TCMB') {
+      ctx.fail(
+        'silent-misread',
+        `the third column of the note row is ${JSON.stringify(sheet.rows[4][2])}, expected "TCMB"`
+      );
+    }
+    // ...and the DATA table is exactly the two columns above the blank line,
+    // with neither note row swept into it. That is the part that would corrupt
+    // a chart, and the part the modal width exists to protect.
+    const tables = (await file.listTables()).filter((t) => t.includes(' \u00b7 Table '));
+    const first = await file.runQuery(`select * from ${JSON.stringify(tables[0])}`);
+    if (first.columns.join(',') !== 'Date,value') {
+      ctx.fail('silent-misread', `the table reads columns [${first.columns.join(', ')}]`);
+    }
+    if (first.rows.length !== 2) {
+      ctx.fail('silent-misread', `the table reads ${first.rows.length} rows, expected 2`);
+    }
+  },
+});
+
 // ---------------------------------------------------------------------------
 // The same shapes, EDITED
 // ---------------------------------------------------------------------------
