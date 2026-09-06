@@ -46,7 +46,7 @@
  * for the cell's -- which in that codebase nulled 182,000 cells in one sheet.
  */
 
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, writeFile, rename, rm } from 'node:fs/promises';
 import { unzipSync, zipSync, strFromU8, strToU8 } from 'fflate';
 
 /** A1 column letters -> 0-based index. "A" -> 0, "Z" -> 25, "AA" -> 26. */
@@ -241,8 +241,21 @@ export interface PatchCellRequest {
   columnName: string;
   /** Every column the sheet's view exposes, in order, for finding the header row. */
   columnNames: readonly string[];
-  /** 1-based position of the row among the rows read_xlsx returned. */
+  /**
+   * Which row.
+   *
+   * With `verbatim`, this is the WORKSHEET row number -- row 7 is Excel's row 7.
+   * Without it, the 1-based position among the data rows read_xlsx returned,
+   * counted from below the header.
+   */
   rowOrdinal: number;
+  /**
+   * The coordinates are the worksheet's own: `rowOrdinal` is an Excel row
+   * number and `columnName` is an Excel column letter.
+   *
+   * Turns the write from a search into arithmetic -- see patchCell.
+   */
+  verbatim?: boolean;
   /** What the grid showed in this cell. The write is refused if the file disagrees. */
   expectedCurrent: unknown;
   newValue: unknown;
@@ -314,50 +327,77 @@ export async function patchCell(request: PatchCellRequest): Promise<void> {
   // order -- read_xlsx returns them in sheet order, so its Nth row is the Nth
   // row here. Trailing junk sits past the end and is never indexed into,
   // because the ordinal always counts from the top.
-  const wanted = new Set(columnNames);
-  let headerIndex = -1;
-  let headerCells = new Map<string, string>();
-  for (let i = 0; i < rows.length; i++) {
-    const cells = cellTextsOf(rows[i].xml, sharedStrings);
-    const texts = new Set(cells.values());
-    if ([...wanted].every((name) => texts.has(name))) {
-      headerIndex = i;
-      headerCells = cells;
-      break;
-    }
-  }
-  if (headerIndex === -1) {
-    throw new Error(
-      'Could not find the header row in this sheet, so there is no way to tell ' +
-        'which row and column the edit belongs to. The cell was not changed.'
-    );
-  }
+  let letters: string;
+  let target: RowBlock;
 
-  // Which COLUMN, by the header's own text rather than by counting: a sheet
-  // whose first column is blank starts at B, and every positional guess is
-  // then one column out.
-  let letters: string | undefined;
-  for (const [ref, text] of headerCells) {
-    if (text === columnName) {
-      letters = ref;
-      break;
+  if (request.verbatim) {
+    // The sheet is read verbatim, anchored at A1 with no header promoted, so
+    // the grid's coordinates ARE the worksheet's: grid row N is Excel row N and
+    // a column called "B" is column B. Nothing has to be found, and the class
+    // of bug the search below exists to avoid cannot arise -- there is no
+    // header to locate wrongly and no count to be off by.
+    //
+    // This is the payoff of showing the sheet as it is. The old view promoted a
+    // header and dropped everything above it, so the writer had to reconstruct
+    // where the data started by searching the XML for the column names.
+    if (!/^[A-Z]+$/.test(columnName)) {
+      throw new Error(`"${columnName}" is not a column of the sheet. The cell was not changed.`);
     }
-  }
-  if (!letters) {
-    throw new Error(
-      `Could not find a column headed "${columnName}" in the sheet, so the edit ` +
-        `cannot be placed. The cell was not changed.`
-    );
-  }
+    letters = columnName;
+    const found = rows.find((r) => r.number === rowOrdinal);
+    if (rowOrdinal < 1 || !found) {
+      throw new Error(
+        `Row ${rowOrdinal} holds nothing in this sheet, so there is no cell to change.`
+      );
+    }
+    target = found;
+  } else {
+    const wanted = new Set(columnNames);
+    let headerIndex = -1;
+    let headerCells = new Map<string, string>();
+    for (let i = 0; i < rows.length; i++) {
+      const cells = cellTextsOf(rows[i].xml, sharedStrings);
+      const texts = new Set(cells.values());
+      if ([...wanted].every((name) => texts.has(name))) {
+        headerIndex = i;
+        headerCells = cells;
+        break;
+      }
+    }
+    if (headerIndex === -1) {
+      throw new Error(
+        'Could not find the header row in this sheet, so there is no way to tell ' +
+          'which row and column the edit belongs to. The cell was not changed.'
+      );
+    }
 
-  const targetIndex = headerIndex + rowOrdinal;
-  if (rowOrdinal < 1 || targetIndex >= rows.length) {
-    throw new Error(
-      `Row ${rowOrdinal} is past the end of this sheet (${rows.length} row(s) below ` +
-        `the header). The cell was not changed.`
-    );
+    // Which COLUMN, by the header's own text rather than by counting: a sheet
+    // whose first column is blank starts at B, and every positional guess is
+    // then one column out.
+    let byHeader: string | undefined;
+    for (const [ref, text] of headerCells) {
+      if (text === columnName) {
+        byHeader = ref;
+        break;
+      }
+    }
+    if (!byHeader) {
+      throw new Error(
+        `Could not find a column headed "${columnName}" in the sheet, so the edit ` +
+          `cannot be placed. The cell was not changed.`
+      );
+    }
+    letters = byHeader;
+
+    const targetIndex = headerIndex + rowOrdinal;
+    if (rowOrdinal < 1 || targetIndex >= rows.length) {
+      throw new Error(
+        `Row ${rowOrdinal} is past the end of this sheet (${rows.length} row(s) below ` +
+          `the header). The cell was not changed.`
+      );
+    }
+    target = rows[targetIndex];
   }
-  const target = rows[targetIndex];
   const ref = `${letters}${target.number}`;
 
   // The second reading. DuckDB said this is the row; the file has to agree that
@@ -380,7 +420,28 @@ export async function patchCell(request: PatchCellRequest): Promise<void> {
   files[sheetPath] = strToU8(updatedSheet);
 
   // Rezipped whole, because a zip's central directory has to be rebuilt when
-  // any member's compressed size changes. Every other member is passed through
-  // as the bytes that came out, so nothing but the edited sheet is re-encoded.
-  await writeFile(filePath, Buffer.from(zipSync(files)));
+  // any member's compressed size changes.
+  //
+  // NOTE: this DOES re-encode every member. `unzipSync` above inflates them all
+  // and `zipSync` re-deflates them all, so editing one cell of a 100 MB
+  // workbook recompresses 100 MB. (A comment here used to claim the opposite;
+  // it was wrong, and the claim is worth contradicting explicitly so it is not
+  // reintroduced. Fixing it properly means carrying the original compressed
+  // bytes through with fflate's ZipPassThrough.)
+  const bytes = Buffer.from(zipSync(files));
+
+  // Written beside the file and moved into place, never over it.
+  //
+  // `writeFile` to the workbook's own path truncates it first, so an
+  // interruption between truncate and write leaves the user with a zero-length
+  // or half-written workbook -- their data, destroyed by a one-cell edit. The
+  // Feather path already does it this way and records the same reasoning.
+  const temp = `${filePath}.dfv-tmp-${process.pid}-${Date.now()}`;
+  try {
+    await writeFile(temp, bytes);
+    await rename(temp, filePath);
+  } catch (err) {
+    await rm(temp, { force: true }).catch(() => {});
+    throw err;
+  }
 }

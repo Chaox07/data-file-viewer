@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import { registerCase } from '../expect';
-import { firstTable, quote, readTable } from '../harness/inspect';
+import { firstTable, quote, readTable, subjectTable } from '../harness/inspect';
 import * as w from './_write';
 
 /**
@@ -182,7 +182,9 @@ registerCase({
     tableName: "O'Brien's Data",
   }),
   check: async (file, ctx) => {
-    const name = "O'Brien's Data";
+    // The hostile COLUMN names are the point here, and they live in the table
+    // detected inside the sheet; the sheet's own object is verbatim.
+    const name = await subjectTable(file, "O'Brien's Data");
     const table = await readTable(file, name);
     const rowValues: Record<string, unknown> = {};
     table.columns.forEach((c, i) => {
@@ -223,7 +225,10 @@ registerCase({
     ]),
   }),
   check: async (file, ctx) => {
-    const table = await readTable(file, 'data');
+    // The named columns live in the table detected inside the sheet; the
+    // sheet's own object is verbatim, with letter-named columns.
+    const subject = await subjectTable(file, 'data');
+    const table = await readTable(file, subject);
     if (!table.columns.includes('say "hello"')) {
       ctx.fail(
         'silent-misread',
@@ -236,7 +241,7 @@ registerCase({
       rowValues[c] = table.rows[0][i];
     });
     try {
-      const changed = await file.updateCell('data', 'say "hello"', 'EDITED', rowValues);
+      const changed = await file.updateCell(subject, 'say "hello"', 'EDITED', rowValues);
       if (changed !== 1) {
         ctx.fail('lost-edit', `the edit changed ${changed} rows, expected 1`);
       }

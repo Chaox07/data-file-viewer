@@ -57,6 +57,38 @@ export async function firstTable(file: DuckDbFile): Promise<string> {
 }
 
 /**
+ * The object a case's expectations are ABOUT.
+ *
+ * For every kind but .xlsx that is the first table, and always was. A workbook
+ * is different, and the difference is deliberate: the object named after a
+ * sheet is now the sheet VERBATIM -- every declared row and column, columns
+ * named after their Excel letters, titles and footnotes exactly where the file
+ * puts them, nothing promoted or excluded. Its columns are A, B, C by
+ * construction.
+ *
+ * The named, typed columns a roundtrip case asserts on live in the tables
+ * DETECTED inside the sheet, which is where a header row has been read as a
+ * header. So a workbook case reads `<sheet> \u00b7 Table 1`.
+ *
+ * Detection is deferred until a sheet is first queried (reading every sheet of
+ * a workbook to open one of them is what made opening slow), so the sheet is
+ * queried here to trigger it before the list is re-read.
+ */
+export async function subjectTable(file: DuckDbFile, named?: string): Promise<string> {
+  const sheet = named ?? (await firstTable(file));
+  if (file.fileKind !== 'xlsx') return sheet;
+  // Querying it is what makes the sheet find its tables; detection is deferred
+  // until first use.
+  try {
+    await file.runQuery(`select * from ${quote(sheet)} limit 1`);
+  } catch {
+    return sheet; // not an object of this file; let the caller fail on it
+  }
+  const detected = (await file.listTables()).filter((t) => t.startsWith(`${sheet} \u00b7 Table `));
+  return detected[0] ?? sheet;
+}
+
+/**
  * Open, list, and actually READ.
  *
  * Never just open. For the flat kinds `open()` only runs `create view ... as
@@ -66,7 +98,11 @@ export async function firstTable(file: DuckDbFile): Promise<string> {
  * "did open() throw" passes for the wrong reason.
  */
 export async function readTable(file: DuckDbFile, tableName?: string): Promise<CanonicalTable> {
-  const name = tableName ?? (await firstTable(file));
+  // A case names the SHEET it is about; what it asserts on -- named columns,
+  // typed values -- is the table detected inside that sheet. Resolving here
+  // rather than in every case keeps `tableName` meaning "the thing this sheet
+  // is about" and stops each case from having to restate the detection.
+  const name = await subjectTable(file, tableName);
   const result = await file.runQuery(`select * from ${quote(name)}`);
   return { columns: result.columns, rows: result.rows };
 }

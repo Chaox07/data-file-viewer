@@ -44,3 +44,20 @@ test('hasMultipleStatements ignores a single trailing semicolon', () => {
   assert.equal(hasMultipleStatements('select 1; select 2'), true);
   assert.equal(hasMultipleStatements("select ';'"), false);
 });
+
+test('a dollar-quoted string cannot smuggle a second statement past Safe Mode', () => {
+  // The scanner used to enter a string at the `'` INSIDE the dollar quote and
+  // consume everything to the next one, swallowing the `;` and the DROP with
+  // it. What survived looked like a single select with no write keyword, so
+  // Safe Mode allowed it; DuckDB reads three statements.
+  const sql = `select $a$'$a$ as c; drop table t; select '1'`;
+  assert.ok(
+    destructiveReason(sql) !== null || hasMultipleStatements(sql),
+    'a dollar-quoted string hid a DROP from the scanner'
+  );
+});
+
+test('an ordinary dollar-quoted literal is still allowed', () => {
+  assert.equal(destructiveReason(`select $tag$ drop table t $tag$ as note`), null);
+  assert.equal(destructiveReason(`select $$ delete everything $$ as note`), null);
+});

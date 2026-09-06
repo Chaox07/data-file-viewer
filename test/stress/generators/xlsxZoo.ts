@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { unzipSync } from 'fflate';
 import { registerCase, type CaseContext } from '../expect';
-import { readTable } from '../harness/inspect';
+import { readTable, subjectTable } from '../harness/inspect';
 import * as w from './_write';
 
 /**
@@ -160,7 +160,12 @@ async function editAndVerify(
   path: string,
   options: { row: number; column: string; value: unknown; sheet?: string }
 ): Promise<void> {
-  const sheet = options.sheet ?? 'data';
+  // The named columns an edit case talks about ("label", "amount") live in the
+  // table DETECTED inside the sheet; the sheet's own object is verbatim, with
+  // columns named after their Excel letters. Editing through the table is also
+  // the more interesting path, because it exercises the translation from the
+  // table's coordinates back to a worksheet cell.
+  const sheet = options.sheet ?? (await subjectTable(file));
   const before = await readTable(file, sheet);
   const untouchedBefore = await partsExcept(path, 'xl/worksheets/sheet1.xml');
 
@@ -256,12 +261,13 @@ registerCase({
     path: await w.xlsxFile(join(ctx.dir, 'int.xlsx'), [{ name: 'data', rows: [HEADER, ...BODY] }]),
   }),
   check: async (file, ctx, built) => {
-    const before = await readTable(file, 'data');
+    const subject = await subjectTable(file, 'data');
+    const before = await readTable(file, subject);
     const rowValues: Record<string, unknown> = {};
     before.columns.forEach((c, i) => {
       rowValues[c] = before.rows[0][i];
     });
-    await file.updateCell('data', 'amount', 7, rowValues);
+    await file.updateCell(subject, 'amount', 7, rowValues);
     file.dispose();
 
     const zip = unzipSync(new Uint8Array(await readFile(built.path)));
@@ -346,7 +352,8 @@ registerCase({
     ]),
   }),
   check: async (file, ctx, built) => {
-    const before = await readTable(file, 'data');
+    const subject = await subjectTable(file, 'data');
+    const before = await readTable(file, subject);
     const bytes = await readFile(built.path);
     const rowValues: Record<string, unknown> = {};
     before.columns.forEach((c, i) => {
@@ -355,7 +362,7 @@ registerCase({
 
     let refused = false;
     try {
-      await file.updateCell('data', 'label', 'EDITED', rowValues);
+      await file.updateCell(subject, 'label', 'EDITED', rowValues);
     } catch (err) {
       refused = true;
       const message = err instanceof Error ? err.message : String(err);
@@ -468,7 +475,10 @@ registerCase({
     ]),
   }),
   check: async (file, ctx, built) => {
-    const table = await readTable(file, 'data');
+    // The named columns live in the table detected inside the sheet; the
+    // sheet's own object is verbatim, with letter-named columns.
+    const subject = await subjectTable(file, 'data');
+    const table = await readTable(file, subject);
     const last = table.rows[table.rows.length - 1];
     if (Number(last[0]) !== 39999) {
       ctx.fail('silent-misread', `the last row is ${JSON.stringify(last)}, expected [39999, "row 39999"]`);
@@ -480,7 +490,7 @@ registerCase({
     table.columns.forEach((c, i) => {
       rowValues[c] = last[i];
     });
-    const changed = await file.updateCell('data', 'label', 'EDITED', rowValues);
+    const changed = await file.updateCell(subject, 'label', 'EDITED', rowValues);
     file.dispose();
     if (changed !== 1) {
       ctx.fail('lost-edit', `editing the last of 40,000 rows changed ${changed} rows`);
@@ -526,7 +536,10 @@ for (const error of ['#DIV/0!', '#N/A', '#REF!', '#VALUE!', '#NAME?']) {
       ]),
     }),
     check: async (file, ctx) => {
-      const table = await readTable(file, 'data');
+      // The named columns live in the table detected inside the sheet; the
+    // sheet's own object is verbatim, with letter-named columns.
+    const subject = await subjectTable(file, 'data');
+    const table = await readTable(file, subject);
       if (table.rows.length !== 3) {
         ctx.fail('silent-misread', `one uncomputable cell cost the sheet rows: ${table.rows.length} of 3`);
       }

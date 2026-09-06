@@ -92,9 +92,9 @@
         },
         "dataFileViewer.maxResultRows": {
           "type": "number",
-          "default": 0,
+          "default": 50000,
           "minimum": 0,
-          "description": "Maximum number of rows a query result sends to the view. 0 (the default) means no cap — every matching row is shown. Set a cap if very large results feel slow: sorting still runs across the whole result before the cap is applied, so the rows you see remain the true top N."
+          "description": "Maximum number of rows a query result sends to the view. Every row of a result crosses into the view before the grid decides which 30 of them to draw, so an uncapped query over a very large table spends its time moving rows nobody looks at. The default of 50,000 keeps that bounded and the footer says when a result was capped. Set 0 for no cap. Sorting still runs across the whole result before the cap is applied, so the rows you see remain the true top N."
         },
         "dataFileViewer.liveRefreshIntervalMs": {
           "type": "number",
@@ -136,16 +136,16 @@
           "default": ["#VALUE!", "#REF!", "#DIV/0!", "#NAME?", "#NUM!", "#NULL!", "#N/A", "N/A", "NA"],
           "markdownDescription": "Cell text read as \"no value here\" rather than as a word. A spreadsheet writes a gap as `=NA()` (cached as `#N/A`) or as the bare word `NA`, and read back those are strings sitting in a column of numbers — which types the whole column as text and drops it out of the chart's column picker without saying so. A column is converted only when every one of its other values is a number, so a column holding a real note keeps its text and the notice says which value decided it. Set to `[]` to read the file literally. The file on disk is never modified."
         },
-        "dataFileViewer.sheetBlocks": {
+        "dataFileViewer.sheetTables": {
           "type": "string",
-          "enum": ["split", "single", "raw"],
-          "default": "split",
+          "enum": ["grid", "rows", "off"],
+          "default": "grid",
           "enumDescriptions": [
-            "Every block on the sheet is its own table: the main one under the sheet's name, and each caption, footnote and secondary table beside it.",
-            "Only the sheet's main table. Everything else on the sheet has nowhere to be.",
-            "No interpretation: one table per sheet, every declared row and column, all text, columns named after their Excel letters."
+            "Split a sheet on blank rows AND blank columns, so two tables side by side are two tables.",
+            "Split on blank rows only \u2014 what the ETL pipeline does. Tables side by side stay fused into one wide table.",
+            "Offer the sheets alone, with no tables detected inside them."
           ],
-          "markdownDescription": "How much of a worksheet's structure to offer. A published workbook rarely holds one rectangle per sheet — a footnote at the top, a table of series definitions, then the data — and `read_xlsx` on its own stops at the first block, which is usually the footnote.\n\n`split` (the default) gives each block its own table, so a sheet holding six things offers six things and each can be browsed, sorted, exported and plotted on its own. `single` opens the main table only. `raw` interprets nothing and shows the sheet exactly as it sits on disk, which is how you check what the split did. The file is never modified in any of the three."
+          "markdownDescription": "Whether to look for tables **inside** each sheet, and how.\n\nThe sheet itself is always shown exactly as the file holds it \u2014 every row and column, columns named after their Excel letters, titles and footnotes where the workbook puts them. Nothing is cleaned, promoted or moved. This setting only decides what is offered *beside* it.\n\nA published workbook rarely holds one rectangle per sheet: a footnote at the top, a table of series definitions, then the data, and often two tables side by side. Each detected table becomes its own object with real column types, so it can be sorted, summarised and plotted \u2014 while the sheet stays untouched.\n\n`grid` (the default) splits on blank rows and blank columns. `rows` splits on blank rows only, matching the ETL pipeline. `off` skips detection. The file is never modified in any of the three."
         }
       }
     },

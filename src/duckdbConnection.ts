@@ -16,8 +16,13 @@ import { tmpdir } from 'node:os';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
 import { KNOWN_FREQUENCIES, type SeriesFrequency } from './chartSpec';
 import { csvLocaleOptions, decideFile, type NumberLocale } from './numericLocale';
-import { listSheets, readSheetDimension } from './xlsxSheets';
-import { analyseSheet, needsBlockHandling, sheetFragments, type Cell } from './sheetBlocks';
+import { listSheets, readSheetDimensionsChecked, type SheetDimension } from './xlsxSheets';
+import {
+  columnLetters as tableColumnLetters,
+  detectTables,
+  isBlank,
+  type Cell,
+} from './sheetTables';
 import {
   EXCEL_ERROR_TOKENS,
   classifyTextColumn,
@@ -92,18 +97,28 @@ export interface DuckDbFileOpenOptions {
    */
   nullText?: readonly string[];
   /**
-   * How much of a worksheet's structure to offer.
+   * Whether to look for tables INSIDE each sheet, and how.
    *
-   * `"split"` (the default) gives every block on the sheet its own object: the
-   * table the sheet is about under the sheet's name, and each caption, footnote
-   * and secondary table beside it. `"single"` opens only the main table, which
-   * leaves the rest of the sheet with nowhere to be. `"raw"` interprets nothing
-   * — one object per sheet, every declared row and column, all text.
+   * The sheet itself is always offered verbatim -- every declared row and
+   * column, nothing promoted, nothing excluded, footnotes where the file puts
+   * them. This only decides what is offered BESIDE it.
+   *
+   * `"grid"` (the default) splits a sheet on blank rows AND blank columns, so
+   * two tables sitting side by side are two tables. `"rows"` splits on blank
+   * rows only, which is what the ETL pipeline does. `"off"` offers the sheets
+   * alone.
    */
-  sheetBlocks?: SheetBlockMode;
+  sheetTables?: SheetTableMode;
 }
 
-export type SheetBlockMode = 'split' | 'single' | 'raw';
+export type SheetTableMode = 'grid' | 'rows' | 'off';
+
+/** A sheet whose tables have not been looked for yet. */
+interface PendingSheet {
+  /** The sheet name as a SQL string literal, for read_xlsx's `sheet =`. */
+  literal: string;
+  dim: SheetDimension | undefined;
+}
 
 /** What the locale sniff concluded, for the notice the viewer shows. */
 export interface NumberLocaleReport {
@@ -157,154 +172,79 @@ async function sniffCsvLocale(
   }
 }
 
-/** What a worksheet declares (or, absent a declaration, measures) as its extent. */
-type SheetDimension = NonNullable<Awaited<ReturnType<typeof readSheetDimension>>>;
-
-/** Structure of one worksheet: where its header is, and what sits above it. */
-interface SheetShapeInfo {
-  /** 1-based Excel row of the header. */
-  headerExcelRow: number;
-  /** Last row the sheet declares, for the range's end bound. */
-  lastRow: number;
-  /**
-   * First column the sheet declares — the range's LEFT bound, not "A".
-   *
-   * Both sheets of YieldCurve_Data.xlsx declare `B2:AH16809`: column A is
-   * empty throughout. Anchoring the range at A instead gave every sheet a
-   * leading all-NULL column named `C0` (34 columns where the sheet has 33),
-   * and shifted sheetBlocks' header text by one against its own width, so the
-   * last real column fell off the end of the detected header.
-   */
-  firstCol: string;
-  /** Last column the sheet declares. */
-  lastCol: string;
-  /** Every other rectangle on the sheet, each one its own object. */
-  fragments: SheetFragmentInfo[];
-}
-
 /**
- * One block of a sheet that is not the main table, as an Excel address.
+ * One detected table, as the Excel addresses `read_xlsx`'s `range` speaks.
  *
- * `sheetFragments` works in indices into the sample; this is the same thing
- * converted to the addresses `read_xlsx`'s `range` speaks, which is the only
- * form that can be handed back to DuckDB.
+ * `sheetTables.detectTables` works in 0-based indices into the grid it was
+ * given; because that grid is always read from `A1`, an index i is Excel row
+ * i+1 and column index j is column letter j. This is the same thing in the only
+ * form DuckDB accepts.
  */
-interface SheetFragmentInfo {
-  /** 1-based Excel row, inclusive at both ends. */
+interface SheetTableInfo {
+  /** 1-based Excel rows, inclusive at both ends. */
   startRow: number;
   endRow: number;
   firstCol: string;
   lastCol: string;
-  /** `header = true` when the fragment's first row names its columns. */
+  /** `header = true` when the table's first row names its columns. */
   hasHeader: boolean;
-  /** What this object is called after the sheet's name: `(rows 4-9)`. */
+  /** What this object is called after the sheet's name: `· Table 2`. */
   suffix: string;
 }
 
-/** How many rows to sample when locating a sheet's header. */
-const SHEET_SHAPE_SAMPLE_ROWS = 200;
-
 /**
- * Locate a sheet's header row, or undefined when it is already row 1 (the
- * ordinary case, which keeps reading exactly as it did before).
+ * The sheet, verbatim: every declared row and column, as text, columns named
+ * after their Excel letters.
+ *
+ * This is what the sheet's own object shows, and it is the whole point of the
+ * design. A viewer is asked "what is in this file"; anything it hides, moves or
+ * retypes is an answer to a different question. So:
+ *
+ *   - **Anchored at A1**, not at the dimension's first cell. Grid row N is then
+ *     Excel row N and grid column J is Excel column J, exactly, which is what
+ *     makes "the footnote is where it was" true rather than approximately true
+ *     -- and what lets a cell edit address the right cell by arithmetic instead
+ *     of by matching header text down the sheet.
+ *   - **`header = false`**, so nothing on the sheet is promoted out of the data
+ *     into a name. `read_xlsx` gives the columns their Excel letters for free.
+ *   - **`all_varchar`**, so a footnote under a numeric column cannot retype the
+ *     column, and nothing has to be excluded to protect a type.
+ *
+ * The dimension routinely OVER-declares (see the project's xlsx geometry
+ * notes), which would otherwise pad the sheet with phantom trailing rows. The
+ * caller trims trailing blank rows and columns after the read; interior blanks
+ * are kept, because those are structure -- they are what separates one table
+ * from the next.
  */
-async function sniffSheetShape(
-  connection: DuckDBConnection,
+function xlsxVerbatimExpr(
   filePathLiteral: string,
   sheetLiteral: string,
   dim: SheetDimension | undefined
-): Promise<SheetShapeInfo | undefined> {
-  try {
-    if (!dim) return undefined;
-    const sampleEnd = Math.min(dim.lastRow, SHEET_SHAPE_SAMPLE_ROWS);
-    // Sampled from the sheet's own first column, the same bound the real read
-    // uses below, so the column indices sheetBlocks reasons about are the
-    // indices the data actually has.
-    const reader = await connection.runAndReadAll(
-      `select * from read_xlsx('${filePathLiteral}', sheet = '${sheetLiteral}', ` +
-        `header = false, all_varchar = true, ignore_errors = true, ` +
-        `range = '${dim.firstCol}1:${dim.lastCol}${sampleEnd}')`
-    );
-    const rows = reader.getRows() as Cell[][];
-    const shape = analyseSheet(rows);
-    if (!shape.table || !needsBlockHandling(shape)) return undefined;
-    // Where the range ENDS is as much a decision as where it starts. The
-    // sheet's last row is the right bound only when the table runs to it; on a
-    // sheet with notes UNDER the table, ending there sweeps the blank line and
-    // the notes in as data rows. (Measured: a four-row table with two note
-    // lines below it read back as seven rows.) `endRow` is exclusive and
-    // 0-based, so it is already the 1-based last row of the block; it can only
-    // be trusted when the block ended before the sample did, because a block
-    // that reaches the end of the sample may simply have been cut off by it.
-    const tableEndedInSample = shape.table.endRow < rows.length;
-    // The sample was read from row 1 of the sheet's own first column, so a row
-    // at index i is Excel row i+1 and a column at index j is j columns right of
-    // dim.firstCol. Verified against the workbook: `range='B1:D7'` on
-    // used-YieldCurve returns its row 2 as out[1] and its row 6 as out[5].
-    const colBase = columnIndexOf(dim.firstCol);
-    const fragments: SheetFragmentInfo[] = sheetFragments(shape).map((f) => {
-      const startRow = f.startRow + 1;
-      // endRow is an exclusive 0-based index, which is already the 1-based
-      // inclusive last row.
-      const endRow = f.endRow;
-      return {
-        startRow,
-        endRow,
-        firstCol: columnLettersOf(colBase + f.firstCol),
-        lastCol: columnLettersOf(colBase + f.lastCol),
-        hasHeader: f.hasHeader,
-        suffix: startRow === endRow ? `(row ${startRow})` : `(rows ${startRow}-${endRow})`,
-      };
-    });
-    return {
-      headerExcelRow: (shape.table.headerRow ?? 0) + 1,
-      lastRow: tableEndedInSample ? shape.table.endRow : dim.lastRow,
-      firstCol: dim.firstCol,
-      lastCol: dim.lastCol,
-      fragments,
-    };
-  } catch {
-    // A sheet we cannot sample is read the way it always was.
-    return undefined;
-  }
-}
-
-/** The read_xlsx() call for one sheet, ranged only when the header is not row 1. */
-function xlsxReadExpr(
-  filePathLiteral: string,
-  sheetLiteral: string,
-  shape: SheetShapeInfo | undefined,
-  tolerateErrors = false
 ): string {
-  if (!shape) {
-    const tolerate = tolerateErrors ? ', ignore_errors = true' : '';
-    return `read_xlsx('${filePathLiteral}', sheet = '${sheetLiteral}'${tolerate})`;
-  }
-  // ignore_errors: a ranged read types each column from the range, and one
-  // uncomputable cell in a 16,000-row sheet would otherwise refuse the lot.
-  // The existing xlsxErrorsTolerated path does the same for the same reason,
-  // which is why a shaped sheet never needs that repair.
+  const range = dim ? `, range = 'A1:${dim.lastCol}${dim.lastRow}'` : '';
   return (
-    `read_xlsx('${filePathLiteral}', sheet = '${sheetLiteral}', ` +
-    `range = '${shape.firstCol}${shape.headerExcelRow}:${shape.lastCol}${shape.lastRow}', ` +
-    `header = true, ignore_errors = true)`
+    `read_xlsx('${filePathLiteral}', sheet = '${sheetLiteral}'${range}, ` +
+    `header = false, all_varchar = true, ignore_errors = true)`
   );
 }
 
 /**
- * The read for one block that is not the sheet's main table.
+ * The read for one detected table.
  *
- * `header = false` names the columns after their Excel letters -- B, C, D --
- * which is exactly what a caption or a footnote should be called, and it stops
- * a lone sentence from becoming a column name over zero rows.
+ * Typed, unlike the verbatim sheet: this is the object the grid sorts, the
+ * stats panel summarises and the chart plots, so its columns need to be numbers
+ * where the file holds numbers.
+ *
+ * `ignore_errors`: a ranged read types each column from the range, and one
+ * uncomputable cell in a 16,000-row sheet would otherwise refuse the lot.
  */
-function xlsxFragmentExpr(
+function xlsxTableExpr(
   filePathLiteral: string,
   sheetLiteral: string,
-  fragment: SheetFragmentInfo
+  table: SheetTableInfo
 ): string {
-  const range = `${fragment.firstCol}${fragment.startRow}:${fragment.lastCol}${fragment.endRow}`;
-  const shape = fragment.hasHeader ? 'header = true' : 'header = false, all_varchar = true';
+  const range = `${table.firstCol}${table.startRow}:${table.lastCol}${table.endRow}`;
+  const shape = table.hasHeader ? 'header = true' : 'header = false, all_varchar = true';
   return (
     `read_xlsx('${filePathLiteral}', sheet = '${sheetLiteral}', ` +
     `range = '${range}', ${shape}, ignore_errors = true)`
@@ -312,24 +252,27 @@ function xlsxFragmentExpr(
 }
 
 /**
- * The sheet with nothing decided about it: every declared row and column, as
- * text, columns named after their Excel letters.
+ * Trailing blank rows and columns of a verbatim read, as a row/column count to
+ * keep.
  *
- * The answer to "what is actually in the file" -- and the reason the split
- * above is an interpretation the user can check rather than one they have to
- * take on trust. Starts at row 1 rather than at the dimension's first row,
- * because "the sheet as it is" includes its empty top.
+ * Only TRAILING ones. A blank row in the middle of a sheet separates two
+ * tables and is load-bearing; a blank row after the last cell is the sheet's
+ * declared rectangle being larger than its contents, which is routine
+ * (`efektif_kur` declares 3 columns for 2 columns of data; `chain_gdp` declares
+ * 12 for 10). Keeping those would report a 200-row sheet as 16,809 rows.
  */
-function xlsxRawExpr(
-  filePathLiteral: string,
-  sheetLiteral: string,
-  dim: SheetDimension | undefined
-): string {
-  const range = dim ? `, range = '${dim.firstCol}1:${dim.lastCol}${dim.lastRow}'` : '';
-  return (
-    `read_xlsx('${filePathLiteral}', sheet = '${sheetLiteral}'${range}, ` +
-    `header = false, all_varchar = true, ignore_errors = true)`
-  );
+function trimTrailingBlanks(rows: readonly Cell[][]): { rows: number; cols: number } {
+  let lastRow = -1;
+  let lastCol = -1;
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    for (let c = 0; c < row.length; c++) {
+      if (isBlank(row[c])) continue;
+      if (r > lastRow) lastRow = r;
+      if (c > lastCol) lastCol = c;
+    }
+  }
+  return { rows: lastRow + 1, cols: lastCol + 1 };
 }
 
 /**
@@ -364,14 +307,28 @@ interface ViewSource {
   /** True once the name resolves to a real table holding the data, not a view. */
   cached?: boolean;
   /**
-   * A block of a sheet that is not the sheet's main table.
+   * A table detected inside a sheet, rather than a sheet.
    *
-   * Read-only (a write would have to find its row by header text, and two
-   * blocks on one sheet can carry the same header), never cached, and not put
-   * through interpretTextColumns -- which costs two full package reads per
-   * object against a handful of note rows.
+   * Materialised like a sheet is, and for the same reason: with a workbook the
+   * cost is the PACKAGE, not the row count, so leaving it as a view would make
+   * every sort, every stats panel and every chart re-inflate the whole file --
+   * on precisely the objects the user plots. It does mean the cells of a sheet
+   * are held twice over; that is bounded by the same MAX_CACHED_CELLS budget,
+   * and it is the trade the measurements argue for.
    */
   derived?: boolean;
+  /**
+   * The sheet exactly as the file holds it -- all text, letter-named columns.
+   *
+   * Never put through interpretTextColumns: it is text BY DESIGN, and
+   * re-typing it is precisely what this object exists not to do.
+   */
+  verbatimSheet?: boolean;
+  /**
+   * For a detected table, where it sits on its sheet -- so an edit made through
+   * it can be turned into a worksheet cell address by arithmetic.
+   */
+  tableOrigin?: { sheet: string; startRow: number; firstCol: number; hasHeader: boolean };
 }
 
 function viewBodySql(source: ViewSource, filePath: string, tolerateErrors: boolean): string {
@@ -1062,15 +1019,32 @@ function isLockConflict(err: unknown): boolean {
 // to happen once per process — but LOAD is per-connection state and must run
 // every time. Splitting the two matters on the live path, where a connection
 // used to be rebuilt from scratch on every tick.
-let sqliteExtensionInstalled = false;
+const installedExtensions = new Set<string>();
+
+/**
+ * INSTALL once per process, LOAD every time.
+ *
+ * `from` names a non-core repository (`community`). INSTALL touches the
+ * extension directory and, on a cold machine, the network; LOAD is the only
+ * part that is per-connection state. Every extension goes through here, so the
+ * live path -- which rebuilds a connection on every tick -- pays the install
+ * once rather than once a tick.
+ */
+async function ensureExtension(
+  connection: DuckDBConnection,
+  name: string,
+  from?: string
+): Promise<void> {
+  if (!installedExtensions.has(name)) {
+    await connection.run(from ? `install ${name} from ${from}` : `install ${name}`);
+    installedExtensions.add(name);
+  }
+  await connection.run(`load ${name}`);
+}
 
 async function ensureSqliteExtension(connection: DuckDBConnection): Promise<void> {
   try {
-    if (!sqliteExtensionInstalled) {
-      await connection.run(`install sqlite`);
-      sqliteExtensionInstalled = true;
-    }
-    await connection.run(`load sqlite`);
+    await ensureExtension(connection, 'sqlite');
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(
@@ -1331,7 +1305,16 @@ export class DuckDbFile {
      * views of their own (.duckdb and .sqlite are ATTACHed, not read through
      * a view). See ViewSource.
      */
-    private readonly viewSources: Map<string, ViewSource> = new Map()
+    private readonly viewSources: Map<string, ViewSource> = new Map(),
+    /**
+     * Sheets whose tables have not been looked for yet, keyed by sheet name.
+     *
+     * A sheet leaves this map the first time anything queries it, and never
+     * re-enters it. See ensureSheetPrepared for why the work waits.
+     */
+    private readonly pendingSheets: Map<string, PendingSheet> = new Map(),
+    private readonly tableMode: SheetTableMode = 'grid',
+    private readonly nullText: readonly string[] = EXCEL_ERROR_TOKENS
   ) {}
 
   isReadOnly(): boolean {
@@ -1392,8 +1375,10 @@ export class DuckDbFile {
     // repair and by the Safe Mode backup copy — see ViewSource.
     const viewSources = new Map<string, ViewSource>();
     const viewLabels = new Map<string, string>();
-    /** How much of a worksheet's structure to offer; see DuckDbFileOpenOptions. */
-    const blockMode: SheetBlockMode = options?.sheetBlocks ?? 'split';
+    // Sheets whose tables have not been looked for yet. See ensureSheetPrepared.
+    const pendingSheets = new Map<string, PendingSheet>();
+    /** Whether to look for tables inside a sheet at all; see DuckDbFileOpenOptions. */
+    const tableMode: SheetTableMode = options?.sheetTables ?? 'grid';
     const looksArrow = /\.(arrows?|feather)$/i.test(path);
     const isFeather = looksArrow && (await isFeatherEncoding(path));
     const isArrow = looksArrow && !isFeather;
@@ -1536,8 +1521,7 @@ export class DuckDbFile {
       // extension (codedthinking/duckdb-dta), which reads Stata formats
       // 117-121 (Stata 13-18) via read_dta().
       try {
-        await connection.run(`install dta from community`);
-        await connection.run(`load dta`);
+        await ensureExtension(connection, 'dta', 'community');
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         throw new Error(
@@ -1557,8 +1541,7 @@ export class DuckDbFile {
       // encoding only, so a Feather file is converted to one first and the
       // view is built over the conversion instead of the original.
       try {
-        await connection.run(`install arrow from community`);
-        await connection.run(`load arrow`);
+        await ensureExtension(connection, 'arrow', 'community');
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         throw new Error(
@@ -1593,8 +1576,7 @@ export class DuckDbFile {
       // `excel` is a core DuckDB extension (not community), but still needs
       // fetching once per machine like sqlite/dta above.
       try {
-        await connection.run(`install excel`);
-        await connection.run(`load excel`);
+        await ensureExtension(connection, 'excel');
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         throw new Error(
@@ -1605,10 +1587,19 @@ export class DuckDbFile {
       if (sheets.length === 0) {
         throw new Error(`"${basename(path)}" declares no readable sheets.`);
       }
-      const filePath = path.replace(/'/g, "''");
       const failures: string[] = [];
-      // Every name Excel itself claims, known before the first block is named.
-      const sheetNames = new Set(sheets.map((s) => s.name));
+      // Every sheet's rectangle, from ONE pass over the archive. Per-sheet
+      // reading is what made this cost a package parse per sheet.
+      const { dimensions: sheetDims, damaged } = await readSheetDimensionsChecked(
+        path,
+        sheets.map((s) => s.path)
+      );
+      // A workbook does none of its reading at open now, so a truncated package
+      // would otherwise open clean and report whatever survived the cut as if
+      // it were the whole sheet. This is the earliest honest refusal left.
+      if (damaged) {
+        throw new Error(`"${basename(path)}" is not a complete .xlsx package: ${damaged}`);
+      }
       for (const sheet of sheets) {
         // read_xlsx addresses a sheet by NAME, so the sheet name is a SQL
         // string literal here and a quoted identifier for the view -- two
@@ -1617,79 +1608,33 @@ export class DuckDbFile {
         const asLiteral = sheet.name.replace(/'/g, "''");
         const asIdent = sheet.name.replace(/"/g, '""');
         try {
-          // Where does this sheet's table actually start?
+          // The sheet is offered EXACTLY as it is: every declared row and
+          // column, as text, columns named after their Excel letters. No header
+          // is promoted, nothing above or below a table is excluded, and no
+          // footnote is relocated into an object of its own.
           //
-          // read_xlsx with no `range` stops at the first contiguous block of
-          // rows. On a sheet with a preamble and a blank line above the real
-          // table -- the ordinary shape of a published workbook -- that block
-          // IS the preamble, so the sheet opens as a handful of columns and
-          // one row and cannot be charted. Verified on YieldCurve_Data.xlsx:
-          // 3 columns, 1 row, no error.
+          // This replaces a design that gave the sheet's name to the table it
+          // judged most important and re-listed the rest as `Sheet (rows 3-5)`.
+          // Nothing was deleted by that, and the footnote was still gone from
+          // where the file puts it.
           //
-          // So sample the top of the sheet as text, find the header by width
-          // (see sheetBlocks.ts), and give read_xlsx an explicit range when
-          // the header is not already row 1. Structure only: nothing is
-          // dropped, and the rows above the header come back as notes.
-          // Read once per sheet and used twice: to find the header row, and to
-          // decide whether the sheet is small enough to hold in memory.
-          const dim = await readSheetDimension(path, sheet.path);
-          const shape =
-            blockMode === 'raw'
-              ? undefined
-              : await sniffSheetShape(connection, filePath, asLiteral, dim);
+          // The tables INSIDE the sheet are found separately, on first use --
+          // see ensureSheetPrepared. Detection needs the sheet's contents, and
+          // reading every sheet of a workbook to open one of them is what made
+          // opening slow. Binding a view costs ~3 ms (measured); reading a
+          // sheet costs 240-640 ms, so the read is what waits.
+          const dim = sheetDims.get(sheet.path);
           const source: ViewSource = {
             sourcePath: path,
-            readExpr:
-              blockMode === 'raw'
-                ? (p) => xlsxRawExpr(p.replace(/'/g, "''"), asLiteral, dim)
-                : (p, tolerate) => xlsxReadExpr(p.replace(/'/g, "''"), asLiteral, shape, tolerate),
+            readExpr: (p) => xlsxVerbatimExpr(p.replace(/'/g, "''"), asLiteral, dim),
             cellCount: dim ? declaredCellCount(dim) : undefined,
+            verbatimSheet: true,
           };
           await connection.run(`create view "${asIdent}" as ${viewBodySql(source, path, false)}`);
           viewSources.set(sheet.name, source);
           viewLabels.set(sheet.name, `Sheet "${sheet.name}"`);
           xlsxSheetPaths.set(sheet.name, sheet.path);
-
-          // Everything else on the sheet, each as its own object.
-          //
-          // Without this the sheet's captions, footnotes and secondary tables
-          // have nowhere to be: naming the main table is a choice, and a
-          // viewer that makes it and then says nothing has deleted the rest as
-          // far as anyone using it can tell. Reported as exactly that, about
-          // the footnote at the top of Raw_Data.
-          const fragments = blockMode === 'split' ? (shape?.fragments ?? []) : [];
-          const names: string[] = [];
-          for (const fragment of fragments) {
-            const name = uniqueName(
-              `${sheet.name} ${fragment.suffix}`,
-              (candidate) => viewSources.has(candidate) || sheetNames.has(candidate)
-            );
-            const fragmentSource: ViewSource = {
-              sourcePath: path,
-              readExpr: (p) => xlsxFragmentExpr(p.replace(/'/g, "''"), asLiteral, fragment),
-              derived: true,
-            };
-            try {
-              await connection.run(
-                `create view ${quoteIdent(name)} as ${viewBodySql(fragmentSource, path, false)}`
-              );
-              viewSources.set(name, fragmentSource);
-              viewLabels.set(name, `"${name}"`);
-              names.push(name);
-            } catch {
-              // A block we cannot address must not cost the sheet it is on.
-            }
-          }
-          if (shape) {
-            openWarnings.push(
-              `Sheet "${sheet.name}": the table starts at row ${shape.headerExcelRow}. ` +
-                (names.length > 0
-                  ? `The rest of the sheet is listed separately, as ${names
-                      .map((n) => `"${n}"`)
-                      .join(' and ')}.`
-                  : `Nothing else on the sheet could be addressed as a block.`)
-            );
-          }
+          pendingSheets.set(sheet.name, { literal: asLiteral, dim });
         } catch (err) {
           // One unreadable sheet (a chart sheet, a macro sheet, an empty one)
           // must not cost the user the rest of the workbook.
@@ -1726,35 +1671,31 @@ export class DuckDbFile {
       await connection.run(`use "${mainObjectName}"`);
     }
 
-    // A workbook is read into memory once, before anything else queries it.
-    // Ordered before the interpretation below on purpose: that pass makes two
-    // passes over each sheet, and against a view every one of them re-inflates
-    // the whole package. See cacheSheetAsTable for the measurements.
-    if (isXlsx) {
-      // Budgeted across the WORKBOOK, not per sheet: a workbook of forty
-      // sheets that each pass the per-sheet test would otherwise be held in
-      // memory forty times over. Sheets are taken in workbook order, so which
-      // ones make the cut is at least predictable.
-      let budget = MAX_CACHED_CELLS;
-      for (const [name, source] of viewSources) {
-        if ((source.cellCount ?? Infinity) > budget) continue;
-        if (await cacheSheetAsTable(connection, name, source)) budget -= source.cellCount ?? 0;
-      }
-    }
-
-    // Every view exists by now, so read the text columns and say what they
-    // hold. Runs after the sheet loop rather than inside it because one
-    // sheet's interpretation must not be able to cost the user that sheet: a
-    // throw inside the loop is caught there as "this sheet is unreadable".
+    // NOTE: a workbook does none of its reading here.
+    //
+    // What used to happen at this point was: materialise every sheet, then run
+    // interpretTextColumns over every sheet. Both read the file. Opening a
+    // twenty-sheet workbook therefore read all twenty before showing one, and
+    // that is the "it takes a long time to load" this is fixing.
+    //
+    // Measured on YieldCurve_Data.xlsx (21 MB, two sheets), which is what
+    // settled the design -- binding a view is not the expensive part:
+    //
+    //   create view over read_xlsx (bind)          3 ms
+    //   ranged read of the sheet             244 / 642 ms
+    //   pulling that grid into JS            150 / 553 ms
+    //
+    // So views are created for every sheet at open (cheap, and it is what makes
+    // the sidebar complete), and every READ waits until the sheet is actually
+    // asked for. See ensureSheetPrepared, which runQuery calls.
     const nullText = options?.nullText ?? EXCEL_ERROR_TOKENS;
-    for (const [view, source] of viewSources) {
-      // Not the sheet fragments: two full package reads each (a sample and a
-      // whole-column verification), against a caption or five rows of
-      // definitions. See ViewSource.derived.
-      if (source.derived) continue;
-      openWarnings.push(
-        ...(await interpretTextColumns(connection, view, viewLabels.get(view) ?? view, source, nullText))
-      );
+    if (!isXlsx) {
+      for (const [view, source] of viewSources) {
+        if (source.derived) continue;
+        openWarnings.push(
+          ...(await interpretTextColumns(connection, view, viewLabels.get(view) ?? view, source, nullText))
+        );
+      }
     }
 
     const catalogReader = await connection.runAndReadAll('select current_database()');
@@ -1799,7 +1740,10 @@ export class DuckDbFile {
       openWarnings,
       xlsxSheetPaths,
       csvLocaleReport,
-      viewSources
+      viewSources,
+      pendingSheets,
+      tableMode,
+      nullText
     );
   }
 
@@ -2143,7 +2087,195 @@ export class DuckDbFile {
    * The cap is a parameter rather than a config read because this module
    * deliberately imports no `vscode`; duckdbEditorProvider owns the setting.
    */
+  /** What kind of file this is — .xlsx behaves differently enough to be worth asking. */
+  get fileKind(): FileKind {
+    return this.kind;
+  }
+
+  /** Sheets that have not been prepared yet — the sidebar re-lists once they are. */
+  hasPendingSheets(): boolean {
+    return this.pendingSheets.size > 0;
+  }
+
+  /**
+   * Do the reading one sheet needs, the first time anything asks for it.
+   *
+   * Everything expensive about opening a workbook lives here, and none of it
+   * happens until the sheet is used:
+   *
+   *   1. Materialise the sheet into a real DuckDB table. A workbook is the one
+   *      kind where re-reading per query is not a reasonable default -- the
+   *      cost is the package, not the row count, so `limit 100` against a view
+   *      costs the same as reading all 16,803 rows.
+   *   2. Trim the trailing blank rows and columns the declared rectangle
+   *      over-states, so the sheet reports the size it actually has.
+   *   3. Find the tables inside it (sheetTables.detectTables) and give each one
+   *      its own typed object.
+   *   4. Interpret the text columns of those tables -- not of the sheet, which
+   *      is text by design.
+   *
+   * Failure is not fatal at any step: the sheet is already open and readable,
+   * and a sheet whose tables could not be worked out is a sheet with no extra
+   * objects beside it, not a sheet the user cannot see.
+   */
+  private async ensureSheetPrepared(name: string): Promise<void> {
+    const pending = this.pendingSheets.get(name);
+    if (!pending) return;
+    // Removed FIRST: a failure below must not leave the sheet queued to be
+    // retried on every query it serves.
+    this.pendingSheets.delete(name);
+
+    const source = this.viewSources.get(name);
+    if (!source) return;
+
+    try {
+      await cacheSheetAsTable(this.connection, name, source);
+
+      // The grid, exactly as the sheet's own object shows it. Read back from
+      // the materialised table where there is one, so detection costs no
+      // further file reads.
+      const reader = await this.connection.runAndReadAll(`select * from ${quoteIdent(name)}`);
+      const grid = reader.getRows() as Cell[][];
+      const columnNames = reader.columnNames();
+
+      // The declared rectangle over-declares routinely; a sheet should not
+      // report 16,809 rows because its <dimension> says so.
+      const used = trimTrailingBlanks(grid);
+      if (
+        source.cached &&
+        used.rows > 0 &&
+        (used.rows < grid.length || used.cols < columnNames.length)
+      ) {
+        const keep = columnNames.slice(0, Math.max(used.cols, 1)).map(quoteIdent).join(', ');
+        await replaceWithTable(
+          this.connection,
+          name,
+          `select ${keep} from ${quoteIdent(name)} limit ${used.rows}`,
+          true
+        );
+      }
+
+      // Cells Excel could not compute, said once per sheet.
+      //
+      // This used to be reported by repairXlsxViewsForCellErrors, which only
+      // ran when a query FAILED on such a cell -- and the verbatim read cannot
+      // fail on one, because it reads every column as text with ignore_errors.
+      // So the notice moved here, where the grid is already in hand: it is both
+      // cheaper and more reliable than waiting for a query to break.
+      if (
+        this.nullText.length > 0 &&
+        grid.some((row) => row.some((cell) => typeof cell === 'string' && isExcelError(cell, this.nullText)))
+      ) {
+        this.lateWarnings.push(
+          `Sheet "${name}" holds cell values Excel could not compute (#DIV/0!, #N/A, ` +
+            `#REF! and the like). They are shown as empty cells in the tables read from ` +
+            `it; the sheet itself shows them exactly as the file has them.`
+        );
+      }
+
+      if (this.tableMode === 'off') return;
+      const tables = detectTables(grid.slice(0, used.rows), {
+        splitColumns: this.tableMode === 'grid',
+      });
+      if (tables.length === 0) return;
+
+      const taken = (candidate: string): boolean =>
+        this.viewSources.has(candidate) || this.xlsxSheetPaths.has(candidate);
+
+      let index = 0;
+      for (const table of tables) {
+        index++;
+        // Grid row i is Excel row i+1, and grid column j is column letter j,
+        // because the verbatim read is anchored at A1. That is the whole reason
+        // it is anchored there.
+        const info: SheetTableInfo = {
+          startRow: table.region.top + 1,
+          endRow: table.region.bottom,
+          firstCol: tableColumnLetters(table.region.left),
+          lastCol: tableColumnLetters(table.region.right - 1),
+          hasHeader: table.headerRow !== null,
+          suffix: `\u00b7 Table ${index}`,
+        };
+        const tableName = uniqueName(`${name} ${info.suffix}`, taken);
+        const cells =
+          (table.region.bottom - table.region.top) * (table.region.right - table.region.left);
+        const tableSource: ViewSource = {
+          sourcePath: source.sourcePath,
+          readExpr: (p) => xlsxTableExpr(p.replace(/'/g, "''"), pending.literal, info),
+          cellCount: cells,
+          derived: true,
+          tableOrigin: {
+            sheet: name,
+            startRow: info.startRow,
+            firstCol: table.region.left,
+            hasHeader: info.hasHeader,
+          },
+        };
+        try {
+          await this.connection.run(
+            `create view ${quoteIdent(tableName)} as ${viewBodySql(
+              tableSource,
+              source.sourcePath,
+              this.xlsxErrorsTolerated
+            )}`
+          );
+          this.viewSources.set(tableName, tableSource);
+          // Held in memory, like the sheet it came from. See ViewSource.derived.
+          await cacheSheetAsTable(this.connection, tableName, tableSource);
+          this.lateWarnings.push(
+            ...(await interpretTextColumns(
+              this.connection,
+              tableName,
+              `"${tableName}"`,
+              tableSource,
+              this.nullText
+            ))
+          );
+        } catch {
+          // A table we cannot address must not cost the sheet it sits on.
+        }
+      }
+    } catch {
+      // The sheet itself is open and readable; only the extras are missing.
+    }
+  }
+
+  /**
+   * Which not-yet-prepared sheet does this SQL need?
+   *
+   * `baseTableOfSelect` answers for ordinary names, and is preferred because it
+   * actually parses. It is not enough on its own, for two reasons that both
+   * show up in real use:
+   *
+   *   - Sheet names are hostile. Excel allows `a; drop`, `say "hi"`,
+   *     `rate -- pct`; a parser looking for a table name in a statement cannot
+   *     be relied on to survive those, and a sheet that fails to prepare reads
+   *     as an empty one rather than as an error.
+   *   - A query may name a DETECTED table (`Sheet · Table 1`) before anything
+   *     has touched the sheet it was found in -- on a reopened file, say, or
+   *     from a sidebar entry restored from a previous session. The table does
+   *     not exist until its sheet is prepared.
+   *
+   * So the parse is backed up by looking for each pending sheet's own quoted
+   * identifier in the text. Exact, because that is the form every query this
+   * viewer builds uses, and cheap, because the map is one entry per sheet.
+   */
+  private pendingSheetFor(sql: string): string | undefined {
+    const base = baseTableOfSelect(sql);
+    if (base !== undefined && this.pendingSheets.has(base)) return base;
+    for (const name of this.pendingSheets.keys()) {
+      if (base !== undefined && base.startsWith(`${name} \u00b7 Table `)) return name;
+      if (sql.includes(quoteIdent(name))) return name;
+    }
+    return undefined;
+  }
+
   async runQuery(sql: string, maxRows = 0): Promise<QueryResult> {
+    // Whatever this query reads, make sure that sheet has been looked at. The
+    // funnel every read passes through, which is what makes the deferral above
+    // invisible to callers.
+    const pending = this.pendingSheetFor(sql);
+    if (pending !== undefined) await this.ensureSheetPrepared(pending);
     try {
       return await this.runQueryOnce(sql, maxRows);
     } catch (err) {
@@ -2357,7 +2489,14 @@ export class DuckDbFile {
     const inner = extracted ? extracted.withoutLimit : stripped;
     const col = quoteIdent(column);
     const limitSuffix = extracted ? ` ${extracted.limitClause}` : '';
-    const sortedSql = `select * from ${wrapAsSubquery(inner)} as _sorted order by ${col} ${direction} nulls last${limitSuffix}`;
+    // Narrowed at RUNTIME, not just in the type. `direction` is typed
+    // `'asc' | 'desc'` here and in the webview message union, but TypeScript
+    // types are erased -- onDidReceiveMessage hands over whatever actually
+    // arrived, and this is the one place a message-supplied value reaches the
+    // SQL without going through quoteIdent. A message carrying
+    // `"asc nulls last) ; drop table t; --"` would otherwise splice straight in.
+    const dir = direction === 'desc' ? 'desc' : 'asc';
+    const sortedSql = `select * from ${wrapAsSubquery(inner)} as _sorted order by ${col} ${dir} nulls last${limitSuffix}`;
     // The cap applies to the sorted result, so it stays "the true top N by
     // this column" rather than "N arbitrary rows, then sorted".
     const result = await this.runQuery(sortedSql, maxRows);
@@ -2747,10 +2886,11 @@ export class DuckDbFile {
     const found =
       tables.find((t) => t === tableName) ?? tables.find((t) => t.toLowerCase() === tableName.toLowerCase());
     if (!found) return { editable: false };
-    // A block of a sheet is read-only (see ViewSource.derived), and the grid
-    // has to know that BEFORE offering the cell: an editable-looking cell that
-    // refuses on save is worse than one that was never offered.
-    if (this.viewSources.get(found)?.derived) return { editable: false };
+    // A detected table IS editable -- its rectangle is known, so an edit made
+    // through it lands on an exact worksheet cell (see updateXlsxCell). Only a
+    // derived object with no known origin is refused, and there are none.
+    const derived = this.viewSources.get(found);
+    if (derived?.derived && !derived.tableOrigin) return { editable: false };
 
     // Column list for the UPDATE is re-derived from the live table, not
     // parsed out of the SELECT text.
@@ -2865,19 +3005,19 @@ export class DuckDbFile {
     rowValues: Record<string, unknown>,
     onStatus?: (message: string) => void
   ): Promise<number> {
-    const sheetPath = this.xlsxSheetPaths.get(table);
+    // A detected table is a rectangle of a known sheet at a known offset, so an
+    // edit through it is translated onto that sheet rather than refused.
+    //
+    // The refusal it replaces was right about its own design and wrong as a
+    // rule: when a block was addressed only by a range, the writer had to find
+    // its row by matching header text down the sheet, and two blocks carrying
+    // the same header were indistinguishable. Now the sheet is read verbatim
+    // from A1, so the table's own origin plus the row's ordinal within it give
+    // an exact worksheet cell -- no searching, and no ambiguity to have.
+    const origin = this.viewSources.get(table)?.tableOrigin;
+    const sheetName = origin?.sheet ?? table;
+    const sheetPath = this.xlsxSheetPaths.get(sheetName);
     if (!sheetPath) {
-      // A block of a sheet is addressed by a range, and the writer finds its
-      // row by matching the header text down the sheet -- so an edit here could
-      // land in a different block that happens to carry the same header. Read
-      // it here, edit it in the sheet it belongs to.
-      if (this.viewSources.get(table)?.derived) {
-        throw new Error(
-          `"${table}" is one block of a sheet, opened for reading. Edit the cell in the ` +
-            `sheet's own table instead — a block is addressed by a range, and writing ` +
-            `through one could put the value in a different block with the same header.`
-        );
-      }
       throw new Error(`"${table}" is not a sheet of this workbook, so it cannot be edited.`);
     }
 
@@ -2912,22 +3052,44 @@ export class DuckDbFile {
     await patchXlsxCell({
       filePath: this.path,
       sheetPath,
-      columnName: column,
       columnNames: whereCols,
-      rowOrdinal: Number(matches[0][0]),
+      // Both coordinates are the worksheet's own.
+      //
+      // For the sheet itself the ordinal already IS the Excel row, because the
+      // read is anchored at A1 with no header promoted. For a detected table,
+      // its first data row sits at `startRow` (plus one when its first row is a
+      // header), and its column N is `firstCol + N` -- arithmetic, because the
+      // table's rectangle is known exactly.
+      rowOrdinal: origin
+        ? origin.startRow + (origin.hasHeader ? 1 : 0) + Number(matches[0][0]) - 1
+        : Number(matches[0][0]),
+      columnName: origin
+        ? columnLettersOf(origin.firstCol + whereCols.indexOf(column))
+        : column,
       expectedCurrent: rowValues[column],
       newValue,
+      verbatim: true,
     });
     // An uncached sheet is `read_xlsx(...)`, re-read on every query, so the
     // next one already sees the file as it now is. A cached one is a table,
     // and would keep showing the pre-edit value: the edit would land in the
     // file and appear not to have happened.
-    const source = this.viewSources.get(table);
-    if (source?.cached) {
+    //
+    // An edit made through a detected table changes the SHEET it belongs to, so
+    // BOTH have to be reloaded: the sheet, and every table read out of it.
+    // Missing the tables was visible as an edit that landed in the file and
+    // then did not appear in the grid it was typed into.
+    const stale = [sheetName];
+    for (const [candidate, viewSource] of this.viewSources) {
+      if (viewSource.tableOrigin?.sheet === sheetName) stale.push(candidate);
+    }
+    for (const name of stale) {
+      const source = this.viewSources.get(name);
+      if (!source?.cached) continue;
       try {
         await replaceWithTable(
           this.connection,
-          table,
+          name,
           viewBodySql(source, source.sourcePath, this.xlsxErrorsTolerated),
           true
         );

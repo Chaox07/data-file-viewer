@@ -7,6 +7,23 @@ import { join } from 'node:path';
 import { DuckDbFile } from '../src/duckdbConnection';
 import { xlsxFile } from './stress/generators/_write';
 
+const drainedCache = new WeakMap<DuckDbFile, string[]>();
+
+/**
+ * The TABLE detected inside a sheet -- the object with named, typed columns.
+ *
+ * The sheet's own object is verbatim: every row and column as the file holds
+ * them, all text, columns named after their Excel letters. These tests are
+ * about caching and edits of the DATA, so they address the table. Querying the
+ * sheet is what makes it find its tables; detection is deferred to first use.
+ */
+async function tableOf(file: DuckDbFile, sheet = 'data'): Promise<string> {
+  await file.runQuery(`select * from "${sheet}" limit 1`);
+  const found = (await file.listTables()).find((t) => t.startsWith(`${sheet} \u00b7 Table `));
+  assert.ok(found, `no table was detected inside sheet "${sheet}"`);
+  return found;
+}
+
 /**
  * A workbook sheet is read into memory once instead of once per query — see
  * cacheSheetAsTable. That turns each sheet from a `read_xlsx()` view into a
@@ -32,14 +49,14 @@ test('an edit lands in the file AND is visible on the next query', async () => {
   const path = await xlsxFile(join(d, 'book.xlsx'), [{ name: 'data', rows: ROWS(1.5) }]);
   const file = await DuckDbFile.open(path);
   try {
-    const before = await file.runQuery('select * from "data"');
+    const before = await file.runQuery(`select * from "${await tableOf(file)}"`);
     const rowValues: Record<string, unknown> = {};
     before.columns.forEach((c, i) => (rowValues[c] = before.rows[0][i]));
 
-    const changed = await file.updateCell('data', 'amount', 99.5, rowValues);
+    const changed = await file.updateCell(await tableOf(file), 'amount', 99.5, rowValues);
     assert.equal(changed, 1);
 
-    const after = await file.runQuery('select * from "data" order by "id"');
+    const after = await file.runQuery(`select * from "${await tableOf(file)}" order by "id"`);
     assert.equal(Number(after.rows[0][2]), 99.5, 'the edit must be visible without reopening');
     assert.equal(Number(after.rows[1][2]), 2.5, 'and nothing else may move');
     assert.equal(after.rows.length, 2);
@@ -53,15 +70,15 @@ test('the edit is really in the file, not only in the copy held in memory', asyn
   const d = dir();
   const path = await xlsxFile(join(d, 'book.xlsx'), [{ name: 'data', rows: ROWS(1.5) }]);
   const file = await DuckDbFile.open(path);
-  const before = await file.runQuery('select * from "data"');
+  const before = await file.runQuery(`select * from "${await tableOf(file)}"`);
   const rowValues: Record<string, unknown> = {};
   before.columns.forEach((c, i) => (rowValues[c] = before.rows[0][i]));
-  await file.updateCell('data', 'amount', 99.5, rowValues);
+  await file.updateCell(await tableOf(file), 'amount', 99.5, rowValues);
   await file.dispose();
 
   const reopened = await DuckDbFile.open(path);
   try {
-    const after = await reopened.runQuery('select * from "data" order by "id"');
+    const after = await reopened.runQuery(`select * from "${await tableOf(reopened)}" order by "id"`);
     assert.equal(Number(after.rows[0][2]), 99.5);
   } finally {
     await reopened.dispose();
@@ -78,13 +95,13 @@ test('a refresh picks up a workbook another process rewrote', async () => {
   await xlsxFile(path, [{ name: 'data', rows: ROWS(1.5) }]);
   const file = await DuckDbFile.open(path, undefined, { forceReadOnly: true });
   try {
-    const before = await file.runQuery('select * from "data" order by "id"');
+    const before = await file.runQuery(`select * from "${await tableOf(file)}" order by "id"`);
     assert.equal(Number(before.rows[0][2]), 1.5);
 
     await xlsxFile(path, [{ name: 'data', rows: ROWS(42) }]);
 
     assert.equal(await file.refreshInPlace(), true);
-    const after = await file.runQuery('select * from "data" order by "id"');
+    const after = await file.runQuery(`select * from "${await tableOf(file)}" order by "id"`);
     assert.equal(Number(after.rows[0][2]), 42, 'the refresh must actually re-read the workbook');
   } finally {
     await file.dispose();
@@ -99,10 +116,16 @@ test('a refresh that finds the file unreadable keeps the last good rows', async 
   await xlsxFile(path, [{ name: 'data', rows: ROWS(1.5) }]);
   const file = await DuckDbFile.open(path, undefined, { forceReadOnly: true });
   try {
+    // Read it BEFORE the damage. A sheet is materialised the first time it is
+    // used, not when the workbook opens, so "the last good rows" only exist for
+    // a sheet somebody actually looked at -- which is exactly the case this is
+    // about: the rows are on screen when the file changes underneath.
+    const table = await tableOf(file);
+
     const { writeFileSync } = await import('node:fs');
     writeFileSync(path, 'this is not a workbook');
     await file.refreshInPlace();
-    const after = await file.runQuery('select * from "data" order by "id"');
+    const after = await file.runQuery(`select * from "${table}" order by "id"`);
     assert.equal(after.rows.length, 2);
     assert.equal(Number(after.rows[0][2]), 1.5);
   } finally {
@@ -122,7 +145,7 @@ test('every sheet of a multi-sheet workbook is still listed and readable', async
     const tables = await file.listTables();
     assert.deepEqual(tables.sort(), ['s0', 's1', 's2', 's3', 's4']);
     for (let i = 0; i < 5; i++) {
-      const r = await file.runQuery(`select * from "s${i}" order by "id"`);
+      const r = await file.runQuery(`select * from "${await tableOf(file, `s${i}`)}" order by "id"`);
       assert.equal(r.rows.length, 2);
       assert.equal(Number(r.rows[0][2]), i);
     }
@@ -146,7 +169,7 @@ test('caching and the marker interpretation compose — the sheet is a table AND
   ]);
   const file = await DuckDbFile.open(path);
   try {
-    const r = await file.runQuery('select * from "data" order by "id"');
+    const r = await file.runQuery(`select * from "${await tableOf(file)}" order by "id"`);
     assert.equal(r.columnStatsKind[1], 'numeric');
     assert.deepEqual(
       r.rows.map((row) => row[1]),

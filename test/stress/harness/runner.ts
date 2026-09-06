@@ -152,7 +152,15 @@ async function applyExpectations(
   }
 
   if (c.expect.tables) {
-    const actual = await file.listTables();
+    const all = await file.listTables();
+    // A workbook sheet offers the tables detected inside it beside itself, as
+    // `<sheet> \u00b7 Table N`. Those are not what a case listing `tables` is
+    // about -- that list names the SHEETS a workbook should expose, and
+    // restating the detection in every one of them would say nothing about the
+    // case and go stale the moment detection improves. A case that does care
+    // names such an entry itself, and then they are compared like any other.
+    const caresAboutDetected = c.expect.tables.some((t) => t.includes(' \u00b7 Table '));
+    const actual = caresAboutDetected ? all : all.filter((t) => !/ \u00b7 Table \d+$/.test(t));
     const missing = c.expect.tables.filter((t) => !actual.includes(t));
     const extra = actual.filter((t) => !c.expect.tables!.includes(t));
     if (missing.length || extra.length) {

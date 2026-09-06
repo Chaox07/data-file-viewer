@@ -9,7 +9,7 @@ import {
   FNV_OFFSET_BASIS,
   FileKind,
   QueryDiff,
-  SheetBlockMode,
+  SheetTableMode,
   baseTableOfSelect,
   TopValuesStats,
   fnv1aFold,
@@ -67,10 +67,10 @@ function nullTextSetting(): readonly string[] {
   return value.filter((v): v is string => typeof v === 'string' && v.trim() !== '');
 }
 
-/** How much of a worksheet's structure to offer; see DuckDbFileOpenOptions. */
-function sheetBlocksSetting(): SheetBlockMode {
-  const value = vscode.workspace.getConfiguration('dataFileViewer').get<unknown>('sheetBlocks', 'split');
-  return value === 'single' || value === 'raw' ? value : 'split';
+/** Whether to look for tables inside a sheet, and how; see DuckDbFileOpenOptions. */
+function sheetTablesSetting(): SheetTableMode {
+  const value = vscode.workspace.getConfiguration('dataFileViewer').get<unknown>('sheetTables', 'grid');
+  return value === 'rows' || value === 'off' ? value : 'grid';
 }
 
 // Most points a chart will draw. This is the viewer's OWN ceiling, not the
@@ -579,7 +579,7 @@ async function reconnectDocument(document: DuckDBDocument, forceReadOnly: boolea
     siblingPath,
     numberLocale: numberLocaleSetting(),
     nullText: nullTextSetting(),
-    sheetBlocks: sheetBlocksSetting(),
+    sheetTables: sheetTablesSetting(),
   });
   if (document.disposed) {
     // dispose() fired while this reconnect was in flight — don't swap a
@@ -903,7 +903,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
         siblingPath,
         numberLocale: numberLocaleSetting(),
         nullText: nullTextSetting(),
-        sheetBlocks: sheetBlocksSetting(),
+        sheetTables: sheetTablesSetting(),
       });
       if (file.isReadOnly()) {
         vscode.window.showWarningMessage(
@@ -1156,6 +1156,11 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
           }
 
           const sql = message.sql;
+          // A workbook sheet finds the tables inside it the first time it is
+          // queried, not when the file opens — reading every sheet to show one
+          // is what made opening slow. So the sidebar can gain entries as a
+          // result of this query, and has to be told.
+          const hadPendingSheets = document.file.hasPendingSheets();
           const { result, diffFields, diffSkipped, editability } = await document.runExclusive(async () => {
             const queryResult = await document.file.runQuery(sql, getMaxResultRows());
             document.lastSql = sql;
@@ -1208,6 +1213,22 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             editable: editability.editable,
             editableTable: editability.editable ? editability.table : undefined,
           });
+
+          // Posted AFTER the result, so the rows the user asked for are never
+          // waiting behind a sidebar refresh.
+          if (hadPendingSheets) {
+            try {
+              const tables = await document.runExclusive(() => document.getTables());
+              webview.postMessage({
+                command: 'tables',
+                tables,
+                combinedTableNames: [...document.combinedQueryMap.values()].map((t) => `${t}_combined`),
+                previewFirst: false,
+              });
+            } catch {
+              // The sidebar keeps what it had; the tables are still queryable.
+            }
+          }
           void reportRowTotal(document, webview, sql, result);
         } catch (err) {
           const message2 = (err as Error).message;
@@ -1257,6 +1278,19 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
         // describing the user's own query, and the chart is a second reading
         // of it rather than a replacement.
         if (!document.lastSql) return;
+        // Validated before anything is read off it. The type says
+        // `yColumns: string[]`, but types are erased and this handler is async:
+        // a message without the field would throw OUT of the callback as an
+        // unhandled rejection rather than reaching the chartError path below.
+        if (
+          !Array.isArray(message.yColumns) ||
+          message.yColumns.length === 0 ||
+          !message.yColumns.every((c) => typeof c === 'string') ||
+          typeof message.xColumn !== 'string'
+        ) {
+          webview.postMessage({ command: 'chartError', message: 'Nothing to plot.' });
+          return;
+        }
         const cap = getChartMaxPoints();
         const series = message.yColumns.length === 1 ? message.yColumns[0] : `${message.yColumns.length} series`;
         // Keyed by the table being plotted, so a second table opens a second

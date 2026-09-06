@@ -8,6 +8,20 @@ import { columnIndexOf, columnLettersOf, patchCell } from '../src/xlsxWrite';
 import { DuckDbFile } from '../src/duckdbConnection';
 
 /**
+ * The TABLE detected inside a sheet -- the object with named, typed columns.
+ *
+ * A sheet's own object is verbatim: every row and column as the file holds
+ * them, all text, columns named after their Excel letters. Querying it is what
+ * makes it find its tables; detection is deferred until first use.
+ */
+async function tableOf(file: DuckDbFile, sheet = 'data'): Promise<string> {
+  await file.runQuery(`select * from "${sheet}" limit 1`);
+  const found = (await file.listTables()).find((t) => t.startsWith(`${sheet} \u00b7 Table `));
+  assert.ok(found, `no table was detected inside sheet "${sheet}"`);
+  return found;
+}
+
+/**
  * Editing a workbook without rewriting it.
  *
  * The whole point of patching the worksheet XML rather than regenerating it is
@@ -337,13 +351,21 @@ test('the edited workbook still opens, with the edit in it', async () => {
   });
   const file = await DuckDbFile.open(path);
   try {
-    const r = await file.runQuery('select "qty" from "data" order by "qty"');
+    // The named, typed columns live in the table detected inside the sheet;
+    // the sheet's own object is verbatim, with letter-named columns.
+    const table = await tableOf(file);
+    const r = await file.runQuery(`select "qty" from "${table}" order by "qty"`);
     assert.deepEqual(
       r.rows.map((row) => Number(row[0])),
       [2, 7, 55]
     );
-    const other = await file.runQuery('select count(*) from "notes"');
-    assert.equal(Number(other.rows[0][0]), 0);
+    // The other sheet is untouched, and its one line is READABLE. It used to
+    // read as zero rows, because the sheet's only row was promoted to a header
+    // and there was nothing left under it -- a note sheet that opened empty.
+    // Read verbatim, the note is simply there, at row 1, which is the whole
+    // point of showing a sheet as the file holds it.
+    const other = await file.runQuery('select * from "notes"');
+    assert.deepEqual(other.rows, [['keep me']]);
   } finally {
     file.dispose();
   }
@@ -355,16 +377,19 @@ test('an edit made through updateCell lands in the file', async () => {
   const path = await makeWorkbook('endtoend.xlsx');
   const file = await DuckDbFile.open(path);
   try {
-    const info = await file.checkEditableSelect('select * from "data"');
+    const table = await tableOf(file);
+    const info = await file.checkEditableSelect(`select * from "${table}"`);
     assert.equal(info.editable, true, '.xlsx should be editable');
-    const n = await file.updateCell('data', 'qty', 77, { name: 'bolt', qty: 10, total: 20 });
+    const n = await file.updateCell(table, 'qty', 77, { name: 'bolt', qty: 10, total: 20 });
     assert.equal(n, 1);
   } finally {
     file.dispose();
   }
   const reopened = await DuckDbFile.open(path);
   try {
-    const r = await reopened.runQuery(`select "qty" from "data" where "name" = 'bolt'`);
+    const r = await reopened.runQuery(
+      `select "qty" from "${await tableOf(reopened)}" where "name" = 'bolt'`
+    );
     assert.equal(Number(r.rows[0][0]), 77);
   } finally {
     reopened.dispose();

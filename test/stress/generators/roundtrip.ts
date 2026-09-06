@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { unzipSync } from 'fflate';
 import { DuckDbFile } from '../../../src/duckdbConnection';
 import { registerCase, type CaseContext, type CanonicalTable } from '../expect';
-import { firstTable, readTable } from '../harness/inspect';
+import { readTable, subjectTable } from '../harness/inspect';
 import * as w from './_write';
 
 /**
@@ -92,7 +92,7 @@ async function driveEdit(spec: RoundTripSpec, ctx: CaseContext, path: string): P
   let table: CanonicalTable;
   let name: string;
   try {
-    name = await firstTable(file);
+    name = await subjectTable(file);
     table = await readTable(file, name);
     const colIndex = table.columns.indexOf(spec.edit.column);
     if (colIndex < 0) {
@@ -384,7 +384,8 @@ registerCase({
     ]),
   }),
   check: async (file, ctx, built) => {
-    const table = await readTable(file, 'data');
+    const subject = await subjectTable(file, 'data');
+    const table = await readTable(file, subject);
     if (table.rows[0][0] !== '9007199254740993') {
       ctx.fail(
         'silent-misread',
@@ -392,7 +393,7 @@ registerCase({
           `if that is a rounded number the two rows are now indistinguishable`
       );
     }
-    const changed = await file.updateCell('data', 'label', 'EDITED', {
+    const changed = await file.updateCell(subject, 'label', 'EDITED', {
       id: table.rows[0][0],
       label: table.rows[0][1],
     });

@@ -67,6 +67,27 @@ function stripCommentsAndLiterals(sql: string): string {
       out += ' ';
       continue;
     }
+    // DuckDB's dollar quoting: $$...$$ or $tag$...$tag$, which nests nothing
+    // and ends only at its matching tag.
+    //
+    // Missing this does not merely under-strip, it can fail OPEN. A `'` inside
+    // a dollar-quoted string opens a phantom literal that DuckDB never sees,
+    // and the scanner then swallows everything up to the next quote --
+    // including a `;` and the statement after it. So
+    //
+    //     select $a$'$a$ as c; drop table t; select '1'
+    //
+    // reached the write-keyword scan as a single harmless-looking select,
+    // while DuckDB reads three statements, the middle one a DROP.
+    const dollar = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i));
+    if (ch === '$' && dollar) {
+      const tag = dollar[0];
+      const close = sql.indexOf(tag, i + tag.length);
+      i = close === -1 ? sql.length : close + tag.length;
+      out += ' ';
+      continue;
+    }
+
     if (ch === "'" || ch === '"') {
       const quote = ch;
       i++;

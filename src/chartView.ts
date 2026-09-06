@@ -250,13 +250,32 @@ function formatTooltip(
   const header = isCategory
     ? (first.axisValueLabel ?? '')
     : pointDateLabel((first.value as [number, unknown])?.[0], frequency);
-  const lines = [`<b>${header}</b>`];
+  const lines = [`<b>${escapeHtml(header)}</b>`];
   for (const p of params) {
     const raw = isCategory ? p.value : (p.value as [number, unknown])?.[1];
     if (raw === null || raw === undefined || typeof raw !== 'number') continue;
-    lines.push(`${p.marker ?? ''} ${p.seriesName ?? ''}: <b>${formatTooltipNumber(raw)}</b>`);
+    // Both of these come out of the FILE: `axisValueLabel` is a cell value and
+    // `seriesName` is a column name. ECharts inserts a tooltip formatter's
+    // return value as innerHTML, so a cell holding `<img src=x onerror=...>`
+    // or a column named `<b>x` would reach the DOM as markup. The CSP blocks
+    // the script, but the same reasoning is already applied to `frequency` in
+    // duckdbConnection.ts -- it was simply missed for these two.
+    // `p.marker` is ECharts' own swatch markup and is deliberately not escaped.
+    lines.push(
+      `${p.marker ?? ''} ${escapeHtml(p.seriesName ?? '')}: <b>${formatTooltipNumber(raw)}</b>`
+    );
   }
   return lines.join('<br/>');
+}
+
+/** Text that is about to be put into innerHTML, made inert. */
+function escapeHtml(text: unknown): string {
+  return String(text ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function render(message: Extract<ChartMessage, { command: 'chart' }>): void {

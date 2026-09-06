@@ -31,6 +31,44 @@ async function openSheet(
 }
 
 /**
+ * The object these tests are about: the TABLE detected inside the sheet.
+ *
+ * The sheet's own object is verbatim -- every row and column as the file holds
+ * them, all text, columns named after their Excel letters -- so a question
+ * about column TYPES cannot be asked of it. `NA` becoming a null in a numeric
+ * column is a property of the table read out of the sheet, which is also the
+ * object the chart plots, which is where the defect that prompted all this
+ * showed up.
+ *
+ * Querying the sheet is what makes it find its tables; detection is deferred
+ * until first use.
+ */
+const drained = new WeakMap<DuckDbFile, string[]>();
+
+/**
+ * Everything the file has told the user, from both channels.
+ *
+ * Interpreting a sheet's columns happens when the sheet is first USED, not when
+ * the workbook opens -- reading every sheet of a workbook to open one of them is
+ * what made opening slow -- so these notices arrive on the late channel rather
+ * than in `openWarnings`. `takeLateWarnings` empties as it reads, so what it
+ * gives back is accumulated here and a test may ask more than once.
+ */
+function noticesOf(file: DuckDbFile): string[] {
+  const seen = drained.get(file) ?? [];
+  seen.push(...file.takeLateWarnings());
+  drained.set(file, seen);
+  return [...file.openWarnings, ...seen];
+}
+
+async function tableOf(file: DuckDbFile, sheet = 'data'): Promise<string> {
+  await file.runQuery(`select * from "${sheet}" limit 1`);
+  const found = (await file.listTables()).find((t) => t.startsWith(`${sheet} \u00b7 Table `));
+  assert.ok(found, `no table was detected inside sheet "${sheet}"`);
+  return found;
+}
+
+/**
  * Numeric rows with the markers placed wherever the caller asks.
  *
  * One decimal place, deliberately. "1.001" is genuinely ambiguous — 1001 read
@@ -56,15 +94,15 @@ test('a numeric column with NA in it becomes numeric, and the NA cells become em
     [4, '2.5'],
   ]);
   try {
-    const r = await file.runQuery('select * from "data"');
+    const r = await file.runQuery(`select * from "${await tableOf(file)}"`);
     assert.equal(r.columnStatsKind[1], 'numeric', 'the column must be plottable');
     assert.deepEqual(
       r.rows.map((row) => row[1]),
       [null, 1.5, null, 2.5]
     );
     assert.ok(
-      file.openWarnings.some((w) => /read as numbers/.test(w) && /2 Excel error markers/.test(w)),
-      `the count is the evidence; got: ${file.openWarnings.join(' | ')}`
+      noticesOf(file).some((w) => /read as numbers/.test(w) && /2 Excel error markers/.test(w)),
+      `the count is the evidence; got: ${noticesOf(file).join(' | ')}`
     );
   } finally {
     await file.dispose();
@@ -81,7 +119,7 @@ test('no row is lost — the count is the same before and after', async () => {
     [4, '2.5'],
   ]);
   try {
-    const r = await file.runQuery('select count(*) as n from "data"');
+    const r = await file.runQuery(`select count(*) as n from "${await tableOf(file)}"`);
     assert.equal(Number(r.rows[0][0]), 4);
   } finally {
     await file.dispose();
@@ -96,10 +134,10 @@ test('a column whose FIRST 2,000 rows are all markers still converts', async () 
   // 2000` sample concluded "nothing but markers" for all 70 of them.
   const { file, dir } = await openSheet(seriesWithMarkers(3000, (i) => i < 2500));
   try {
-    const r = await file.runQuery('select * from "data" limit 1');
+    const r = await file.runQuery(`select * from "${await tableOf(file)}" limit 1`);
     assert.equal(r.columnStatsKind[1], 'numeric');
     const counts = await file.runQuery(
-      'select count(*) as n, count("ratio") as filled from "data"'
+      `select count(*) as n, count("ratio") as filled from "${await tableOf(file)}"`
     );
     assert.equal(Number(counts.rows[0][0]), 3000);
     assert.equal(Number(counts.rows[0][1]), 500);
@@ -117,13 +155,13 @@ test('one written note far past the sample keeps the whole column as text', asyn
     seriesWithMarkers(3000, (i) => i % 7 === 0, [2800, 'under review'])
   );
   try {
-    const r = await file.runQuery('select * from "data" limit 1');
+    const r = await file.runQuery(`select * from "${await tableOf(file)}" limit 1`);
     assert.equal(r.columnStatsKind[1], 'other', 'the column must keep its text');
-    const kept = await file.runQuery(`select count(*) as n from "data" where "ratio" = 'under review'`);
+    const kept = await file.runQuery(`select count(*) as n from "${await tableOf(file)}" where "ratio" = 'under review'`);
     assert.equal(Number(kept.rows[0][0]), 1, 'the note itself must survive');
     assert.ok(
-      file.openWarnings.some((w) => /"ratio" was left as text/.test(w)),
-      `the refusal must be said out loud; got: ${file.openWarnings.join(' | ')}`
+      noticesOf(file).some((w) => /"ratio" was left as text/.test(w)),
+      `the refusal must be said out loud; got: ${noticesOf(file).join(' | ')}`
     );
   } finally {
     await file.dispose();
@@ -141,12 +179,12 @@ test('nullText: [] reads the file literally', async () => {
     { nullText: [] }
   );
   try {
-    const r = await file.runQuery('select * from "data"');
+    const r = await file.runQuery(`select * from "${await tableOf(file)}"`);
     assert.deepEqual(
       r.rows.map((row) => row[1]),
       ['NA', '1.5']
     );
-    assert.equal(file.openWarnings.length, 0, 'nothing was interpreted, so there is nothing to report');
+    assert.equal(noticesOf(file).length, 0, 'nothing was interpreted, so there is nothing to report');
   } finally {
     await file.dispose();
     rmSync(dir, { recursive: true, force: true });
@@ -160,13 +198,13 @@ test('a workbook with no markers is untouched and says nothing', async () => {
     [2, 'beta'],
   ]);
   try {
-    const r = await file.runQuery('select * from "data"');
+    const r = await file.runQuery(`select * from "${await tableOf(file)}"`);
     assert.deepEqual(
       r.rows.map((row) => row[1]),
       ['alpha', 'beta']
     );
     assert.equal(r.columnStatsKind[1], 'other');
-    assert.equal(file.openWarnings.length, 0);
+    assert.equal(noticesOf(file).length, 0);
   } finally {
     await file.dispose();
     rmSync(dir, { recursive: true, force: true });
@@ -180,14 +218,14 @@ test('a column of nothing but markers empties but keeps its type', async () => {
     [2, '#N/A'],
   ]);
   try {
-    const r = await file.runQuery('select * from "data"');
+    const r = await file.runQuery(`select * from "${await tableOf(file)}"`);
     assert.deepEqual(
       r.rows.map((row) => row[1]),
       [null, null]
     );
     assert.ok(
-      file.openWarnings.some((w) => /nothing but error markers/.test(w)),
-      `got: ${file.openWarnings.join(' | ')}`
+      noticesOf(file).some((w) => /nothing but error markers/.test(w)),
+      `got: ${noticesOf(file).join(' | ')}`
     );
   } finally {
     await file.dispose();
@@ -214,7 +252,7 @@ test('a sheet whose header is not row 1 opens at its own first column, with no p
   ]);
   const file = await DuckDbFile.open(path);
   try {
-    const r = await file.runQuery('select * from "data"');
+    const r = await file.runQuery(`select * from "${await tableOf(file)}"`);
     assert.deepEqual(r.columns, ['Date', 'a', 'b']);
     assert.equal(r.rows.length, 2);
   } finally {
