@@ -114,10 +114,26 @@ other table.
 
 ### Excel workbooks
 
-`.xlsx` is the one flat format here that *is* multi-table, so it gets the
-`.duckdb` treatment instead: **one view per sheet**, named after the sheet and
-listed in the sidebar in the order the workbook declares them. Click a sheet to
-preview it, or join across sheets in the query box like any other tables.
+A worksheet is a page, not a table: a title, maybe a legend, one or more tables,
+and footnotes under them. So a workbook gives you **two kinds of object**.
+
+**The sheet itself, exactly as the file holds it.** Every declared row and
+column, read from A1, all values as text, columns named after their Excel
+letters. Grid row 7 *is* row 7 of the spreadsheet. Nothing is promoted to a
+header, nothing above or below a table is excluded, and a footnote stays under
+the table it annotates. If you want to know what is in the file, this answers
+that question and no other.
+
+**The tables found inside it**, listed beside the sheet as `Sheet · Table 1`,
+`Sheet · Table 2`. These are typed — numbers are numbers — so they sort,
+summarise, chart, and can be edited. A sheet is cut on blank rows *and* blank
+columns, so two tables sitting side by side are two tables rather than one wide
+one whose header belongs to neither. Titles, captions and footnotes are
+recognised and are simply not offered as tables; they are still on the sheet, at
+their own row numbers, because the sheet is shown whole. The classification is
+ported from the ETL pipeline function by function, so a sheet read here and the
+same sheet read there agree about how many tables it holds. `dataFileViewer.sheetTables`
+turns the column split off (`rows`), or detection off entirely (`off`).
 
 Sheet names are read out of the workbook package directly (`xl/workbook.xml`
 plus its `.rels`), because DuckDB's `read_xlsx()` addresses a sheet by name but
@@ -125,17 +141,22 @@ offers no way to ask which names exist. A sheet that can't be read — a chart
 sheet, a macro sheet, an empty one — is skipped rather than failing the whole
 workbook; the file only errors if *none* of its sheets can be read.
 
+**Opening is fast because opening does no reading.** Binding a view over a sheet
+costs about 3 ms; reading one costs 240–640 ms. So every sheet gets its view when
+the workbook opens, and the reading — materialising it, finding its tables,
+typing their columns — waits until you actually click that sheet. A ten-sheet
+workbook here opens in 26 ms and a 21 MB two-sheet one in 152 ms, against 116 ms
+and 3134 ms before. The tables appear in the sidebar under their sheet the moment
+it is opened.
+
 **Cells Excel could not compute** — `#DIV/0!`, `#N/A`, `#REF!`, `#VALUE!` — used
 to cost you the whole sheet. `read_xlsx()` types a column from its values and
 then refuses the lot over one of them: *"Failed to parse cell 'E122': Could not
-convert string '#DIV/0!' to DOUBLE"*, and a 121-row sheet would not open. Such a
-sheet is now retried with `ignore_errors`, which reads that cell as empty and
-keeps every column's real type — which is what the value means: Excel saying it
-has no number there. The sheet is named in a warning when the file opens, since
-a cell quietly becoming blank is exactly the kind of thing worth saying out loud.
-(`all_varchar` would also have opened it, and is the wrong trade: it turns every
-column in the sheet into text to rescue one cell, costing sorting, stats and
-charting on all of them.)
+convert string '#DIV/0!' to DOUBLE"*, and a 121-row sheet would not open. The
+sheet is read as text, so it always opens; in the tables read out of it, such a
+cell is read as empty and the column keeps its real type — which is what the
+value means: Excel saying it has no number there. The sheet is named in a warning,
+since a cell quietly becoming blank is worth saying out loud.
 
 **Workbooks are editable, one cell at a time.** Nothing is regenerated. DuckDB
 *can* write an `.xlsx`, and saving through it was never an option: it writes a
