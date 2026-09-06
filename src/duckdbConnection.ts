@@ -307,14 +307,22 @@ interface ViewSource {
   /** True once the name resolves to a real table holding the data, not a view. */
   cached?: boolean;
   /**
+   * True once a detected table has paid its one-time materialisation and text
+   * interpretation cost. Detected tables are bound as cheap views when their
+   * sheet is first inspected, then prepared only when something actually
+   * queries them. This keeps opening a raw sheet from re-reading the workbook
+   * once per detected table.
+   */
+  prepared?: boolean;
+  /**
    * A table detected inside a sheet, rather than a sheet.
    *
-   * Materialised like a sheet is, and for the same reason: with a workbook the
-   * cost is the PACKAGE, not the row count, so leaving it as a view would make
-   * every sort, every stats panel and every chart re-inflate the whole file --
-   * on precisely the objects the user plots. It does mean the cells of a sheet
-   * are held twice over; that is bounded by the same MAX_CACHED_CELLS budget,
-   * and it is the trade the measurements argue for.
+   * Bound as a view when the sheet is detected, then materialised on its first
+   * actual use. With a workbook the cost is the PACKAGE, not the range size, so
+   * eager materialisation made opening one raw sheet re-inflate the workbook
+   * once per detected table. Keeping the view forever would instead make every
+   * sort, stats panel and chart pay that cost. First-use materialisation pays it
+   * once and only for objects the user actually touches.
    */
   derived?: boolean;
   /**
@@ -2109,10 +2117,9 @@ export class DuckDbFile {
    *      costs the same as reading all 16,803 rows.
    *   2. Trim the trailing blank rows and columns the declared rectangle
    *      over-states, so the sheet reports the size it actually has.
-   *   3. Find the tables inside it (sheetTables.detectTables) and give each one
-   *      its own typed object.
-   *   4. Interpret the text columns of those tables -- not of the sheet, which
-   *      is text by design.
+   *   3. Find the tables inside it (sheetTables.detectTables) and bind a cheap
+   *      typed view for each one. Reading, materialising and interpreting that
+   *      view waits until the table's first actual use.
    *
    * Failure is not fatal at any step: the sheet is already open and readable,
    * and a sheet whose tables could not be worked out is a sheet with no extra
@@ -2204,6 +2211,7 @@ export class DuckDbFile {
           readExpr: (p) => xlsxTableExpr(p.replace(/'/g, "''"), pending.literal, info),
           cellCount: cells,
           derived: true,
+          prepared: false,
           tableOrigin: {
             sheet: name,
             startRow: info.startRow,
@@ -2220,17 +2228,12 @@ export class DuckDbFile {
             )}`
           );
           this.viewSources.set(tableName, tableSource);
-          // Held in memory, like the sheet it came from. See ViewSource.derived.
-          await cacheSheetAsTable(this.connection, tableName, tableSource);
-          this.lateWarnings.push(
-            ...(await interpretTextColumns(
-              this.connection,
-              tableName,
-              `"${tableName}"`,
-              tableSource,
-              this.nullText
-            ))
-          );
+          // Do not read this range yet. A ranged read_xlsx() still inflates and
+          // parses the whole workbook package, even for a two-row table. Paying
+          // that once per detected table made opening the raw sheet scale with
+          // the number of tables it happened to contain. The first query that
+          // actually uses this object materialises and interprets it through
+          // ensureDerivedPrepared() below; binding the view itself is cheap.
         } catch {
           // A table we cannot address must not cost the sheet it sits on.
         }
@@ -2270,12 +2273,59 @@ export class DuckDbFile {
     return undefined;
   }
 
+  /**
+   * Detected-table views named by this SQL that have not paid their one-time
+   * preparation cost yet. The parsed base table covers the ordinary single-
+   * table path; exact quoted-name matching also covers joins and hostile Excel
+   * names without attempting to parse them ourselves.
+   */
+  private pendingDerivedTablesFor(sql: string): string[] {
+    const found = new Set<string>();
+    const base = baseTableOfSelect(sql);
+    if (base !== undefined) {
+      const source = this.viewSources.get(base);
+      if (source?.derived && source.prepared !== true) found.add(base);
+    }
+    for (const [name, source] of this.viewSources) {
+      if (!source.derived || source.prepared === true) continue;
+      if (sql.includes(quoteIdent(name))) found.add(name);
+    }
+    return [...found];
+  }
+
+  /**
+   * Turn one detected-table view into the typed in-memory table its sort,
+   * statistics, chart and edit paths expect. This is deliberately lazy: the
+   * raw sheet preview needs the table's bounds and name, but does not need to
+   * inflate the workbook again for its values.
+   */
+  private async ensureDerivedPrepared(name: string): Promise<void> {
+    const source = this.viewSources.get(name);
+    if (!source?.derived || source.prepared === true) return;
+
+    // DuckDbFile operations are serialized by the document provider, so there
+    // is no concurrent first-use race here. Mark it only after both best-effort
+    // stages have run; neither helper throws for an unreadable optional view.
+    await cacheSheetAsTable(this.connection, name, source);
+    this.lateWarnings.push(
+      ...(await interpretTextColumns(this.connection, name, `"${name}"`, source, this.nullText))
+    );
+    source.prepared = true;
+  }
+
+  private async prepareDerivedTablesFor(sql: string): Promise<void> {
+    for (const name of this.pendingDerivedTablesFor(sql)) {
+      await this.ensureDerivedPrepared(name);
+    }
+  }
+
   async runQuery(sql: string, maxRows = 0): Promise<QueryResult> {
     // Whatever this query reads, make sure that sheet has been looked at. The
     // funnel every read passes through, which is what makes the deferral above
     // invisible to callers.
     const pending = this.pendingSheetFor(sql);
     if (pending !== undefined) await this.ensureSheetPrepared(pending);
+    await this.prepareDerivedTablesFor(sql);
     try {
       return await this.runQueryOnce(sql, maxRows);
     } catch (err) {
@@ -2441,6 +2491,11 @@ export class DuckDbFile {
     xIsText = false,
     maxPoints = 0
   ): Promise<QueryResult & { xAxisMode: 'time' | 'category' }> {
+    // Charting may be the first action taken on a detected table (the inline
+    // sheet UI does not require a separate preview first). Prepare it before
+    // the text-axis probe, or that probe and the chart query would each
+    // re-read the workbook-backed view.
+    await this.prepareDerivedTablesFor(baseSql);
     const stripped = stripTrailingSemicolon(baseSql);
     const extracted = extractTrailingLimit(stripped);
     // The LIMIT is KEPT, not stripped. It used to be stripped, on the argument
@@ -2484,6 +2539,7 @@ export class DuckDbFile {
     direction: 'asc' | 'desc',
     maxRows = 0
   ): Promise<QueryResult & { sortedSql: string }> {
+    await this.prepareDerivedTablesFor(baseSql);
     const stripped = stripTrailingSemicolon(baseSql);
     const extracted = extractTrailingLimit(stripped);
     const inner = extracted ? extracted.withoutLimit : stripped;
@@ -3158,6 +3214,7 @@ export class DuckDbFile {
 
   /** On-demand top-N most frequent values for a string/"other"-kind column. */
   async getColumnTopValues(baseSql: string, column: string, limit = 20): Promise<TopValuesStats> {
+    await this.prepareDerivedTablesFor(baseSql);
     // limit ends up interpolated directly into a LIMIT clause (integers
     // can't be bound as query parameters the way values/identifiers can) —
     // clamp it here as a second line of defense even though the caller
@@ -3190,6 +3247,7 @@ export class DuckDbFile {
     column: string,
     statsKind: 'numeric' | 'datetime'
   ): Promise<DescriptiveStats> {
+    await this.prepareDerivedTablesFor(baseSql);
     const wrapped = wrapAsSubquery(stripTrailingSemicolon(baseSql));
     const col = quoteIdent(column);
     const meanExpr = statsKind === 'numeric' ? `avg(${col})` : `to_timestamp(avg(epoch(${col})))`;

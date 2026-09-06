@@ -121,6 +121,8 @@ test('a refresh that finds the file unreadable keeps the last good rows', async 
     // a sheet somebody actually looked at -- which is exactly the case this is
     // about: the rows are on screen when the file changes underneath.
     const table = await tableOf(file);
+    const before = await file.runQuery(`select * from "${table}" order by "id"`);
+    assert.equal(Number(before.rows[0][2]), 1.5);
 
     const { writeFileSync } = await import('node:fs');
     writeFileSync(path, 'this is not a workbook');
@@ -149,6 +151,68 @@ test('every sheet of a multi-sheet workbook is still listed and readable', async
       assert.equal(r.rows.length, 2);
       assert.equal(Number(r.rows[0][2]), i);
     }
+  } finally {
+    await file.dispose();
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('detected tables stay lazy until first use, so opening a sheet reads the workbook once', async () => {
+  const d = dir();
+  const path = await xlsxFile(join(d, 'book.xlsx'), [
+    {
+      name: 'data',
+      rows: [
+        ['date', 'left', null, 'date', 'right'],
+        ['2020-01-01', 2, null, '2020-01-01', 20],
+        ['2020-01-02', 1, null, '2020-01-02', 10],
+      ],
+    },
+  ]);
+  const file = await DuckDbFile.open(path);
+  try {
+    await file.runQuery('select * from "data" limit 1');
+    const detected = (await file.listTables()).filter((name) => name.startsWith('data · Table '));
+    assert.equal(detected.length, 2);
+
+    const kindsBefore = await file.runQuery(
+      `select table_name, table_type from information_schema.tables
+       where table_name like 'data · Table %' order by table_name`
+    );
+    assert.deepEqual(
+      kindsBefore.rows.map((row) => row.map(String)),
+      detected.map((name) => [name, 'VIEW']),
+      'merely opening the sheet eagerly materialized every detected table'
+    );
+
+    const first = await file.runQuery(`select * from "${detected[0]}" order by "left"`);
+    assert.deepEqual(first.rows.map((row) => Number(row[1])), [1, 2]);
+
+    const kindsAfter = await file.runQuery(
+      `select table_name, table_type from information_schema.tables
+       where table_name like 'data · Table %' order by table_name`
+    );
+    assert.deepEqual(
+      kindsAfter.rows.map((row) => row.map(String)),
+      [
+        [detected[0], 'BASE TABLE'],
+        [detected[1], 'VIEW'],
+      ],
+      'using one detected table should not force its neighbour to load'
+    );
+
+    // Sorting can be the first action on an inline detected table. It must
+    // trigger the same one-time preparation without requiring a preview query.
+    const second = await file.runSortedQuery(
+      `select * from "${detected[1]}"`,
+      'right',
+      'asc'
+    );
+    assert.deepEqual(second.rows.map((row) => Number(row[1])), [10, 20]);
+    const secondKind = await file.runQuery(
+      `select table_type from information_schema.tables where table_name = '${detected[1]}'`
+    );
+    assert.equal(String(secondKind.rows[0][0]), 'BASE TABLE');
   } finally {
     await file.dispose();
     rmSync(d, { recursive: true, force: true });

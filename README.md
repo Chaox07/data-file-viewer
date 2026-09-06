@@ -141,13 +141,17 @@ offers no way to ask which names exist. A sheet that can't be read — a chart
 sheet, a macro sheet, an empty one — is skipped rather than failing the whole
 workbook; the file only errors if *none* of its sheets can be read.
 
-**Opening is fast because opening does no reading.** Binding a view over a sheet
-costs about 3 ms; reading one costs 240–640 ms. So every sheet gets its view when
-the workbook opens, and the reading — materialising it, finding its tables,
-typing their columns — waits until you actually click that sheet. A ten-sheet
-workbook here opens in 26 ms and a 21 MB two-sheet one in 152 ms, against 116 ms
-and 3134 ms before. The tables appear in the sidebar under their sheet the moment
-it is opened.
+**Opening is fast because opening does no sheet reading.** Binding a view over a
+sheet costs about 3 ms; reading one costs 240–640 ms. So every sheet gets its view
+when the workbook opens, and materialising it plus finding its tables waits until
+you actually click that sheet. Detected tables are then bound without another
+read and materialise only when first used: even a tiny range costs a full
+workbook parse, so eagerly loading every detected table made the raw-sheet
+preview scale with the number of tables. A ten-sheet workbook here opens in 26
+ms and a 21 MB two-sheet one in about 152 ms. On that 21 MB workbook, the first
+raw-sheet preview fell from about 1.02 s to 0.44 s while repeated previews remain
+about 5 ms. The tables appear in the sidebar under their sheet the moment it is
+opened.
 
 **Cells Excel could not compute** — `#DIV/0!`, `#N/A`, `#REF!`, `#VALUE!` — used
 to cost you the whole sheet. `read_xlsx()` types a column from its values and
