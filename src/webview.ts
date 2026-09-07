@@ -9,6 +9,7 @@ import { DisplayOrderCache } from './gridOrder';
 import { liveStatusText } from './liveStatus';
 import { computeVirtualWindow } from './virtualWindow';
 import {
+  type ColumnStatsFields,
   type Effect,
   type ExtensionMessage,
   type LastResult,
@@ -17,6 +18,7 @@ import {
   initialState,
   reduce,
 } from './webviewState';
+import type { DetectedSheetTable, DetectedTableFilter, DetectedTableSort } from './duckdbConnection';
 // Note what is NOT imported here: ECharts. The chart draws in its own VS Code
 // tab (see chartPanel.ts / chartView.ts), so the ~530 KB library loads the
 // first time somebody plots something rather than every time a file is opened.
@@ -278,7 +280,11 @@ function previewTable(name: string): void {
   }
   const sqlText = `SELECT * FROM "${name}" LIMIT 100;`;
   setEditorText(sqlText);
-  runQuery(sqlText);
+  if (running) return;
+  setRunning(true);
+  statusEl.textContent = 'Running…';
+  state.awaitingTotalForSql = sqlText.trim();
+  vscode.postMessage({ command: 'runQuery', sql: sqlText, sheetPreview: name });
 }
 
 // ------------------------------------------------------------------- charts
@@ -346,6 +352,164 @@ function applyTableChangeStatus(status: Record<string, TableStatus>): void {
     else if (s === 'changed') item.textContent = `${name} (changed)`;
     else if (s === 'new') item.textContent = `${name} (new since backup)`;
     else item.textContent = name;
+  });
+}
+
+interface InlineTableUiState {
+  filters: Map<string, string>;
+  sort?: DetectedTableSort;
+  result?: {
+    columns: string[];
+    rows: unknown[][];
+    columnStatsKind: StatsKind[];
+    sql: string;
+    totalRows: number;
+  };
+}
+
+const inlineTableState = new Map<string, InlineTableUiState>();
+let inlineOwnerRows: unknown[][] | undefined;
+
+function inlineStateFor(table: string): InlineTableUiState {
+  let current = inlineTableState.get(table);
+  if (!current) {
+    current = { filters: new Map() };
+    inlineTableState.set(table, current);
+  }
+  return current;
+}
+
+function sheetTableByName(name: string): DetectedSheetTable | undefined {
+  return state.lastResult?.sheetTables?.find((table) => table.name === name);
+}
+
+function sheetTableDisplayLimit(table: DetectedSheetTable): number {
+  if (!state.lastResult) return 1;
+  const firstDataRow = table.headerRow === null ? table.top : table.headerRow + 1;
+  return Math.max(1, Math.min(table.bottom, state.lastResult.rows.length) - firstDataRow);
+}
+
+function filtersForMessage(current: InlineTableUiState): DetectedTableFilter[] {
+  return [...current.filters]
+    .filter(([, value]) => value !== '')
+    .map(([column, value]) => ({ column, value }));
+}
+
+function requestInlineTable(table: DetectedSheetTable): void {
+  if (running) return;
+  const current = inlineStateFor(table.name);
+  setRunning(true);
+  statusEl.textContent = `Updating ${table.name}…`;
+  vscode.postMessage({
+    command: 'sheetTableQuery',
+    table: table.name,
+    filters: filtersForMessage(current),
+    sort: current.sort,
+    limit: sheetTableDisplayLimit(table),
+  });
+}
+
+let filterPopoverEl: HTMLDivElement | null = null;
+
+function closeFilterPopover(): void {
+  filterPopoverEl?.remove();
+  filterPopoverEl = null;
+}
+
+function openInlineFilter(anchor: HTMLElement, table: DetectedSheetTable, column: string): void {
+  if (running) return;
+  closeStatsPopover();
+  closeFilterPopover();
+  const current = inlineStateFor(table.name);
+  const popover = document.createElement('div');
+  popover.className = 'filter-popover';
+
+  const title = document.createElement('div');
+  title.className = 'stats-title';
+  title.textContent = `Filter ${column}`;
+  const input = document.createElement('input');
+  input.className = 'filter-input';
+  input.placeholder = 'Contains…';
+  input.value = current.filters.get(column) ?? '';
+  const actions = document.createElement('div');
+  actions.className = 'filter-actions';
+  const clear = document.createElement('button');
+  clear.textContent = 'Clear';
+  const apply = document.createElement('button');
+  apply.textContent = 'Apply';
+  actions.appendChild(clear);
+  actions.appendChild(apply);
+  popover.appendChild(title);
+  popover.appendChild(input);
+  popover.appendChild(actions);
+  document.body.appendChild(popover);
+  positionPopover(popover, anchor);
+  filterPopoverEl = popover;
+
+  const closeOnOutsideClick = (event: MouseEvent) => {
+    if (!filterPopoverEl || !filterPopoverEl.contains(event.target as Node)) {
+      closeFilterPopover();
+      document.removeEventListener('click', closeOnOutsideClick, true);
+    }
+  };
+  window.setTimeout(() => document.addEventListener('click', closeOnOutsideClick, true), 0);
+
+  const commit = (value: string) => {
+    if (value === '') current.filters.delete(column);
+    else current.filters.set(column, value);
+    closeFilterPopover();
+    requestInlineTable(table);
+  };
+  clear.addEventListener('click', () => commit(''));
+  apply.addEventListener('click', () => commit(input.value));
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') commit(input.value);
+    else if (event.key === 'Escape') closeFilterPopover();
+  });
+  window.setTimeout(() => input.focus(), 0);
+}
+
+function requestInlineStats(anchor: HTMLElement, table: DetectedSheetTable, column: string): void {
+  if (running) return;
+  closeFilterPopover();
+  closeStatsPopover();
+  const popover = document.createElement('div');
+  popover.className = 'stats-popover';
+  popover.innerHTML = '<div class="stats-loading">Loading…</div>';
+  document.body.appendChild(popover);
+  positionPopover(popover, anchor);
+  statsPopoverEl = popover;
+  pendingStatsColumn = column;
+  pendingStatsTable = table.name;
+  pendingStatsAnchor = anchor;
+  const closeOnOutsideClick = (event: MouseEvent) => {
+    if (!statsPopoverEl || !statsPopoverEl.contains(event.target as Node)) {
+      closeStatsPopover();
+      document.removeEventListener('click', closeOnOutsideClick, true);
+    }
+  };
+  window.setTimeout(() => document.addEventListener('click', closeOnOutsideClick, true), 0);
+  const current = inlineStateFor(table.name);
+  vscode.postMessage({
+    command: 'sheetTableStats',
+    table: table.name,
+    column,
+    filters: filtersForMessage(current),
+    sort: current.sort,
+    limit: sheetTableDisplayLimit(table),
+  });
+}
+
+function requestInlineChart(table: DetectedSheetTable, column: string): void {
+  if (running) return;
+  const current = inlineStateFor(table.name);
+  vscode.postMessage({
+    command: 'sheetTableChart',
+    table: table.name,
+    column,
+    filters: filtersForMessage(current),
+    sort: current.sort,
+    limit: sheetTableDisplayLimit(table),
   });
 }
 
@@ -446,14 +610,44 @@ function renderStatsPopoverContent(container: HTMLElement, message: Extract<Exte
   }
 }
 
+function renderInlineStatsPopover(
+  container: HTMLElement,
+  column: string,
+  statsKind: StatsKind,
+  shown: ColumnStatsFields,
+  all: ColumnStatsFields
+): void {
+  container.innerHTML = '';
+  const shownSection = document.createElement('section');
+  shownSection.className = 'stats-scope';
+  renderStatsPopoverContent(shownSection, {
+    command: 'columnStatsResult',
+    column: `${column} — shown`,
+    statsKind,
+    ...shown,
+  });
+  const allSection = document.createElement('section');
+  allSection.className = 'stats-scope';
+  renderStatsPopoverContent(allSection, {
+    command: 'columnStatsResult',
+    column: `${column} — all table rows`,
+    statsKind,
+    ...all,
+  });
+  container.appendChild(shownSection);
+  container.appendChild(allSection);
+}
+
 let statsPopoverEl: HTMLDivElement | null = null;
 let pendingStatsColumn: string | null = null;
+let pendingStatsTable: string | null = null;
 let pendingStatsAnchor: HTMLElement | null = null;
 
 function closeStatsPopover(): void {
   statsPopoverEl?.remove();
   statsPopoverEl = null;
   pendingStatsColumn = null;
+  pendingStatsTable = null;
   pendingStatsAnchor = null;
 }
 
@@ -494,10 +688,11 @@ function openStatsPopover(anchor: HTMLElement, column: string, statsKind: StatsK
   positionPopover(popover, anchor);
   statsPopoverEl = popover;
   pendingStatsColumn = column;
+  pendingStatsTable = null;
   pendingStatsAnchor = anchor;
 
   const closeOnOutsideClick = (e: MouseEvent) => {
-    if (statsPopoverEl && !statsPopoverEl.contains(e.target as Node)) {
+    if (!statsPopoverEl || !statsPopoverEl.contains(e.target as Node)) {
       closeStatsPopover();
       document.removeEventListener('click', closeOnOutsideClick, true);
     }
@@ -660,6 +855,100 @@ let renderedHeaderKey: string | undefined;
 let virtualState: { order: number[]; rowHeight: number } | undefined;
 let virtualRenderScheduled = false;
 
+function inlineCellValue(
+  rowIndex: number,
+  columnIndex: number,
+  original: unknown
+): { value: unknown; filteredOut: boolean } {
+  for (const table of state.lastResult?.sheetTables ?? []) {
+    const current = inlineTableState.get(table.name)?.result;
+    if (!current || columnIndex < table.left || columnIndex >= table.right) continue;
+    const firstDataRow = table.headerRow === null ? table.top : table.headerRow + 1;
+    if (rowIndex < firstDataRow || rowIndex >= table.bottom) continue;
+    const resultRow = current.rows[rowIndex - firstDataRow];
+    if (!resultRow) return { value: '', filteredOut: true };
+    return { value: resultRow[columnIndex - table.left], filteredOut: false };
+  }
+  return { value: original, filteredOut: false };
+}
+
+function appendInlineHeaderControls(
+  td: HTMLTableCellElement,
+  table: DetectedSheetTable,
+  sheetColumnIndex: number
+): void {
+  const columnIndex = sheetColumnIndex - table.left;
+  const column = table.columns[columnIndex];
+  if (column === undefined) return;
+  td.classList.add('sheet-table-header');
+
+  const controls = document.createElement('span');
+  controls.className = 'sheet-table-controls';
+  controls.title = table.name;
+  controls.addEventListener('dblclick', (event) => event.stopPropagation());
+  const current = inlineStateFor(table.name);
+
+  if (columnIndex === 0) {
+    const label = document.createElement('span');
+    label.className = 'sheet-table-label';
+    const count = current.result
+      ? `${current.result.rows.length} shown · ${current.result.totalRows} match · ${table.rowCount} total`
+      : `${table.rowCount} rows`;
+    label.textContent = `${table.name.slice(table.name.lastIndexOf('·'))} · ${count}`;
+    controls.appendChild(label);
+  }
+
+  const isActiveSort = current.sort?.column === column;
+  const sort = document.createElement('button');
+  sort.className = 'sheet-table-sort';
+  sort.classList.toggle('active', isActiveSort);
+  sort.textContent = isActiveSort ? (current.sort!.direction === 'asc' ? '▲' : '▼') : '⇅';
+  sort.title = isActiveSort ? 'Reverse this table sort' : `Sort this table by ${column}`;
+  sort.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const latest = inlineStateFor(table.name);
+    latest.sort = {
+      column,
+      direction: latest.sort?.column === column && latest.sort.direction === 'asc' ? 'desc' : 'asc',
+    };
+    requestInlineTable(table);
+  });
+
+  const filter = document.createElement('button');
+  filter.className = 'sheet-table-filter';
+  filter.classList.toggle('active', current.filters.has(column));
+  filter.textContent = '⌕';
+  filter.title = `Filter this table by values containing text in ${column}`;
+  filter.addEventListener('click', (event) => {
+    event.stopPropagation();
+    openInlineFilter(filter, table, column);
+  });
+
+  const stats = document.createElement('button');
+  stats.className = 'sheet-table-stats';
+  stats.textContent = '≡';
+  stats.title = `Statistics for shown and all ${column} values`;
+  stats.addEventListener('click', (event) => {
+    event.stopPropagation();
+    requestInlineStats(stats, table, column);
+  });
+
+  const plot = document.createElement('button');
+  plot.className = 'sheet-table-plot';
+  plot.textContent = '📈';
+  plot.title = `Plot the rows shown for ${column}`;
+  plot.addEventListener('click', (event) => {
+    event.stopPropagation();
+    requestInlineChart(table, column);
+  });
+
+  controls.appendChild(sort);
+  controls.appendChild(filter);
+  controls.appendChild(stats);
+  controls.appendChild(plot);
+  td.appendChild(controls);
+}
+
 function buildRowElement(i: number, displayIdx: number): HTMLTableRowElement {
   const { rows, cellChanged, rowIsNew, columnStatsKind } = state.lastResult!;
   const row = rows[i];
@@ -667,10 +956,12 @@ function buildRowElement(i: number, displayIdx: number): HTMLTableRowElement {
   tr.className = displayIdx % 2 === 0 ? 'even' : 'odd';
   const isNewRow = rowIsNew?.[i] === true;
   if (isNewRow) tr.classList.add('row-new');
-  row.forEach((value, j) => {
+  row.forEach((originalValue, j) => {
     const td = document.createElement('td');
-    td.textContent = formatValue(value, columnStatsKind[j]);
-    if (value === null || value === undefined) td.classList.add('cell-null');
+    const { value, filteredOut } = inlineCellValue(i, j, originalValue);
+    td.textContent = filteredOut ? '' : formatValue(value, columnStatsKind[j]);
+    if (!filteredOut && (value === null || value === undefined)) td.classList.add('cell-null');
+    if (filteredOut) td.classList.add('cell-filtered-out');
     if (!isNewRow && cellChanged?.[i]?.[j]) td.classList.add('cell-changed');
     // Coordinates on the element, handled by one delegated listener below,
     // rather than a closure per cell: renderVirtualWindow rebuilds its window
@@ -678,6 +969,13 @@ function buildRowElement(i: number, displayIdx: number): HTMLTableRowElement {
     // allocations per frame.
     td.dataset.r = String(i);
     td.dataset.c = String(j);
+    for (const table of state.lastResult?.sheetTables ?? []) {
+      const headerRow = table.headerRow ?? table.top;
+      if (i === headerRow && j >= table.left && j < table.right) {
+        appendInlineHeaderControls(td, table, j);
+        break;
+      }
+    }
     tr.appendChild(td);
   });
   return tr;
@@ -766,6 +1064,11 @@ function renderResults(preserveScroll = false): void {
     renderedHeaderKey = undefined;
     return;
   }
+  if (inlineOwnerRows !== state.lastResult.rows) {
+    inlineTableState.clear();
+    inlineOwnerRows = state.lastResult.rows;
+    closeFilterPopover();
+  }
   const { columns, rows, cellChanged, rowIsNew, renamedColumns, columnStatsKind } = state.lastResult;
 
   if (columns.length === 0) {
@@ -812,6 +1115,16 @@ function renderResults(preserveScroll = false): void {
       th.classList.add('col-renamed');
     }
     inner.appendChild(label);
+
+    // A worksheet's A/B/C headers describe the page grid, not one data
+    // table. Sorting one of them would move whole worksheet rows and detach
+    // every detected region from its coordinates; the real table controls
+    // live on each promoted header below instead.
+    if (state.lastResult?.sheetTables !== undefined) {
+      th.appendChild(inner);
+      headRow.appendChild(th);
+      return;
+    }
 
     const controls = document.createElement('span');
     controls.className = 'th-controls';
@@ -1040,6 +1353,46 @@ function applyEffect(effect: Effect): void {
         el.textContent = effect.message;
         statsPopoverEl.appendChild(el);
         if (pendingStatsAnchor) positionPopover(statsPopoverEl, pendingStatsAnchor);
+      }
+      break;
+    case 'sheetTableResult': {
+      const current = inlineStateFor(effect.message.table);
+      current.result = {
+        columns: effect.message.columns,
+        rows: effect.message.rows,
+        columnStatsKind: effect.message.columnStatsKind,
+        sql: effect.message.sql,
+        totalRows: effect.message.totalRows,
+      };
+      renderResults(true);
+      break;
+    }
+    case 'sheetTableStatsResult':
+      if (
+        statsPopoverEl &&
+        pendingStatsTable === effect.message.table &&
+        pendingStatsColumn === effect.message.column
+      ) {
+        renderInlineStatsPopover(
+          statsPopoverEl,
+          effect.message.column,
+          effect.message.statsKind,
+          effect.message.shown,
+          effect.message.all
+        );
+        if (pendingStatsAnchor) positionPopover(statsPopoverEl, pendingStatsAnchor);
+      }
+      break;
+    case 'sheetTableError':
+      if (statsPopoverEl && pendingStatsTable === effect.table) {
+        statsPopoverEl.innerHTML = '';
+        const error = document.createElement('div');
+        error.className = 'stats-empty';
+        error.textContent = effect.message;
+        statsPopoverEl.appendChild(error);
+        if (pendingStatsAnchor) positionPopover(statsPopoverEl, pendingStatsAnchor);
+      } else {
+        statusEl.textContent = effect.message;
       }
       break;
     case 'closeCellInspector':

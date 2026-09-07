@@ -138,6 +138,39 @@ test('an unchanged live tick updates the clock but does not re-render', () => {
   assert.deepEqual(kinds(effects), ['updateLiveStatusText'], 'an unchanged tick redrew the grid for nothing');
 });
 
+test('an inline sheet-table result updates only that region, not the worksheet result', () => {
+  const seeded = apply(initialState(), {
+    command: 'queryResult',
+    ...fields({
+      sheetTables: [
+        {
+          name: 'data · Table 1',
+          sheet: 'data',
+          top: 3,
+          bottom: 8,
+          left: 1,
+          right: 3,
+          headerRow: 3,
+          columns: ['Date', 'Value'],
+          rowCount: 4,
+        },
+      ],
+    }),
+  });
+  const worksheetRows = seeded.state.lastResult!.rows;
+  const { state, effects } = reduce(seeded.state, {
+    command: 'sheetTableResult',
+    table: 'data · Table 1',
+    sql: 'select * from "data · Table 1" limit 4',
+    totalRows: 20,
+    columns: ['Date', 'Value'],
+    rows: [['2020-01-01', 1]],
+    columnStatsKind: ['datetime', 'numeric'],
+  });
+  assert.equal(state.lastResult!.rows, worksheetRows, 'inline sorting replaced the whole worksheet');
+  assert.deepEqual(kinds(effects), ['setRunning', 'status', 'sheetTableResult']);
+});
+
 // ---------------------------------------------------------------------------
 // The late row total
 // ---------------------------------------------------------------------------

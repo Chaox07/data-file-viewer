@@ -1,5 +1,6 @@
 import type { StatsKind } from './gridFormat';
 import type { SortState } from './gridOrder';
+import type { DetectedSheetTable } from './duckdbConnection';
 
 /**
  * The webview's data state, and the rules for moving it.
@@ -38,9 +39,24 @@ export interface QueryResultFields {
   timeColumnWarning?: string;
   /** DuckDB already ordered these rows — see computeDisplayOrder, which must not re-sort them. */
   serverSorted?: boolean;
+  /** Present only for a verbatim worksheet preview. */
+  sheetTables?: DetectedSheetTable[];
 }
 
 export type LastResult = QueryResultFields;
+
+export interface ColumnStatsFields {
+  totalRows: number;
+  nonNullRows: number;
+  nullCount: number;
+  distinctCount?: number;
+  topValues?: { value: unknown; frequency: number }[];
+  min?: unknown;
+  max?: unknown;
+  mean?: unknown;
+  p5?: unknown;
+  p95?: unknown;
+}
 
 export type ExtensionMessage =
   | { command: 'tables'; tables: string[]; combinedTableNames: string[]; previewFirst?: boolean }
@@ -73,18 +89,23 @@ export type ExtensionMessage =
       command: 'columnStatsResult';
       column: string;
       statsKind: StatsKind;
-      totalRows: number;
-      nonNullRows: number;
-      nullCount: number;
-      distinctCount?: number;
-      topValues?: { value: unknown; frequency: number }[];
-      min?: unknown;
-      max?: unknown;
-      mean?: unknown;
-      p5?: unknown;
-      p95?: unknown;
-    }
+    } & ColumnStatsFields
   | { command: 'columnStatsError'; column: string; message: string }
+  | ({
+      command: 'sheetTableResult';
+      table: string;
+      sql: string;
+      totalRows: number;
+    } & Pick<QueryResultFields, 'columns' | 'rows' | 'columnStatsKind'>)
+  | {
+      command: 'sheetTableStatsResult';
+      table: string;
+      column: string;
+      statsKind: StatsKind;
+      shown: ColumnStatsFields;
+      all: ColumnStatsFields;
+    }
+  | { command: 'sheetTableError'; table: string; message: string }
   | { command: 'cellUpdated'; column: string; newValue: unknown; rowValues: Record<string, unknown>; rowsMatched: number }
   | { command: 'cellUpdateError'; column: string; message: string }
   | { command: 'editStatus'; message: string };
@@ -144,6 +165,9 @@ export type Effect =
   | { kind: 'liveRefreshRejected'; reason: string }
   | { kind: 'statsResult'; message: Extract<ExtensionMessage, { command: 'columnStatsResult' }> }
   | { kind: 'statsError'; column: string; message: string }
+  | { kind: 'sheetTableResult'; message: Extract<ExtensionMessage, { command: 'sheetTableResult' }> }
+  | { kind: 'sheetTableStatsResult'; message: Extract<ExtensionMessage, { command: 'sheetTableStatsResult' }> }
+  | { kind: 'sheetTableError'; table: string; message: string }
   | { kind: 'closeCellInspector' }
   | { kind: 'cellUpdateError'; column: string; message: string }
   | { kind: 'editStatus'; message: string };
@@ -169,6 +193,7 @@ function resultFrom(message: QueryResultFields, over: Partial<LastResult> = {}):
     truncated: message.truncated,
     editable: message.editable,
     editableTable: message.editableTable,
+    sheetTables: message.sheetTables,
     ...over,
   };
 }
@@ -324,6 +349,25 @@ export function reduce(state: WebviewState, message: ExtensionMessage): Reduced 
 
     case 'columnStatsError':
       effects.push({ kind: 'statsError', column: message.column, message: message.message });
+      break;
+
+    case 'sheetTableResult':
+      effects.push(
+        { kind: 'setRunning', value: false },
+        { kind: 'status', text: '' },
+        { kind: 'sheetTableResult', message }
+      );
+      break;
+
+    case 'sheetTableStatsResult':
+      effects.push({ kind: 'sheetTableStatsResult', message });
+      break;
+
+    case 'sheetTableError':
+      effects.push(
+        { kind: 'setRunning', value: false },
+        { kind: 'sheetTableError', table: message.table, message: message.message }
+      );
       break;
 
     case 'cellUpdated': {

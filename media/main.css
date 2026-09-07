@@ -268,6 +268,61 @@ html, body {
   font-style: italic;
 }
 
+/* A detected table stays in its original worksheet cells. Its own controls
+   sit beside the promoted header text, so side-by-side tables can be operated
+   independently without turning them into duplicate sidebar entries. */
+.results td.sheet-table-header {
+  background: rgba(82, 139, 255, 0.12);
+  color: #d7dae0;
+  font-weight: 600;
+  overflow: visible;
+}
+
+.sheet-table-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+
+.sheet-table-label {
+  color: #61afef;
+  font-size: 10px;
+  font-weight: 500;
+  white-space: nowrap;
+  margin-right: 3px;
+}
+
+.sheet-table-controls button {
+  background: none;
+  border: none;
+  border-radius: 2px;
+  color: #8b93a5;
+  cursor: pointer;
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 3px;
+}
+
+.sheet-table-controls button:hover,
+.sheet-table-controls button.active {
+  background: #3a3f4b;
+  color: #61afef;
+}
+
+.sheet-table-plot {
+  opacity: 0.65;
+}
+
+.sheet-table-plot:hover {
+  opacity: 1;
+}
+
+.results td.cell-filtered-out {
+  background: rgba(33, 37, 43, 0.45);
+}
+
 /* Change highlighting, relative to the last backup — see "Check for changes". */
 .results td.cell-changed {
   background: rgba(229, 192, 123, 0.35);
@@ -334,6 +389,56 @@ html, body {
   padding: 10px;
   font-size: 12px;
   color: #abb2bf;
+}
+
+.stats-scope + .stats-scope {
+  border-top: 1px solid #3a3f4b;
+  margin-top: 10px;
+  padding-top: 10px;
+}
+
+.filter-popover {
+  position: fixed;
+  z-index: 21;
+  width: 240px;
+  box-sizing: border-box;
+  background: #21252b;
+  border: 1px solid #181a1f;
+  border-radius: 4px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  padding: 10px;
+  color: #abb2bf;
+}
+
+.filter-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: #1e2126;
+  color: #abb2bf;
+  border: 1px solid #3a3f4b;
+  border-radius: 3px;
+  padding: 5px 7px;
+}
+
+.filter-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.filter-actions button {
+  background: #3a3f4b;
+  color: #abb2bf;
+  border: none;
+  border-radius: 3px;
+  padding: 3px 9px;
+  cursor: pointer;
+}
+
+.filter-actions button:last-child {
+  background: #528bff;
+  color: #fff;
 }
 
 .stats-loading, .stats-empty {

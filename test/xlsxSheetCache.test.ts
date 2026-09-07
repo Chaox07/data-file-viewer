@@ -174,6 +174,34 @@ test('detected tables stay lazy until first use, so opening a sheet reads the wo
     await file.runQuery('select * from "data" limit 1');
     const detected = (await file.listTables()).filter((name) => name.startsWith('data · Table '));
     assert.equal(detected.length, 2);
+    assert.deepEqual(await file.listSidebarTables(), ['data'], 'detected tables duplicated the sheet in the sidebar');
+    assert.deepEqual(
+      file.getDetectedSheetTables('data').map(({ name, sheet, ...layout }) => ({ name, sheet, ...layout })),
+      [
+        {
+          name: detected[0],
+          sheet: 'data',
+          top: 0,
+          bottom: 3,
+          left: 0,
+          right: 2,
+          headerRow: 0,
+          columns: ['date', 'left'],
+          rowCount: 2,
+        },
+        {
+          name: detected[1],
+          sheet: 'data',
+          top: 0,
+          bottom: 3,
+          left: 3,
+          right: 5,
+          headerRow: 0,
+          columns: ['date', 'right'],
+          rowCount: 2,
+        },
+      ]
+    );
 
     const kindsBefore = await file.runQuery(
       `select table_name, table_type from information_schema.tables
@@ -185,8 +213,22 @@ test('detected tables stay lazy until first use, so opening a sheet reads the wo
       'merely opening the sheet eagerly materialized every detected table'
     );
 
-    const first = await file.runQuery(`select * from "${detected[0]}" order by "left"`);
-    assert.deepEqual(first.rows.map((row) => Number(row[1])), [1, 2]);
+    const first = await file.runDetectedTableQuery(
+      detected[0],
+      [{ column: 'date', value: '2020' }],
+      { column: 'left', direction: 'asc' },
+      1
+    );
+    assert.deepEqual(first.rows.map((row) => Number(row[1])), [1]);
+    assert.equal(first.totalRows, 2, 'the inline row count confused its display limit with its filter');
+    const hostileFilter = await file.runDetectedTableQuery(detected[0], [
+      { column: 'date', value: "2020' or true --" },
+    ]);
+    assert.equal(hostileFilter.rows.length, 0, 'filter text escaped into executable SQL');
+    await assert.rejects(
+      file.runDetectedTableQuery(detected[0], [{ column: 'missing', value: 'x' }]),
+      /does not exist/
+    );
 
     const kindsAfter = await file.runQuery(
       `select table_name, table_type from information_schema.tables

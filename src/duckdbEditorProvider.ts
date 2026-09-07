@@ -5,6 +5,8 @@ import { open as fsOpen, readFile, stat, unlink } from 'node:fs/promises';
 import { existsSync, realpathSync } from 'node:fs';
 import {
   DescriptiveStats,
+  DetectedTableFilter,
+  DetectedTableSort,
   DuckDbFile,
   FNV_OFFSET_BASIS,
   FileKind,
@@ -17,6 +19,7 @@ import {
 } from './duckdbConnection';
 import { EXCEL_ERROR_TOKENS } from './textColumns';
 import { ChartPanel } from './chartPanel';
+import { pickXAxis } from './chartSpec';
 import { destructiveReason, hasMultipleStatements } from './sqlSafety';
 import { LiveRefreshController, LiveStatus } from './liveRefresh';
 
@@ -96,6 +99,33 @@ function getGlobalLiveRefreshIntervalMs(): number {
 function clampIntervalMs(candidateMs: unknown): number {
   const n = typeof candidateMs === 'number' && Number.isFinite(candidateMs) ? candidateMs : NaN;
   return Number.isFinite(n) && n > 0 ? Math.max(250, n) : getGlobalLiveRefreshIntervalMs();
+}
+
+function inlineFilters(value: unknown): DetectedTableFilter[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter(
+      (item): item is DetectedTableFilter =>
+        typeof item === 'object' &&
+        item !== null &&
+        typeof (item as DetectedTableFilter).column === 'string' &&
+        typeof (item as DetectedTableFilter).value === 'string'
+    )
+    .slice(0, 100);
+}
+
+function inlineSort(value: unknown): DetectedTableSort | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const candidate = value as Partial<DetectedTableSort>;
+  if (typeof candidate.column !== 'string') return undefined;
+  if (candidate.direction !== 'asc' && candidate.direction !== 'desc') return undefined;
+  return { column: candidate.column, direction: candidate.direction };
+}
+
+function inlineLimit(value: unknown): number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0
+    ? Math.min(value, 100_000)
+    : 100;
 }
 
 // A UX nicety, not a security boundary: the read-only reconnect used for
@@ -391,6 +421,8 @@ export class DuckDBDocument implements vscode.CustomDocument {
   // auto-detect hint. Distinct from lastEditableTable since a `_combined`
   // query is never "editable" but still has a meaningful base table.
   lastQueriedBaseTable: string | undefined;
+  /** Set only when the grid is the untouched worksheet preview with valid coordinates. */
+  lastSheetPreview: string | undefined;
 
   // Keyed by `${statsKind}:${column}` — cleared whenever a new query runs,
   // since stats are scoped to the current base query.
@@ -495,7 +527,7 @@ export class DuckDBDocument implements vscode.CustomDocument {
   async getTables(): Promise<string[]> {
     if (this.tablesCache) return this.tablesCache;
 
-    const ownTables = await this.file.listTables();
+    const ownTables = await this.file.listSidebarTables();
     this.combinedQueryMap.clear();
     const combinable = await this.file.getCombinableTableNames().catch(() => [] as string[]);
     const combinedNames: string[] = [];
@@ -675,6 +707,9 @@ async function runLiveTick(document: DuckDBDocument, webview: vscode.Webview, ge
       editable: false,
       editableTable: undefined,
       serverSorted: false,
+      sheetTables: document.lastSheetPreview
+        ? document.file.getDetectedSheetTables(document.lastSheetPreview)
+        : undefined,
     },
   });
 }
@@ -967,7 +1002,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
     // live ticks yield (see tryRunExclusive).
     type IncomingMessage =
       | { command: 'ready' }
-      | { command: 'runQuery'; sql: string }
+      | { command: 'runQuery'; sql: string; sheetPreview?: string }
       | { command: 'cancelQuery' }
       | { command: 'diffQuery' }
       | { command: 'sortQuery'; column: string; direction: 'asc' | 'desc' }
@@ -977,7 +1012,30 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
       | { command: 'toggleLiveRefresh'; enabled: boolean; intervalMs?: number }
       | { command: 'setLiveRefreshInterval'; intervalMs: number }
       | { command: 'runCombinedQuery'; table: string }
-      | { command: 'chartQuery'; xColumn: string; xIsText: boolean; yColumns: string[] };
+      | { command: 'chartQuery'; xColumn: string; xIsText: boolean; yColumns: string[] }
+      | {
+          command: 'sheetTableQuery';
+          table: string;
+          filters: DetectedTableFilter[];
+          sort?: DetectedTableSort;
+          limit: number;
+        }
+      | {
+          command: 'sheetTableStats';
+          table: string;
+          column: string;
+          filters: DetectedTableFilter[];
+          sort?: DetectedTableSort;
+          limit: number;
+        }
+      | {
+          command: 'sheetTableChart';
+          table: string;
+          column: string;
+          filters: DetectedTableFilter[];
+          sort?: DetectedTableSort;
+          limit: number;
+        };
 
     // One chart tab per TABLE, created on that table's first plot click.
     //
@@ -1051,6 +1109,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
           const { sql, timeColumn, result } = await document.runExclusive(async () => {
             const built = await document.file.buildCombinedQuery(message.table);
             document.lastSql = built.sql;
+            document.lastSheetPreview = undefined;
             document.lastQueriedBaseTable = message.table;
             document.combinedQueryMap.set(built.sql, message.table);
             document.statsCache.clear();
@@ -1203,6 +1262,10 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
           document.lastEditableColumns = editability.editable ? editability.columns : undefined;
           document.lastQueriedBaseTable =
             document.combinedQueryMap.get(sql) ?? (editability.editable ? editability.table : undefined);
+          document.lastSheetPreview =
+            message.sheetPreview && baseTableOfSelect(sql) === message.sheetPreview
+              ? message.sheetPreview
+              : undefined;
 
           webview.postMessage({
             command: 'queryResult',
@@ -1212,6 +1275,13 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             hasLimit: hasTrailingLimit(sql),
             editable: editability.editable,
             editableTable: editability.editable ? editability.table : undefined,
+            // Coordinates are meaningful only for the untouched preview the
+            // sidebar generated. A hand-written WHERE/ORDER BY can rearrange
+            // worksheet rows, so it deliberately gets an ordinary result.
+            sheetTables:
+              document.lastSheetPreview
+                ? document.file.getDetectedSheetTables(document.lastSheetPreview)
+                : undefined,
           });
 
           // Posted AFTER the result, so the rows the user asked for are never
@@ -1267,6 +1337,111 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
           });
         } catch (err) {
           webview.postMessage({ command: 'error', message: (err as Error).message });
+        }
+        return;
+      }
+
+      if (message.command === 'sheetTableQuery') {
+        try {
+          const result = await document.runExclusive(() =>
+            document.file.runDetectedTableQuery(
+              message.table,
+              inlineFilters(message.filters),
+              inlineSort(message.sort),
+              inlineLimit(message.limit)
+            )
+          );
+          webview.postMessage({ command: 'sheetTableResult', table: message.table, ...result });
+        } catch (err) {
+          webview.postMessage({
+            command: 'sheetTableError',
+            table: message.table,
+            message: (err as Error).message,
+          });
+        }
+        return;
+      }
+
+      if (message.command === 'sheetTableStats') {
+        try {
+          const filters = inlineFilters(message.filters);
+          const sort = inlineSort(message.sort);
+          const limit = inlineLimit(message.limit);
+          const { statsKind, shown, all } = await document.runExclusive(async () => {
+            const shownSql = await document.file.buildDetectedTableQuery(
+              message.table,
+              filters,
+              sort,
+              limit
+            );
+            const allSql = await document.file.buildDetectedTableQuery(message.table);
+            const probe = await document.file.runQuery(shownSql, 1);
+            const columnIndex = probe.columns.indexOf(message.column);
+            if (columnIndex === -1) throw new Error(`Column "${message.column}" was not found.`);
+            const kind = probe.columnStatsKind[columnIndex] ?? 'other';
+            const readStats = (sql: string): Promise<TopValuesStats | DescriptiveStats> =>
+              kind === 'other'
+                ? document.file.getColumnTopValues(sql, message.column, 20)
+                : document.file.getColumnDescriptiveStats(sql, message.column, kind);
+            return {
+              statsKind: kind,
+              shown: await readStats(shownSql),
+              all: await readStats(allSql),
+            };
+          });
+          webview.postMessage({
+            command: 'sheetTableStatsResult',
+            table: message.table,
+            column: message.column,
+            statsKind,
+            shown,
+            all,
+          });
+        } catch (err) {
+          webview.postMessage({
+            command: 'sheetTableError',
+            table: message.table,
+            message: (err as Error).message,
+          });
+        }
+        return;
+      }
+
+      if (message.command === 'sheetTableChart') {
+        const cap = getChartMaxPoints();
+        const chartPanel = chartPanels.get(message.table) ?? new ChartPanel(this.context.extensionUri, basename(document.uri.fsPath));
+        chartPanels.set(message.table, chartPanel);
+        const label = `${message.table} — ${message.column}`;
+        try {
+          const result = await document.runExclusive(async () => {
+            const sql = await document.file.buildDetectedTableQuery(
+              message.table,
+              inlineFilters(message.filters),
+              inlineSort(message.sort),
+              inlineLimit(message.limit)
+            );
+            const probe = await document.file.runQuery(sql, 1);
+            const yIndex = probe.columns.indexOf(message.column);
+            if (yIndex === -1 || probe.columnStatsKind[yIndex] !== 'numeric') {
+              throw new Error(`"${message.column}" is not numeric, so it cannot be plotted.`);
+            }
+            const x = pickXAxis(probe.columns, probe.columnStatsKind);
+            if (!x) throw new Error('This table has no date/time column to use as the chart axis.');
+            return document.file.runChartQuery(sql, x.column, [message.column], x.kind === 'text', cap);
+          });
+          chartPanel.reveal(label, {
+            command: 'chart',
+            frequency: null,
+            xColumn: result.columns[0],
+            yColumns: [message.column],
+            columns: result.columns,
+            rows: result.rows,
+            xAxisMode: result.xAxisMode,
+            truncated: result.truncated === true,
+            maxPoints: cap,
+          });
+        } catch (err) {
+          chartPanel.reveal(label, { command: 'chartError', message: (err as Error).message });
         }
         return;
       }

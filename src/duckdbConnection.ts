@@ -45,6 +45,39 @@ export interface QueryResult {
   truncated?: boolean;
 }
 
+/** A detected table's coordinates in the verbatim worksheet grid. */
+export interface DetectedSheetTable {
+  name: string;
+  sheet: string;
+  /** 0-based, inclusive/exclusive grid coordinates. */
+  top: number;
+  bottom: number;
+  left: number;
+  right: number;
+  /** 0-based worksheet-grid row, or null when the table has no promoted header. */
+  headerRow: number | null;
+  columns: string[];
+  rowCount: number;
+}
+
+export interface DetectedTableFilter {
+  column: string;
+  /** Case-insensitive substring matched against the column's displayed value. */
+  value: string;
+}
+
+export interface DetectedTableSort {
+  column: string;
+  direction: 'asc' | 'desc';
+}
+
+export interface DetectedTableQueryResult extends QueryResult {
+  /** The exact SQL represented by rows, reused by stats and chart actions. */
+  sql: string;
+  /** Rows matching the filters before the display LIMIT. */
+  totalRows: number;
+}
+
 export interface QueryDiff {
   cellChanged: boolean[][];
   rowIsNew: boolean[];
@@ -1283,6 +1316,8 @@ export class DuckDbFile {
    * Drained by the caller -- see takeLateWarnings.
    */
   private readonly lateWarnings: string[] = [];
+  /** Sheet -> tables found in its untouched grid, populated on first preview. */
+  private readonly detectedSheetTables = new Map<string, DetectedSheetTable[]>();
 
   private constructor(
     private readonly connection: DuckDBConnection,
@@ -1817,6 +1852,24 @@ export class DuckDbFile {
     return reader.getRows().map((row) => String(row[0]));
   }
 
+  /**
+   * Navigation entries differ from queryable objects for Excel: detected
+   * tables stay addressable by SQL but live inline on their real worksheet,
+   * rather than duplicating every one as a sidebar entry.
+   */
+  async listSidebarTables(): Promise<string[]> {
+    const tables = await this.listTables();
+    if (this.kind !== 'xlsx') return tables;
+    return tables.filter((name) => this.viewSources.get(name)?.derived !== true);
+  }
+
+  getDetectedSheetTables(sheet: string): DetectedSheetTable[] {
+    return (this.detectedSheetTables.get(sheet) ?? []).map((table) => ({
+      ...table,
+      columns: [...table.columns],
+    }));
+  }
+
   async listSiblingTables(): Promise<string[]> {
     if (!this.siblingCatalogName) return [];
     const reader = await this.connection.runAndReadAll(
@@ -2184,6 +2237,7 @@ export class DuckDbFile {
       const tables = detectTables(grid.slice(0, used.rows), {
         splitColumns: this.tableMode === 'grid',
       });
+      this.detectedSheetTables.set(name, []);
       if (tables.length === 0) return;
 
       const taken = (candidate: string): boolean =>
@@ -2228,6 +2282,17 @@ export class DuckDbFile {
             )}`
           );
           this.viewSources.set(tableName, tableSource);
+          this.detectedSheetTables.get(name)!.push({
+            name: tableName,
+            sheet: name,
+            top: table.region.top,
+            bottom: table.region.bottom,
+            left: table.region.left,
+            right: table.region.right,
+            headerRow: table.headerRow,
+            columns: [...table.columns],
+            rowCount: table.rowCount,
+          });
           // Do not read this range yet. A ranged read_xlsx() still inflates and
           // parses the whole workbook package, even for a two-row table. Paying
           // that once per detected table made opening the raw sheet scale with
@@ -2317,6 +2382,60 @@ export class DuckDbFile {
     for (const name of this.pendingDerivedTablesFor(sql)) {
       await this.ensureDerivedPrepared(name);
     }
+  }
+
+  /**
+   * Build the read-only query represented by one inline worksheet table.
+   * Column names are checked against DuckDB's catalog before interpolation;
+   * filter text is always a quoted value, never executable SQL.
+   */
+  async buildDetectedTableQuery(
+    table: string,
+    filters: readonly DetectedTableFilter[] = [],
+    sort?: DetectedTableSort,
+    limit = 0
+  ): Promise<string> {
+    const source = this.viewSources.get(table);
+    if (!source?.derived || !source.tableOrigin) {
+      throw new Error(`"${table}" is not a table detected inside a worksheet.`);
+    }
+    await this.ensureDerivedPrepared(table);
+
+    const columns = new Set(await this.getColumnNames(table, this.catalogName));
+    const predicates: string[] = [];
+    for (const filter of filters.slice(0, 100)) {
+      if (!columns.has(filter.column)) {
+        throw new Error(`Column "${filter.column}" does not exist in "${table}".`);
+      }
+      const value = String(filter.value).slice(0, 4_000);
+      if (value === '') continue;
+      predicates.push(
+        `contains(lower(cast(${quoteIdent(filter.column)} as varchar)), lower(${quoteLiteral(value)}))`
+      );
+    }
+
+    let sql = `select * from ${quoteIdent(table)}`;
+    if (predicates.length > 0) sql += ` where ${predicates.join(' and ')}`;
+    if (sort) {
+      if (!columns.has(sort.column)) {
+        throw new Error(`Column "${sort.column}" does not exist in "${table}".`);
+      }
+      sql += ` order by ${quoteIdent(sort.column)} ${sort.direction === 'desc' ? 'desc' : 'asc'} nulls last`;
+    }
+    if (Number.isInteger(limit) && limit > 0) sql += ` limit ${Math.min(limit, 100_000)}`;
+    return sql;
+  }
+
+  async runDetectedTableQuery(
+    table: string,
+    filters: readonly DetectedTableFilter[] = [],
+    sort?: DetectedTableSort,
+    limit = 0
+  ): Promise<DetectedTableQueryResult> {
+    const sql = await this.buildDetectedTableQuery(table, filters, sort, limit);
+    const result = await this.runQuery(sql);
+    const totalRows = (await this.countMatchingRows(sql)) ?? result.rows.length;
+    return { ...result, sql, totalRows };
   }
 
   async runQuery(sql: string, maxRows = 0): Promise<QueryResult> {

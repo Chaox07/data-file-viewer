@@ -124,15 +124,16 @@ header, nothing above or below a table is excluded, and a footnote stays under
 the table it annotates. If you want to know what is in the file, this answers
 that question and no other.
 
-**The tables found inside it**, listed beside the sheet as `Sheet · Table 1`,
-`Sheet · Table 2`. These are typed — numbers are numbers — so they sort,
-summarise, chart, and can be edited. A sheet is cut on blank rows *and* blank
-columns, so two tables sitting side by side are two tables rather than one wide
-one whose header belongs to neither. Titles, captions and footnotes are
-recognised and are simply not offered as tables; they are still on the sheet, at
-their own row numbers, because the sheet is shown whole. The classification is
-ported from the ETL pipeline function by function, so a sheet read here and the
-same sheet read there agree about how many tables it holds. `dataFileViewer.sheetTables`
+**The tables found inside it**, in their original worksheet cells. Their
+promoted header cells gain independent sort, text-filter, statistics and plot
+controls; operating on one table never moves or filters its neighbour. The
+sidebar therefore stays a list of real sheets rather than duplicating every
+detected rectangle as another entry. Detected tables are typed — numbers are
+numbers — and remain addressable by SQL as `Sheet · Table 1`, `Sheet · Table 2`.
+A sheet is cut on blank rows *and* blank columns, so two tables sitting side by
+side are two tables rather than one wide one whose header belongs to neither.
+Titles, captions and footnotes remain on the untouched sheet. The classification
+is ported from the ETL pipeline function by function. `dataFileViewer.sheetTables`
 turns the column split off (`rows`), or detection off entirely (`off`).
 
 Sheet names are read out of the workbook package directly (`xl/workbook.xml`
@@ -150,8 +151,8 @@ workbook parse, so eagerly loading every detected table made the raw-sheet
 preview scale with the number of tables. A ten-sheet workbook here opens in 26
 ms and a 21 MB two-sheet one in about 152 ms. On that 21 MB workbook, the first
 raw-sheet preview fell from about 1.02 s to 0.44 s while repeated previews remain
-about 5 ms. The tables appear in the sidebar under their sheet the moment it is
-opened.
+about 5 ms. Their controls appear on the detected header cells the moment the
+sheet is opened.
 
 **Cells Excel could not compute** — `#DIV/0!`, `#N/A`, `#REF!`, `#VALUE!` — used
 to cost you the whole sheet. `read_xlsx()` types a column from its values and
@@ -238,6 +239,12 @@ big enough table that is a wait rather than a blink.
 ### Sorting, stats, and cell editing
 
 Every results grid — table previews and hand-written queries alike — gets:
+
+For an Excel worksheet, the A/B/C grid headers intentionally have no data-table
+actions: they describe the page, not a table. Each detected table instead gets
+the same actions directly on its own header row. Its sort and contains-filter
+rewrite only that rectangle; its statistics show both the displayed rows and
+the complete table; its chart uses exactly the filtered, display-limited rows.
 
 - **Sort**: click a column header's sort button to sort by that column,
   ascending; click it again to reverse to descending, and so on. If the
@@ -499,7 +506,7 @@ that window.
 
 ```sh
 npm run package     # builds, then runs vsce package -> data-file-viewer-x.x.x.vsix
-code --install-extension data-file-viewer-0.0.1.vsix
+code --install-extension data-file-viewer-0.0.6.vsix
 ```
 
 `@duckdb/node-api` ships platform-specific native binaries resolved at
