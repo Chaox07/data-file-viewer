@@ -49,6 +49,11 @@ before(async () => {
   await connection.run(`create table years (Year integer, Rate double)`);
   await connection.run(`insert into years values (2023, 3.0), (2021, 1.0), (2022, 2.0)`);
 
+  // A numeric period label that is NOT a year, stored out of order for the
+  // same reason: it must keep the category axis and the table's own ordering.
+  await connection.run(`create table months (Month integer, Rate double)`);
+  await connection.run(`insert into months values (3, 3.0), (1, 1.0), (2, 2.0)`);
+
   // A real date column with a couple of junk rows: still a time axis.
   await connection.run(`create table mostly (Date varchar, v double)`);
   await connection.run(
@@ -186,12 +191,47 @@ test('category labels come back verbatim, in the table’s own order', async () 
   }
 });
 
-test('a numeric Year remains a category in stored order', async () => {
+/**
+ * A year IS a point in time, so it gets a real time axis -- read through
+ * make_date rather than a cast, which is what makes it safe.
+ *
+ * This deliberately overturns the earlier "a numeric Year remains a category
+ * in stored order" rule. That rule was right to refuse `cast(2024 as
+ * timestamp)`, which reads the number as epoch seconds and lands in 1970 --
+ * but the fixture shows what refusing outright costs: the rows are stored
+ * 2023, 2021, 2022, and a category axis draws exactly that, a line running
+ * backwards through time. A category axis carries no ORDER BY on purpose,
+ * because "1996-1Q" sorted lexically can mislead; integers have no such
+ * ambiguity, so the reason does not reach this case.
+ */
+test('a numeric Year charts on an ordered time axis, not a category', async () => {
   const file = await open();
   try {
     const r = await file.runChartQuery('select * from years', 'Year', ['Rate'], false, 0, true);
+    assert.equal(r.xAxisMode, 'time');
+    // Sorted, and each year placed at its own 1 January.
+    assert.deepEqual(
+      r.rows.map((row) => String(row[0]).slice(0, 10)),
+      ['2021-01-01', '2022-01-01', '2023-01-01']
+    );
+    assert.deepEqual(r.rows.map((row) => Number(row[1])), [1.0, 2.0, 3.0]);
+  } finally {
+    file.dispose();
+  }
+});
+
+/**
+ * The bound is what keeps the rule honest. `Month` holding 1..12 is a numeric
+ * period label too, and make_date(1, 1, 1) would draw the series in antiquity
+ * -- so anything that is not plausibly a year falls back to the category axis
+ * it would have been anyway, in stored order.
+ */
+test('a numeric period that is not a year stays a category in stored order', async () => {
+  const file = await open();
+  try {
+    const r = await file.runChartQuery('select * from months', 'Month', ['Rate'], false, 0, true);
     assert.equal(r.xAxisMode, 'category');
-    assert.deepEqual(r.rows.map((row) => Number(row[0])), [2023, 2021, 2022]);
+    assert.deepEqual(r.rows.map((row) => Number(row[0])), [3, 1, 2]);
   } finally {
     file.dispose();
   }

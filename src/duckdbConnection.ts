@@ -15,7 +15,7 @@ import { createWriteStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
 import { KNOWN_FREQUENCIES, type SeriesFrequency } from './chartSpec';
-import { csvLocaleOptions, decideFile, type NumberLocale } from './numericLocale';
+import { bothReadings, csvLocaleOptions, decideFile, type NumberLocale } from './numericLocale';
 import { listSheets, readSheetDimensionsChecked, type SheetDimension } from './xlsxSheets';
 import {
   columnLetters as tableColumnLetters,
@@ -322,6 +322,45 @@ function trimTrailingBlanks(rows: readonly Cell[][]): { rows: number; cols: numb
     }
   }
   return { rows: lastRow + 1, cols: lastCol + 1 };
+}
+
+const NUMERIC_SQL_TYPE = /^(?:u?(?:tiny|small|big|huge)?int|integer|decimal|numeric|double|float|real)/i;
+const TEMPORAL_SQL_TYPE = /^(?:date$|timestamp|time$)/i;
+
+/**
+ * A filter value, checked against the column it will be compared to and
+ * rewritten into the one spelling DuckDB accepts.
+ *
+ * `cast_to_type` alone is not enough, and both gaps show up the moment someone
+ * uses the filter box on a real workbook:
+ *
+ *   1. It throws its own message. Typing "abc" into a filter on a rate column
+ *      produced `Conversion Error: Could not convert string "abc" to
+ *      DECIMAL(3,1)` -- which names an internal type the user never chose and
+ *      does not say which filter was wrong.
+ *   2. It only reads English numbers. The filter box is where somebody retypes
+ *      what they are looking AT, and a Turkish workbook shows 1.234,5 -- which
+ *      `cast_to_type` rejects outright. The viewer already knows both readings
+ *      (numericLocale, used when it decides a sheet's own columns), so
+ *      refusing the number it just rendered would be the viewer disagreeing
+ *      with itself.
+ *
+ * Values for text columns pass through untouched: rewriting them would break
+ * an ordinary string comparison, and a VARCHAR column has no spelling to fix.
+ */
+function filterValueForType(value: string, sqlType: string, columnName: string): string {
+  if (NUMERIC_SQL_TYPE.test(sqlType)) {
+    const { en, eu } = bothReadings(value);
+    const parsed = en ?? eu;
+    if (parsed === null) {
+      throw new Error(`"${value}" is not a number, so ${columnName} cannot be compared to it.`);
+    }
+    return String(parsed);
+  }
+  if (TEMPORAL_SQL_TYPE.test(sqlType) && !Number.isFinite(Date.parse(value))) {
+    throw new Error(`"${value}" is not a date, so ${columnName} cannot be compared to it.`);
+  }
+  return value;
 }
 
 /**
@@ -1927,6 +1966,16 @@ export class DuckDbFile {
     return siblingTables.filter((t) => mainTables.has(t));
   }
 
+  /** Column name -> declared SQL type, in ordinal order. */
+  private async getColumnTypes(table: string, catalog: string): Promise<Map<string, string>> {
+    const reader = await this.connection.runAndReadAll(
+      `select column_name, data_type from information_schema.columns where table_catalog = ${quoteLiteral(
+        catalog
+      )} and table_name = ${quoteLiteral(table)} order by ordinal_position`
+    );
+    return new Map(reader.getRows().map((r) => [String(r[0]), String(r[1])]));
+  }
+
   private async getColumnNames(table: string, catalog: string): Promise<string[]> {
     const reader = await this.connection.runAndReadAll(
       `select column_name from information_schema.columns where table_catalog = ${quoteLiteral(
@@ -2441,7 +2490,8 @@ export class DuckDbFile {
     }
     await this.ensureDerivedPrepared(table);
 
-    const columns = new Set(await this.getColumnNames(table, this.catalogName));
+    const types = await this.getColumnTypes(table, this.catalogName);
+    const columns = new Set(types.keys());
     const predicates: string[] = [];
     for (const filter of filters.slice(0, 100)) {
       if (!columns.has(filter.column)) {
@@ -2450,7 +2500,13 @@ export class DuckDbFile {
       const column = quoteIdent(filter.column);
       const value = String(filter.value ?? '').slice(0, 4_000);
       const valueTo = String(filter.valueTo ?? '').slice(0, 4_000);
-      const typed = (candidate: string) => `cast_to_type(${quoteLiteral(candidate)}, ${column})`;
+      const sqlType = types.get(filter.column) ?? 'VARCHAR';
+      // Checked and canonicalised here rather than left to cast_to_type, for
+      // two reasons the filter box makes concrete -- see filterValueForType.
+      const typed = (candidate: string) =>
+        `cast_to_type(${quoteLiteral(
+          filterValueForType(candidate, sqlType, filter.column)
+        )}, ${column})`;
       switch (filter.operator) {
         case 'contains':
           if (value !== '') {
@@ -2637,11 +2693,18 @@ export class DuckDbFile {
    * Returns the share of NON-NULL values that parsed, so a column that is
    * mostly null does not read as mostly unparseable.
    */
-  private async textAxisParseRate(inner: string, xColumn: string): Promise<number> {
+  private async textAxisParseRate(
+    inner: string,
+    xColumn: string,
+    readAs?: string
+  ): Promise<number> {
     const x = quoteIdent(xColumn);
+    // Defaults to the timestamp cast; the year axis passes its make_date
+    // reading so both claimed kinds are held to the same bar.
+    const expr = readAs ?? `try_cast(${x} as timestamp)`;
     const sample = `select ${x} from ${wrapAsSubquery(inner)} as _probe where ${x} is not null limit ${TEXT_AXIS_PROBE_ROWS}`;
     const reader = await this.connection.runAndReadAll(
-      `select count(*) as n, count(try_cast(${x} as timestamp)) as ok from ${wrapAsSubquery(sample)} as _probe_rows`
+      `select count(*) as n, count(${expr}) as ok from ${wrapAsSubquery(sample)} as _probe_rows`
     );
     const [n, ok] = (reader.getRowsJson()[0] as unknown[]).map(Number);
     return n > 0 ? ok / n : 0;
@@ -2716,12 +2779,35 @@ export class DuckDbFile {
     // downgrade the whole axis, so this is a high bar rather than a perfect
     // one -- and try_cast returning NULL for the failures means they simply
     // drop out of the time-axis query below.
+    // A numeric period label is offered as a category rather than cast to a
+    // timestamp, because reading 2024 as an epoch value lands in 1970. But a
+    // YEAR is still a point in time, and leaving it a category costs something
+    // real: a category axis carries no ORDER BY (deliberately -- see below),
+    // so the series is drawn in whatever order the table holds, and a missing
+    // year closes up instead of leaving a gap.
+    //
+    // So the year reading is tried first, over make_date rather than a cast:
+    // 1996 becomes 1996-01-01, which is where a yearly observation sits on a
+    // date axis and how axisDateLabel already renders one back ("1996").
+    // Bounded rather than trusting the column's name, because `Year` holding
+    // 1, 2, 3 is a count of years and make_date(1, 1, 1) would draw the series
+    // in antiquity. Values outside the range are NULL, so the same parse-rate
+    // bar the text axis uses decides this: mostly years -> a real time axis,
+    // anything else -> the category axis it would have been anyway.
+    const yearExpr =
+      `case when try_cast(${x} as bigint) between 1000 and 3000 ` +
+      `then make_date(cast(${x} as bigint), 1, 1) end`;
+    const asYear =
+      xIsCategory &&
+      (await this.textAxisParseRate(inner, xColumn, yearExpr)) >= TEXT_AXIS_MIN_PARSE_RATE;
+
     const asTime =
-      !xIsCategory &&
-      (!xIsText || (await this.textAxisParseRate(inner, xColumn)) >= TEXT_AXIS_MIN_PARSE_RATE);
+      asYear ||
+      (!xIsCategory &&
+        (!xIsText || (await this.textAxisParseRate(inner, xColumn)) >= TEXT_AXIS_MIN_PARSE_RATE));
 
     if (asTime) {
-      const xExpr = xIsText ? `try_cast(${x} as timestamp)` : x;
+      const xExpr = asYear ? yearExpr : xIsText ? `try_cast(${x} as timestamp)` : x;
       const sql =
         `select ${xExpr} as ${x}, ${ys} from ${wrapAsSubquery(inner)} as _chart ` +
         `where ${xExpr} is not null order by 1 asc`;

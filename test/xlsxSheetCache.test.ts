@@ -245,6 +245,25 @@ test('detected tables stay lazy until first use, so opening a sheet reads the wo
     ]);
     assert.equal(range.rows.length, 2);
 
+    // Junk in a numeric filter names the column and the value the user typed.
+    // Left to DuckDB's own cast this said `Could not convert string "abc" to
+    // DECIMAL(3,1)`, which names a type nobody chose and no filter at all.
+    await assert.rejects(
+      file.runDetectedTableQuery(detected[0], [
+        { column: 'left', operator: 'gt', value: 'abc' },
+      ]),
+      /"abc" is not a number, so left cannot be compared to it/
+    );
+
+    // The filter box is where somebody retypes what they are looking at, and
+    // a Turkish workbook renders 1,5 rather than 1.5. The viewer already reads
+    // both conventions when it types a sheet's columns; refusing one here
+    // would be the viewer disagreeing with itself.
+    const european = await file.runDetectedTableQuery(detected[0], [
+      { column: 'left', operator: 'gt', value: '1,5' },
+    ]);
+    assert.deepEqual(european.rows.map((row) => Number(row[1])), [2]);
+
     const kindsAfter = await file.runQuery(
       `select table_name, table_type from information_schema.tables
        where table_name like 'data · Table %' order by table_name`
