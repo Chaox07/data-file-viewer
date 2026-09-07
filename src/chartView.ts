@@ -472,6 +472,30 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
           axisLabel: {
             ...axis.axisLabel,
             formatter: axisFrequency ? labelTick : undefined,
+            // A time axis does not emit one row of ticks. ECharts' Time scale
+            // builds SEVERAL levels of them -- the month boundaries are one
+            // level, the regular interval another -- and draws every level,
+            // giving the higher one a larger z2 so it lands on top
+            // (AxisBuilder: `z2 = 10 + tick.time.level`). Nothing drops the
+            // loser, so when a month boundary falls within a few pixels of an
+            // interval tick the two labels are painted over each other: a five
+            // month daily series ticked every ~15 days put 1 September under
+            // the bold "Sep" and rendered it as "Sep1", and 2 August under
+            // "Aug" as "Aug2".
+            //
+            // hideOverlap resolves it by dropping the loser instead of
+            // stacking it, and drops the right one: it keeps the highest
+            // `priority`, which IS that z2 (AxisBuilder:571), so the bold
+            // month survives and the day that collided with it goes. ECharts
+            // added this for exactly this case -- its own call site says "this
+            // bit fixes the label overlap issue for the time chart", citing
+            // apache/echarts#14266.
+            //
+            // Applied whether or not a frequency was found, because the
+            // levels are the scale's doing rather than the wording's: with a
+            // frequency the two colliding labels are formatted identically,
+            // so the collision reads as one smeared label instead of two.
+            hideOverlap: true,
           },
           // onZero false pins the axis to the bottom of the plot rather than
           // to y = 0 when zero happens to fall inside the range -- the same
