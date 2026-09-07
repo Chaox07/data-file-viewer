@@ -46,6 +46,9 @@ before(async () => {
     `insert into labels values ('1996-3Q', 5.3), ('1996-1Q', 5.1), ('1996-2Q', 5.2)`
   );
 
+  await connection.run(`create table years (Year integer, Rate double)`);
+  await connection.run(`insert into years values (2023, 3.0), (2021, 1.0), (2022, 2.0)`);
+
   // A real date column with a couple of junk rows: still a time axis.
   await connection.run(`create table mostly (Date varchar, v double)`);
   await connection.run(
@@ -178,6 +181,17 @@ test('category labels come back verbatim, in the table’s own order', async () 
       r.rows.map((row) => row[0]),
       ['1996-3Q', '1996-1Q', '1996-2Q']
     );
+  } finally {
+    file.dispose();
+  }
+});
+
+test('a numeric Year remains a category in stored order', async () => {
+  const file = await open();
+  try {
+    const r = await file.runChartQuery('select * from years', 'Year', ['Rate'], false, 0, true);
+    assert.equal(r.xAxisMode, 'category');
+    assert.deepEqual(r.rows.map((row) => Number(row[0])), [2023, 2021, 2022]);
   } finally {
     file.dispose();
   }

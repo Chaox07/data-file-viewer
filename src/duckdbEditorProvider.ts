@@ -103,15 +103,22 @@ function clampIntervalMs(candidateMs: unknown): number {
 
 function inlineFilters(value: unknown): DetectedTableFilter[] {
   if (!Array.isArray(value)) return [];
-  return value
-    .filter(
-      (item): item is DetectedTableFilter =>
-        typeof item === 'object' &&
-        item !== null &&
-        typeof (item as DetectedTableFilter).column === 'string' &&
-        typeof (item as DetectedTableFilter).value === 'string'
-    )
-    .slice(0, 100);
+  const operators = new Set([
+    'contains', 'equals', 'notEquals', 'gt', 'gte', 'lt', 'lte', 'between', 'isBlank', 'isNotBlank',
+  ]);
+  return value.flatMap((item): DetectedTableFilter[] => {
+    if (typeof item !== 'object' || item === null) return [];
+    const candidate = item as Partial<DetectedTableFilter>;
+    if (typeof candidate.column !== 'string' || !operators.has(String(candidate.operator))) return [];
+    if (candidate.value !== undefined && typeof candidate.value !== 'string') return [];
+    if (candidate.valueTo !== undefined && typeof candidate.valueTo !== 'string') return [];
+    return [{
+      column: candidate.column,
+      operator: candidate.operator!,
+      value: candidate.value,
+      valueTo: candidate.valueTo,
+    }];
+  }).slice(0, 100);
 }
 
 function inlineSort(value: unknown): DetectedTableSort | undefined {
@@ -1012,7 +1019,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
       | { command: 'toggleLiveRefresh'; enabled: boolean; intervalMs?: number }
       | { command: 'setLiveRefreshInterval'; intervalMs: number }
       | { command: 'runCombinedQuery'; table: string }
-      | { command: 'chartQuery'; xColumn: string; xIsText: boolean; yColumns: string[] }
+      | { command: 'chartQuery'; xColumn: string; xIsText: boolean; xIsCategory?: boolean; yColumns: string[] }
       | {
           command: 'sheetTableQuery';
           table: string;
@@ -1427,7 +1434,14 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             }
             const x = pickXAxis(probe.columns, probe.columnStatsKind);
             if (!x) throw new Error('This table has no date/time column to use as the chart axis.');
-            return document.file.runChartQuery(sql, x.column, [message.column], x.kind === 'text', cap);
+            return document.file.runChartQuery(
+              sql,
+              x.column,
+              [message.column],
+              x.kind === 'text',
+              cap,
+              x.kind === 'category'
+            );
           });
           chartPanel.reveal(label, {
             command: 'chart',
@@ -1490,7 +1504,8 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
               message.xColumn,
               message.yColumns,
               message.xIsText === true,
-              cap
+              cap,
+              message.xIsCategory === true
             )
           );
           // Read after the chart query, and never allowed to fail the chart:

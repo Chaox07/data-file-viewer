@@ -271,8 +271,13 @@ function letterNames(left: number, right: number): string[] {
  * look like a header and get promoted. `yearHeadedHeader` below handles the
  * genuine "2019 | ppi | wage" case with a contrast test instead.
  */
-const DATE_COL_PATTERN =
+export const DATE_COL_PATTERN =
   /^(?:date|datetime|time|timestamp|period|year|month|week|day|quarter|tarih|tarihi|zaman|yil|yıl|yillar|yıllar|donem|dönem|donemi|dönemi|ay|aylar|hafta|ceyrek|çeyrek|gun|gün|(?:date|dt|ts|time)_.+|.+_(?:date|datetime|dt|ts|time|timestamp|period)|[DWMQYHdwmqyh]\d*date|dt|ts)$/i;
+
+/** Shared by table detection and chart-axis selection so the two cannot drift. */
+export function isDateColumnName(name: string): boolean {
+  return DATE_COL_PATTERN.test(name.trim());
+}
 
 function populatedCells(grid: readonly Cell[][], row: number, left: number, right: number): Cell[] {
   const out: Cell[] = [];
@@ -385,7 +390,7 @@ function findHeaderRow(grid: readonly Cell[][], region: Region, minCols: number)
 
     const breadthOk = populated.length >= Math.min(minCols, span);
     const looksLikeHeader =
-      populated.some((v) => isText(v) && DATE_COL_PATTERN.test(String(v).trim())) ||
+      populated.some((v) => isText(v) && isDateColumnName(String(v))) ||
       (breadthOk && populated.every(isText)) ||
       (breadthOk && yearHeadedHeader(grid, r, region, populated));
     return looksLikeHeader ? r : null;

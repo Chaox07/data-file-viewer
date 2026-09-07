@@ -8,19 +8,23 @@
  * result wrong.
  */
 
+import { isDateColumnName } from './sheetTables';
+
 export type StatsKind = 'numeric' | 'datetime' | 'other';
 
 /**
  * What the x column is made of, which is NOT the same question as what the
  * axis will be.
  *
- * `datetime` is a real DATE/TIMESTAMP and always draws a time axis.  `text`
+ * `datetime` is a real DATE/TIMESTAMP and always draws a time axis. `text`
  * is a column that merely claims to be one by its name, and whether it can be
  * a time axis depends on what the strings actually parse to -- a question only
  * the database can answer, so it is settled host-side at chart time (see
- * runChartQuery) rather than guessed here.
+ * runChartQuery) rather than guessed here. `category` is a numeric period label
+ * such as Year: it is an axis, but it must not be cast to a timestamp or
+ * offered as its own y series.
  */
-export type XAxisKind = 'datetime' | 'text';
+export type XAxisKind = 'datetime' | 'text' | 'category';
 
 export interface XAxis {
   column: string;
@@ -28,12 +32,10 @@ export interface XAxis {
 }
 
 /**
- * The column names a text x axis is allowed to come from, lowercased.
+ * The exact legacy names, lowercased, that keep their established precedence.
  *
- * This list is the whole reason a text column can be an axis at all, and it
- * is deliberately tiny. Plotting numbers against arbitrary text draws the
- * order the table happens to hold its rows in, dressed up as a chart -- so a
- * text column has to *say* it is the axis before it is treated as one.
+ * Broader date-like names use sheetTables' ETL pattern below. Plotting numbers
+ * against arbitrary text is still refused: a column has to say it is an axis.
  *
  * `sheet_metadata` is the case that makes this concrete: its first column is
  * text and its last is a count, and under a looser rule every macro and ETL
@@ -54,7 +56,15 @@ const TEXT_AXIS_NAMES = ['datetime', 'date'];
  *      (rformat.normalise_dates), so this is the path its files take. Where a
  *      table has two -- a period and a revision stamp, say -- the first wins,
  *      which is the writer's own ordering.
- *   2. A text column NAMED as a date. **ETL writes every date column as
+ *   2. A column named exactly Date/Datetime, preserving the established
+ *      Datetime-before-Date precedence.
+ *   3. A column whose name matches the table detector's shared ETL date-name
+ *      vocabulary (Tarih, Dönem, Year, Month, *_date, and the rest).
+ *
+ * Text axes are probed at query time. Numeric period axes such as Year remain
+ * categories: treating 2024 as an epoch value would invent a date.
+ *
+ * **ETL writes every date column as
  *      VARCHAR holding ISO text**, always, in every output format: _dt_to_iso
  *      plus `pl.Series(..., dtype=pl.Utf8)`, with no setting that changes it.
  *      A type-only rule therefore finds an axis in macro files and never in
@@ -72,9 +82,19 @@ export function pickXAxis(columns: string[], kinds: StatsKind[]): XAxis | undefi
   // helpers_core.R's .resolve_date_col rather than merely resembling it.
   for (const wanted of TEXT_AXIS_NAMES) {
     const i = columns.findIndex(
-      (name, idx) => kinds[idx] === 'other' && name.trim().toLowerCase() === wanted
+      (name) => name.trim().toLowerCase() === wanted
     );
-    if (i >= 0) return { column: columns[i], kind: 'text' };
+    if (i >= 0) {
+      return { column: columns[i], kind: kinds[i] === 'numeric' ? 'category' : 'text' };
+    }
+  }
+
+  const namedIndex = columns.findIndex((name) => isDateColumnName(name));
+  if (namedIndex >= 0) {
+    return {
+      column: columns[namedIndex],
+      kind: kinds[namedIndex] === 'numeric' ? 'category' : 'text',
+    };
   }
   return undefined;
 }
@@ -89,8 +109,10 @@ export function pickXAxis(columns: string[], kinds: StatsKind[]): XAxis | undefi
  * largest one and a flat line for everything else.
  */
 export function plottableColumns(columns: string[], kinds: StatsKind[]): string[] {
-  if (pickXAxis(columns, kinds) === undefined) return [];
-  return columns.filter((_, i) => kinds[i] === 'numeric');
+  const x = pickXAxis(columns, kinds);
+  if (x === undefined) return [];
+  const xIndex = columns.indexOf(x.column);
+  return columns.filter((_, i) => kinds[i] === 'numeric' && i !== xIndex);
 }
 
 /**

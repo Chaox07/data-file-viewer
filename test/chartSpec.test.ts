@@ -56,6 +56,22 @@ test('the name match ignores case and surrounding space', () => {
   assert.equal(pickXAxis([' DATE ', 'Rate'], ['other', 'numeric'])?.kind, 'text');
 });
 
+test('Turkish and period headers use the detector’s shared date vocabulary', () => {
+  assert.deepEqual(pickXAxis(['Tarih', 'Oran'], ['other', 'numeric']), {
+    column: 'Tarih',
+    kind: 'text',
+  });
+  assert.equal(pickXAxis(['Dönem', 'Değer'], ['other', 'numeric'])?.column, 'Dönem');
+});
+
+test('a numeric Year is a category axis, not a y candidate', () => {
+  assert.deepEqual(pickXAxis(['Year', 'Rate'], ['numeric', 'numeric']), {
+    column: 'Year',
+    kind: 'category',
+  });
+  assert.deepEqual(plottableColumns(['Year', 'Rate'], ['numeric', 'numeric']), ['Rate']);
+});
+
 test('a text column NOT named as a date is never an axis', () => {
   // This is the rule that matters. Plotting numbers against arbitrary labels
   // draws the order the table happens to hold its rows in, dressed up as a

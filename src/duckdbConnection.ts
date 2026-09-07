@@ -22,6 +22,7 @@ import {
   detectTables,
   isBlank,
   type Cell,
+  type SheetTable,
 } from './sheetTables';
 import {
   EXCEL_ERROR_TOKENS,
@@ -57,13 +58,28 @@ export interface DetectedSheetTable {
   /** 0-based worksheet-grid row, or null when the table has no promoted header. */
   headerRow: number | null;
   columns: string[];
+  /** Kinds inferred from the worksheet grid already in memory; used only to gate inline controls. */
+  columnStatsKind: StatsKind[];
   rowCount: number;
 }
 
+export type DetectedTableFilterOperator =
+  | 'contains'
+  | 'equals'
+  | 'notEquals'
+  | 'gt'
+  | 'gte'
+  | 'lt'
+  | 'lte'
+  | 'between'
+  | 'isBlank'
+  | 'isNotBlank';
+
 export interface DetectedTableFilter {
   column: string;
-  /** Case-insensitive substring matched against the column's displayed value. */
-  value: string;
+  operator: DetectedTableFilterOperator;
+  value?: string;
+  valueTo?: string;
 }
 
 export interface DetectedTableSort {
@@ -306,6 +322,28 @@ function trimTrailingBlanks(rows: readonly Cell[][]): { rows: number; cols: numb
     }
   }
   return { rows: lastRow + 1, cols: lastCol + 1 };
+}
+
+/**
+ * Infer enough type information to hide impossible inline plot buttons without
+ * loading a detected table. The worksheet grid has already been read for
+ * detection, so this is CPU-only and keeps detected tables lazy.
+ */
+function inferDetectedTableKinds(
+  grid: readonly Cell[][],
+  table: SheetTable,
+  nullText: readonly string[]
+): StatsKind[] {
+  const firstDataRow = table.headerRow === null ? table.region.top : table.headerRow + 1;
+  return table.columns.map((_, offset) => {
+    const values: (string | null)[] = [];
+    const column = table.region.left + offset;
+    for (let row = firstDataRow; row < table.region.bottom; row++) {
+      const value = grid[row]?.[column];
+      values.push(isBlank(value) ? null : String(value));
+    }
+    return classifyTextColumn(values, nullText).kind === 'numeric' ? 'numeric' : 'other';
+  });
 }
 
 /**
@@ -1867,6 +1905,7 @@ export class DuckDbFile {
     return (this.detectedSheetTables.get(sheet) ?? []).map((table) => ({
       ...table,
       columns: [...table.columns],
+      columnStatsKind: [...table.columnStatsKind],
     }));
   }
 
@@ -2291,6 +2330,7 @@ export class DuckDbFile {
             right: table.region.right,
             headerRow: table.headerRow,
             columns: [...table.columns],
+            columnStatsKind: inferDetectedTableKinds(grid, table, this.nullText),
             rowCount: table.rowCount,
           });
           // Do not read this range yet. A ranged read_xlsx() still inflates and
@@ -2387,7 +2427,7 @@ export class DuckDbFile {
   /**
    * Build the read-only query represented by one inline worksheet table.
    * Column names are checked against DuckDB's catalog before interpolation;
-   * filter text is always a quoted value, never executable SQL.
+   * filter values are always quoted and converted to the column's own type.
    */
   async buildDetectedTableQuery(
     table: string,
@@ -2407,11 +2447,45 @@ export class DuckDbFile {
       if (!columns.has(filter.column)) {
         throw new Error(`Column "${filter.column}" does not exist in "${table}".`);
       }
-      const value = String(filter.value).slice(0, 4_000);
-      if (value === '') continue;
-      predicates.push(
-        `contains(lower(cast(${quoteIdent(filter.column)} as varchar)), lower(${quoteLiteral(value)}))`
-      );
+      const column = quoteIdent(filter.column);
+      const value = String(filter.value ?? '').slice(0, 4_000);
+      const valueTo = String(filter.valueTo ?? '').slice(0, 4_000);
+      const typed = (candidate: string) => `cast_to_type(${quoteLiteral(candidate)}, ${column})`;
+      switch (filter.operator) {
+        case 'contains':
+          if (value !== '') {
+            predicates.push(`contains(lower(cast(${column} as varchar)), lower(${quoteLiteral(value)}))`);
+          }
+          break;
+        case 'equals':
+          if (value !== '') predicates.push(`${column} = ${typed(value)}`);
+          break;
+        case 'notEquals':
+          if (value !== '') predicates.push(`${column} <> ${typed(value)}`);
+          break;
+        case 'gt':
+        case 'gte':
+        case 'lt':
+        case 'lte': {
+          if (value === '') break;
+          const operator = { gt: '>', gte: '>=', lt: '<', lte: '<=' }[filter.operator];
+          predicates.push(`${column} ${operator} ${typed(value)}`);
+          break;
+        }
+        case 'between':
+          if (value !== '' && valueTo !== '') {
+            predicates.push(`${column} between ${typed(value)} and ${typed(valueTo)}`);
+          }
+          break;
+        case 'isBlank':
+          predicates.push(`(${column} is null or trim(cast(${column} as varchar)) = '')`);
+          break;
+        case 'isNotBlank':
+          predicates.push(`(${column} is not null and trim(cast(${column} as varchar)) <> '')`);
+          break;
+        default:
+          throw new Error('Unsupported table filter operator.');
+      }
     }
 
     let sql = `select * from ${quoteIdent(table)}`;
@@ -2597,6 +2671,10 @@ export class DuckDbFile {
    *     is the one the writer chose, and it is the only one we can stand
    *     behind.
    *
+   * `xIsCategory` is for numeric period labels such as Year. They are valid
+   * axes, but interpreting 2024 as a timestamp would be wrong, so they bypass
+   * the timestamp probe and preserve their stored order as categories.
+   *
    * `maxPoints` is a real cap and is reported, not hidden -- see the caller,
    * which refuses to draw rather than silently truncating. Rows whose x is
    * null are dropped in SQL: they have no position on any axis, and leaving
@@ -2608,7 +2686,8 @@ export class DuckDbFile {
     xColumn: string,
     yColumns: string[],
     xIsText = false,
-    maxPoints = 0
+    maxPoints = 0,
+    xIsCategory = false
   ): Promise<QueryResult & { xAxisMode: 'time' | 'category' }> {
     // Charting may be the first action taken on a detected table (the inline
     // sheet UI does not require a separate preview first). Prepare it before
@@ -2637,7 +2716,9 @@ export class DuckDbFile {
     // downgrade the whole axis, so this is a high bar rather than a perfect
     // one -- and try_cast returning NULL for the failures means they simply
     // drop out of the time-axis query below.
-    const asTime = !xIsText || (await this.textAxisParseRate(inner, xColumn)) >= TEXT_AXIS_MIN_PARSE_RATE;
+    const asTime =
+      !xIsCategory &&
+      (!xIsText || (await this.textAxisParseRate(inner, xColumn)) >= TEXT_AXIS_MIN_PARSE_RATE);
 
     if (asTime) {
       const xExpr = xIsText ? `try_cast(${x} as timestamp)` : x;

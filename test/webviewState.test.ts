@@ -152,6 +152,7 @@ test('an inline sheet-table result updates only that region, not the worksheet r
           right: 3,
           headerRow: 3,
           columns: ['Date', 'Value'],
+          columnStatsKind: ['other', 'numeric'],
           rowCount: 4,
         },
       ],

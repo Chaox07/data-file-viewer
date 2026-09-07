@@ -187,6 +187,7 @@ test('detected tables stay lazy until first use, so opening a sheet reads the wo
           right: 2,
           headerRow: 0,
           columns: ['date', 'left'],
+          columnStatsKind: ['other', 'numeric'],
           rowCount: 2,
         },
         {
@@ -198,6 +199,7 @@ test('detected tables stay lazy until first use, so opening a sheet reads the wo
           right: 5,
           headerRow: 0,
           columns: ['date', 'right'],
+          columnStatsKind: ['other', 'numeric'],
           rowCount: 2,
         },
       ]
@@ -215,20 +217,33 @@ test('detected tables stay lazy until first use, so opening a sheet reads the wo
 
     const first = await file.runDetectedTableQuery(
       detected[0],
-      [{ column: 'date', value: '2020' }],
+      [{ column: 'date', operator: 'contains', value: '2020' }],
       { column: 'left', direction: 'asc' },
       1
     );
     assert.deepEqual(first.rows.map((row) => Number(row[1])), [1]);
     assert.equal(first.totalRows, 2, 'the inline row count confused its display limit with its filter');
     const hostileFilter = await file.runDetectedTableQuery(detected[0], [
-      { column: 'date', value: "2020' or true --" },
+      { column: 'date', operator: 'contains', value: "2020' or true --" },
     ]);
     assert.equal(hostileFilter.rows.length, 0, 'filter text escaped into executable SQL');
     await assert.rejects(
-      file.runDetectedTableQuery(detected[0], [{ column: 'missing', value: 'x' }]),
+      file.runDetectedTableQuery(detected[0], [{ column: 'missing', operator: 'equals', value: 'x' }]),
       /does not exist/
     );
+
+    const exact = await file.runDetectedTableQuery(detected[0], [
+      { column: 'left', operator: 'equals', value: '1' },
+    ]);
+    assert.deepEqual(exact.rows.map((row) => Number(row[1])), [1]);
+    const greater = await file.runDetectedTableQuery(detected[0], [
+      { column: 'left', operator: 'gt', value: '1' },
+    ]);
+    assert.deepEqual(greater.rows.map((row) => Number(row[1])), [2]);
+    const range = await file.runDetectedTableQuery(detected[0], [
+      { column: 'left', operator: 'between', value: '1', valueTo: '2' },
+    ]);
+    assert.equal(range.rows.length, 2);
 
     const kindsAfter = await file.runQuery(
       `select table_name, table_type from information_schema.tables
@@ -286,6 +301,37 @@ test('caching and the marker interpretation compose — the sheet is a table AND
       `select table_type from information_schema.tables where table_name = 'data'`
     );
     assert.equal(String(kind.rows[0][0]), 'BASE TABLE');
+  } finally {
+    await file.dispose();
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('detected-table blank and non-blank filters include empty spreadsheet cells', async () => {
+  const d = dir();
+  const path = await xlsxFile(join(d, 'book.xlsx'), [
+    {
+      name: 'data',
+      rows: [
+        ['date', 'value', 'note'],
+        ['2024-01-01', 1, 'ready'],
+        ['2024-01-02', 2, null],
+        ['2024-01-03', 3, ''],
+      ],
+    },
+  ]);
+  const file = await DuckDbFile.open(path);
+  try {
+    const table = await tableOf(file);
+    const blank = await file.runDetectedTableQuery(table, [
+      { column: 'note', operator: 'isBlank' },
+    ]);
+    assert.deepEqual(blank.rows.map((row) => Number(row[1])), [2, 3]);
+
+    const nonBlank = await file.runDetectedTableQuery(table, [
+      { column: 'note', operator: 'isNotBlank' },
+    ]);
+    assert.deepEqual(nonBlank.rows.map((row) => Number(row[1])), [1]);
   } finally {
     await file.dispose();
     rmSync(d, { recursive: true, force: true });

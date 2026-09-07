@@ -294,7 +294,7 @@ function previewTable(name: string): void {
 // offering a button for, and ask the host to plot one.
 
 /** The x axis for what is currently on screen, or undefined if it has not got one. */
-function chartXAxis(): { column: string; kind: 'datetime' | 'text' } | undefined {
+function chartXAxis(): { column: string; kind: 'datetime' | 'text' | 'category' } | undefined {
   if (!state.lastResult) return undefined;
   return pickXAxis(state.lastResult.columns, state.lastResult.columnStatsKind);
 }
@@ -309,6 +309,7 @@ function requestChart(yColumn: string): void {
     // host is what settles time-axis-vs-category, since only it can ask the
     // database whether the strings parse.
     xIsText: x.kind === 'text',
+    xIsCategory: x.kind === 'category',
     yColumns: [yColumn],
   });
 }
@@ -356,7 +357,7 @@ function applyTableChangeStatus(status: Record<string, TableStatus>): void {
 }
 
 interface InlineTableUiState {
-  filters: Map<string, string>;
+  filters: Map<string, Omit<DetectedTableFilter, 'column'>>;
   sort?: DetectedTableSort;
   result?: {
     columns: string[];
@@ -390,9 +391,7 @@ function sheetTableDisplayLimit(table: DetectedSheetTable): number {
 }
 
 function filtersForMessage(current: InlineTableUiState): DetectedTableFilter[] {
-  return [...current.filters]
-    .filter(([, value]) => value !== '')
-    .map(([column, value]) => ({ column, value }));
+  return [...current.filters].map(([column, filter]) => ({ column, ...filter }));
 }
 
 function requestInlineTable(table: DetectedSheetTable): void {
@@ -427,10 +426,36 @@ function openInlineFilter(anchor: HTMLElement, table: DetectedSheetTable, column
   const title = document.createElement('div');
   title.className = 'stats-title';
   title.textContent = `Filter ${column}`;
+  const existing = current.filters.get(column);
+  const operator = document.createElement('select');
+  operator.className = 'filter-operator';
+  const choices: [DetectedTableFilter['operator'], string][] = [
+    ['contains', 'Contains'],
+    ['equals', 'Equals'],
+    ['notEquals', 'Not equal'],
+    ['gt', 'Greater than'],
+    ['gte', 'Greater than or equal'],
+    ['lt', 'Less than'],
+    ['lte', 'Less than or equal'],
+    ['between', 'Between'],
+    ['isBlank', 'Is blank'],
+    ['isNotBlank', 'Is not blank'],
+  ];
+  for (const [value, label] of choices) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    operator.appendChild(option);
+  }
+  operator.value = existing?.operator ?? 'contains';
   const input = document.createElement('input');
   input.className = 'filter-input';
-  input.placeholder = 'Contains…';
-  input.value = current.filters.get(column) ?? '';
+  input.placeholder = 'Value…';
+  input.value = existing?.value ?? '';
+  const inputTo = document.createElement('input');
+  inputTo.className = 'filter-input';
+  inputTo.placeholder = 'And…';
+  inputTo.value = existing?.valueTo ?? '';
   const actions = document.createElement('div');
   actions.className = 'filter-actions';
   const clear = document.createElement('button');
@@ -440,7 +465,9 @@ function openInlineFilter(anchor: HTMLElement, table: DetectedSheetTable, column
   actions.appendChild(clear);
   actions.appendChild(apply);
   popover.appendChild(title);
+  popover.appendChild(operator);
   popover.appendChild(input);
+  popover.appendChild(inputTo);
   popover.appendChild(actions);
   document.body.appendChild(popover);
   positionPopover(popover, anchor);
@@ -454,19 +481,44 @@ function openInlineFilter(anchor: HTMLElement, table: DetectedSheetTable, column
   };
   window.setTimeout(() => document.addEventListener('click', closeOnOutsideClick, true), 0);
 
-  const commit = (value: string) => {
-    if (value === '') current.filters.delete(column);
-    else current.filters.set(column, value);
+  const selectedOperator = () => operator.value as DetectedTableFilter['operator'];
+  const updateInputs = () => {
+    const selected = selectedOperator();
+    const needsNoValue = selected === 'isBlank' || selected === 'isNotBlank';
+    input.hidden = needsNoValue;
+    inputTo.hidden = selected !== 'between';
+  };
+  updateInputs();
+  operator.addEventListener('change', updateInputs);
+
+  const commit = () => {
+    const selected = selectedOperator();
+    const needsNoValue = selected === 'isBlank' || selected === 'isNotBlank';
+    if (!needsNoValue && (input.value === '' || (selected === 'between' && inputTo.value === ''))) {
+      current.filters.delete(column);
+    } else {
+      current.filters.set(column, {
+        operator: selected,
+        value: needsNoValue ? undefined : input.value,
+        valueTo: selected === 'between' ? inputTo.value : undefined,
+      });
+    }
     closeFilterPopover();
     requestInlineTable(table);
   };
-  clear.addEventListener('click', () => commit(''));
-  apply.addEventListener('click', () => commit(input.value));
-  input.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') commit(input.value);
-    else if (event.key === 'Escape') closeFilterPopover();
+  clear.addEventListener('click', () => {
+    current.filters.delete(column);
+    closeFilterPopover();
+    requestInlineTable(table);
   });
-  window.setTimeout(() => input.focus(), 0);
+  apply.addEventListener('click', commit);
+  for (const field of [input, inputTo]) {
+    field.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') commit();
+      else if (event.key === 'Escape') closeFilterPopover();
+    });
+  }
+  window.setTimeout(() => (input.hidden ? operator : input).focus(), 0);
 }
 
 function requestInlineStats(anchor: HTMLElement, table: DetectedSheetTable, column: string): void {
@@ -918,7 +970,7 @@ function appendInlineHeaderControls(
   filter.className = 'sheet-table-filter';
   filter.classList.toggle('active', current.filters.has(column));
   filter.textContent = '⌕';
-  filter.title = `Filter this table by values containing text in ${column}`;
+  filter.title = `Filter this table by ${column}`;
   filter.addEventListener('click', (event) => {
     event.stopPropagation();
     openInlineFilter(filter, table, column);
@@ -933,19 +985,21 @@ function appendInlineHeaderControls(
     requestInlineStats(stats, table, column);
   });
 
-  const plot = document.createElement('button');
-  plot.className = 'sheet-table-plot';
-  plot.textContent = '📈';
-  plot.title = `Plot the rows shown for ${column}`;
-  plot.addEventListener('click', (event) => {
-    event.stopPropagation();
-    requestInlineChart(table, column);
-  });
-
   controls.appendChild(sort);
   controls.appendChild(filter);
   controls.appendChild(stats);
-  controls.appendChild(plot);
+  const kinds = current.result?.columnStatsKind ?? table.columnStatsKind;
+  if (plottableColumns(table.columns, kinds).includes(column)) {
+    const plot = document.createElement('button');
+    plot.className = 'sheet-table-plot';
+    plot.textContent = '📈';
+    plot.title = `Plot the rows shown for ${column}`;
+    plot.addEventListener('click', (event) => {
+      event.stopPropagation();
+      requestInlineChart(table, column);
+    });
+    controls.appendChild(plot);
+  }
   td.appendChild(controls);
 }
 
