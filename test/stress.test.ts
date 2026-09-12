@@ -16,6 +16,14 @@ import { runCase } from './stress/harness/runner';
  * A case pinned with `knownBug` is expected to fail and does not fail the
  * build. A pinned case that starts PASSING does fail it, deliberately: a stale
  * pin silently disables a regression test for a bug that was fixed once.
+ *
+ * A known failure is marked `todo`, not returned from silently. It used to
+ * return, which put it in the runner's `pass` tally: `npm test` reported
+ * "pass 563, fail 0" while four reproduced defects sat in the code, and a
+ * fifth appearing would not have moved either number. `npm run stress` had
+ * always counted them separately; this makes the two runners agree. node's
+ * `todo` is its own line in the summary, so the count is visible without
+ * reading the report.
  */
 for (const c of allCases()) {
   test(`stress: ${c.name}`, async (t) => {
@@ -32,7 +40,10 @@ for (const c of allCases()) {
       );
     }
 
-    if (outcome.status === 'xfail') return; // known, reported by run_stress
+    if (outcome.status === 'xfail') {
+      t.todo(`known bug: ${c.expect.knownBug}`);
+      return; // reported in full by run_stress
+    }
 
     assert.deepEqual(
       outcome.findings.map((f) => `[${f.severity}] ${f.message}`),
