@@ -91,36 +91,130 @@ test('E17 control: a long numeric identifier read from a CSV stays exact', async
   }
 });
 
-test('a zero-padded identifier column is typed DOUBLE, losing the padding', async (t) => {
+// ===================================================================
+// E20 -- interpretTextColumns casts a text column to DOUBLE
+// ===================================================================
+//
+// NEW on 2026-09-12, not in the 2026-09-09 review. Found while writing the E17
+// control above, and the two belong together: E17 established that the query
+// TRANSPORT is exact, and it is. This is one layer earlier, and it is where the
+// exactness is spent.
+//
+// interpretTextColumns() promotes a VARCHAR column to numbers when the column
+// "demonstrably holds numbers", and markerNullExpr does the promoting with
+//
+//     try_cast(<normalised> as double)
+//
+// -- double, unconditionally, whatever the column actually holds. The guard in
+// front of it (markerResidueExpr, run over the whole column) asks whether every
+// value CAN be cast, not whether the cast keeps the value. `try_cast(
+// '9007199254740993' as double)` succeeds; it just succeeds with a different
+// number. So the check cannot see this loss, by construction.
+//
+// Not DuckDB's doing. `read_csv_auto` types both fixtures below as VARCHAR and
+// returns them intact; the promotion is this project's own and runs after it.
+//
+// EXT-04 owns it. It has to precede EXT-02: there is no point comparing an
+// expected value against a stored one when the expected value is already the
+// wrong number.
+
+test('E20: an exact integer wider than 2^53 is rounded by the numeric promotion', async (t) => {
   t.todo(
-    'NEW on 2026-09-12, not from the 2026-09-09 review, found while writing the ' +
-      'E17 control. DuckDB\'s CSV sniffer types a zero-padded numeric column as ' +
-      'DOUBLE rather than VARCHAR, so the padding is gone -- and because the ' +
-      'whole column is then a double, a neighbouring exact integer is dragged ' +
-      'through it too: 9007199254740993 arrives as ...992. E17 established that ' +
-      'the TRANSPORT is exact; this is the reader typing the column, one layer ' +
-      'earlier, and the loss happens before transport ever sees it. Needs triage ' +
-      'against EXT-02 (edit/display types) and LIB-01 (reader options).'
+    'E20: the promotion casts to DOUBLE regardless of what the column holds, so ' +
+      'any integer past 2^53 is rounded to the nearest representable double -- ' +
+      'and rounded UP as readily as down, which is why two of the three values ' +
+      'below move in different directions. Nothing is logged: every value cast ' +
+      'successfully, so the whole-column residue guard sees a clean column.'
   );
-  const path = join(dir, 'e17-padded.csv');
-  await writeFile(path, 'account\n9007199254740993\n00123456789012345\n', 'utf8');
+  const path = join(dir, 'e20-wide.csv');
+  // The column is VARCHAR because of the '007' row -- that is what stops DuckDB
+  // typing it BIGINT (the E17 control above, where it does). Once it is text,
+  // the promotion takes it, and takes the exact integers with it.
+  await writeFile(path, 'id\n9007199254740993\n9007199254740995\n007\n', 'utf8');
   const file = await DuckDbFile.open(path);
   try {
-    const typed = await file.runQuery('select typeof(account) as t from "e17-padded" limit 1');
-    assert.equal(
-      String(cell(typed, 0, 't')),
-      'DOUBLE',
-      'the column is no longer typed DOUBLE; re-read this finding'
-    );
+    const typed = await file.runQuery('select typeof(id) as t from "e20-wide" limit 1');
+    assert.equal(String(cell(typed, 0, 't')), 'DOUBLE', 'the column is no longer promoted');
 
-    const result = await file.runQuery('select account from "e17-padded" order by 1');
-    const at = result.columns.indexOf('account');
-    const seen = result.rows.map((r) => String(r[at]));
+    const result = await file.runQuery('select id from "e20-wide"');
+    const at = result.columns.indexOf('id');
     assert.deepEqual(
-      seen,
-      ['123456789012345', '9007199254740992'],
+      result.rows.map((r) => String(r[at])),
+      ['9007199254740992', '9007199254740996', '7'],
       'the loss this pins has changed shape; re-read the finding'
     );
+  } finally {
+    file.dispose();
+  }
+});
+
+test('E20: the same workbook shows two different sets of values in two of its objects', async (t) => {
+  t.todo(
+    'E20, and the sharpest form of it. The verbatim sheet is read all_varchar ' +
+      'and is EXACT -- so the file is fine and the values are there. The ' +
+      'detected table inside that same sheet is the promoted one, and it is the ' +
+      'object the grid sorts, the stats panel summarises, the chart plots and a ' +
+      'cell edit addresses. One open workbook, two answers, nothing said.'
+  );
+  // Text cells, so the sheet holds exactly these characters.
+  const path = join(dir, 'e20-sheet.xlsx');
+  const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+<row r="1"><c r="A1" t="inlineStr"><is><t>id</t></is></c><c r="B1" t="inlineStr"><is><t>note</t></is></c></row>
+<row r="2"><c r="A2" t="inlineStr"><is><t>9007199254740993</t></is></c><c r="B2" t="inlineStr"><is><t>a</t></is></c></row>
+<row r="3"><c r="A3" t="inlineStr"><is><t>9007199254740995</t></is></c><c r="B3" t="inlineStr"><is><t>b</t></is></c></row>
+<row r="4"><c r="A4" t="inlineStr"><is><t>007</t></is></c><c r="B4" t="inlineStr"><is><t>c</t></is></c></row>
+</sheetData></worksheet>`;
+  const zipped = zipSync({
+    '[Content_Types].xml': strToU8(CONTENT_TYPES),
+    '_rels/.rels': strToU8(
+      `<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdW" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`
+    ),
+    'xl/workbook.xml': strToU8(WORKBOOK),
+    'xl/_rels/workbook.xml.rels': strToU8(RELS),
+    'xl/worksheets/sheet1.xml': strToU8(sheet),
+  });
+  await writeFile(path, Buffer.from(zipped));
+
+  const file = await DuckDbFile.open(path);
+  try {
+    const verbatim = await file.runQuery('select "A" from "data"');
+    const seenVerbatim = verbatim.rows.map((r) => String(r[0])).slice(1);
+    assert.deepEqual(
+      seenVerbatim,
+      ['9007199254740993', '9007199254740995', '007'],
+      'the verbatim sheet is meant to be the file, exactly -- if this moved, the ' +
+        'control this finding rests on is gone and E20 needs re-establishing'
+    );
+
+    const table = (await file.listTables()).find((n) => n.startsWith('data · Table '));
+    assert.ok(table, 'no table was detected inside the sheet');
+    const typed = await file.runQuery(`select * from "${table}"`);
+    const at = typed.columns.indexOf('id');
+    assert.deepEqual(
+      typed.rows.map((r) => String(r[at])),
+      ['9007199254740992', '9007199254740996', '7'],
+      'the detected table no longer disagrees with its own sheet; re-read the finding'
+    );
+  } finally {
+    file.dispose();
+  }
+});
+
+test('E20 control: DuckDB itself returns both fixtures intact', async () => {
+  // The control that fixes the blame. Neither loss is DuckDB's CSV sniffer:
+  // read_csv_auto types this column VARCHAR and hands back every character.
+  // Whatever EXT-04 does, it must not "fix" this by reaching for a reader
+  // option -- the reader was already right.
+  const path = join(dir, 'e20-control.csv');
+  await writeFile(path, 'id\n9007199254740993\n007\n', 'utf8');
+  const file = await DuckDbFile.open(join(dir, 'e17.csv'));
+  try {
+    const result = await file.runQuery(
+      `select id from read_csv_auto('${path.replace(/'/g, "''")}')`
+    );
+    const at = result.columns.indexOf('id');
+    assert.deepEqual(result.rows.map((r) => String(r[at])), ['9007199254740993', '007']);
   } finally {
     file.dispose();
   }
