@@ -201,6 +201,164 @@ test('E20: the same workbook shows two different sets of values in two of its ob
   }
 });
 
+/**
+ * The same three values written into formats that DECLARE their column types.
+ *
+ * This is the sharper half of E20, and the reason it is not merely a CSV
+ * problem. interpretTextColumns already refuses to touch attached .duckdb and
+ * .sqlite tables, and its own comment gives the principle: "Those are real
+ * tables with a schema the file itself declares; a column is VARCHAR there
+ * because its writer said so. Reinterpreting untyped text out of a spreadsheet
+ * is a reading of an ambiguous file — overriding a stated schema is a different
+ * and much larger claim, and not one a viewer should make."
+ *
+ * Parquet, Arrow and Feather declare their schemas too. Their writers said so
+ * as plainly as SQLite's did. The exclusion is drawn around the storage
+ * mechanism -- attached database versus view -- rather than around the
+ * principle it states, so every one of them is promoted, and the claim the
+ * comment calls too large to make is made on each of them.
+ */
+
+/** The three values as a one-batch Arrow table with an explicit Utf8 `id`. */
+async function arrowTable() {
+  const { Table, Utf8, vectorFromArray } = await import('apache-arrow');
+  return new Table({
+    id: vectorFromArray(['9007199254740993', '9007199254740995', '007'], new Utf8()),
+    note: vectorFromArray(['a', 'b', 'c'], new Utf8()),
+  });
+}
+
+/**
+ * Write the table at `path` in one of Arrow's two IPC encodings.
+ *
+ * Both, because the handoff distinguishes them and this project has been bitten
+ * by the difference before: `.arrows` is the STREAM encoding and `.feather` the
+ * FILE one, and a fixture covering one says nothing about the other.
+ * apache-arrow rather than DuckDB, which has no arrow COPY function in this
+ * build -- and which would in any case make the fixture and the reader the same
+ * library.
+ */
+async function writeArrow(path: string, encoding: 'stream' | 'file'): Promise<void> {
+  const arrow = await import('apache-arrow');
+  const { createWriteStream } = await import('node:fs');
+  const writer =
+    encoding === 'file' ? new arrow.RecordBatchFileWriter() : new arrow.RecordBatchStreamWriter();
+  const out = createWriteStream(path);
+  const done = new Promise<void>((resolve, reject) => {
+    out.on('finish', () => resolve());
+    out.on('error', reject);
+  });
+  writer.toNodeStream().pipe(out);
+  for (const batch of (await arrowTable()).batches) writer.write(batch);
+  writer.finish();
+  await done;
+}
+
+type TypedFixture = { ext: string; write: (path: string) => Promise<void>; what: string };
+
+const TYPED_FORMATS: TypedFixture[] = [
+  {
+    ext: 'parquet',
+    what: 'Parquet, whose schema names the column a BYTE_ARRAY/UTF8',
+    write: async (path) => {
+      // Written by DuckDB itself, so the column is VARCHAR because the writer
+      // said so -- no sniffing anywhere in the fixture's provenance.
+      const seed = await DuckDbFile.open(join(dir, 'e17.csv'));
+      try {
+        await seed.runQuery(
+          `copy (select * from (values ('9007199254740993','a'),('9007199254740995','b'),('007','c')) ` +
+            `t(id, note)) to '${path.replace(/'/g, "''")}' (FORMAT parquet)`
+        );
+      } finally {
+        seed.dispose();
+      }
+    },
+  },
+  {
+    ext: 'arrows',
+    what: 'Arrow IPC STREAM, whose schema names the field Utf8',
+    write: (path) => writeArrow(path, 'stream'),
+  },
+  {
+    ext: 'feather',
+    what: 'Arrow IPC FILE (Feather), the other encoding of the same declaration',
+    write: (path) => writeArrow(path, 'file'),
+  },
+];
+
+for (const { ext, write, what } of TYPED_FORMATS) {
+  test(`E20: a .${ext} column declared as text is read back as DOUBLE`, async (t) => {
+    t.todo(
+      `E20: the file declares this column a string and the viewer returns doubles. ` +
+        `interpretTextColumns excludes attached .duckdb/.sqlite tables precisely ` +
+        `because their schema is declared -- but Parquet, Arrow and Feather declare ` +
+        `theirs just as plainly, and are views, so the exclusion misses them. The ` +
+        `values are lost against the file's own stated type, which is a stronger ` +
+        `claim than the CSV case: there is nothing ambiguous left to interpret.`
+    );
+    const path = join(dir, `e20-typed.${ext}`);
+    await write(path);
+
+    const file = await DuckDbFile.open(path);
+    try {
+      const table = (await file.listTables())[0];
+      const typed = await file.runQuery(`select typeof(id) as t from "${table}" limit 1`);
+      assert.equal(
+        String(cell(typed, 0, 't')),
+        'DOUBLE',
+        `the .${ext} column is no longer promoted; re-read this finding`
+      );
+      const result = await file.runQuery(`select id from "${table}"`);
+      const at = result.columns.indexOf('id');
+      assert.deepEqual(
+        result.rows.map((r) => String(r[at])),
+        ['9007199254740992', '9007199254740996', '7'],
+        'the loss this pins has changed shape; re-read the finding'
+      );
+    } finally {
+      file.dispose();
+    }
+  });
+
+  test(`E20 control: the .${ext} file really does declare the column as text`, async () => {
+    // Without this the test above could pass because the fixture was written
+    // numeric, which would make it evidence of nothing at all. Read straight
+    // out of the file with apache-arrow or DuckDB's own reader -- not through
+    // DuckDbFile, which is the thing under test.
+    const path = join(dir, `e20-typed-control.${ext}`);
+    await write(path);
+
+    if (ext === 'parquet') {
+      const seed = await DuckDbFile.open(join(dir, 'e17.csv'));
+      try {
+        const declared = await seed.runQuery(
+          `select typeof(id) as t from '${path.replace(/'/g, "''")}' limit 1`
+        );
+        assert.equal(String(cell(declared, 0, 't')), 'VARCHAR', what);
+        const raw = await seed.runQuery(`select id from '${path.replace(/'/g, "''")}'`);
+        assert.deepEqual(
+          raw.rows.map((r) => String(r[0])),
+          ['9007199254740993', '9007199254740995', '007']
+        );
+      } finally {
+        seed.dispose();
+      }
+      return;
+    }
+
+    const arrow = await import('apache-arrow');
+    const reader = await arrow.RecordBatchReader.from(await readFile(path));
+    const table = new arrow.Table(await reader.readAll());
+    assert.equal(String(table.schema.fields[0].type), 'Utf8', what);
+    assert.deepEqual(
+      table.getChild('id')!.toArray() instanceof Array
+        ? (table.getChild('id')!.toArray() as unknown[]).map(String)
+        : Array.from(table.getChild('id')!).map(String),
+      ['9007199254740993', '9007199254740995', '007']
+    );
+  });
+}
+
 test('E20 control: DuckDB itself returns both fixtures intact', async () => {
   // The control that fixes the blame. Neither loss is DuckDB's CSV sniffer:
   // read_csv_auto types this column VARCHAR and hands back every character.
