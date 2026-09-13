@@ -26,10 +26,12 @@ import {
 } from './sheetTables';
 import {
   EXCEL_ERROR_TOKENS,
+  type PromotionTarget,
   classifyTextColumn,
   isExcelError,
   markerBlankExpr,
   markerCountExpr,
+  markerFidelityExpr,
   markerNullExpr,
   markerResidueExpr,
   nonMarkerCountExpr,
@@ -577,6 +579,30 @@ function csvReadExpr(filePath: string, locale: NumberLocale | null): string {
 const TEXT_COLUMN_SAMPLE_ROWS = 2000;
 
 /**
+ * Formats whose files state their own column types (E21).
+ *
+ * A column is text in one of these because its writer wrote down that it is
+ * text, the same way a SQLite column is. `.duckdb` and `.sqlite` are absent
+ * only because they are attached rather than exposed as views and so never
+ * reach interpretTextColumns at all; they belong to this set in principle and
+ * a test asserts they stay out.
+ *
+ * The three that are NOT here are the point of the distinction. A CSV has no
+ * types at all. A worksheet cell carries a display format, not a column type,
+ * and a whole column of them may be text only because one cell said `#N/A`.
+ * A kdb file is parsed by this project's own reader. Those are ambiguous
+ * files, and reading them is what this function is for.
+ */
+const DECLARES_COLUMN_TYPES: ReadonlySet<FileKind> = new Set<FileKind>([
+  'parquet',
+  'arrow',
+  'feather',
+  'dta',
+  'duckdb',
+  'sqlite',
+]);
+
+/**
  * Read a view's text columns as numbers where they demonstrably are numbers
  * with Excel error markers in them, and report what was done.
  *
@@ -588,11 +614,19 @@ const TEXT_COLUMN_SAMPLE_ROWS = 2000;
  * the ViewSource rather than only in the catalog is what lets the backup copy
  * be read the same way.
  *
- * DELIBERATELY NOT applied to attached .duckdb/.sqlite tables. Those are real
- * tables with a schema the file itself declares; a column is VARCHAR there
- * because its writer said so. Reinterpreting untyped text out of a
- * spreadsheet is a reading of an ambiguous file — overriding a stated schema
- * is a different and much larger claim, and not one a viewer should make.
+ * DELIBERATELY NOT applied to a source that DECLARES its column types. A column
+ * is VARCHAR there because its writer said so. Reinterpreting untyped text out
+ * of a spreadsheet is a reading of an ambiguous file — overriding a stated
+ * schema is a different and much larger claim, and not one a viewer should
+ * make.
+ *
+ * That rule used to be drawn around the storage MECHANISM — attached database
+ * versus view — which meant it covered .duckdb and .sqlite and missed Parquet,
+ * Arrow, Feather and .dta, four formats that declare their types just as
+ * plainly. A Parquet footer naming a column UTF8 leaves nothing ambiguous to
+ * interpret, and the claim this comment calls too large to make was being made
+ * on every one of them (E21). The boundary is now drawn around the principle
+ * itself: see DECLARES_COLUMN_TYPES.
  *
  * Returns the notices for openWarnings. Nothing is written to the file.
  */
@@ -601,9 +635,11 @@ async function interpretTextColumns(
   viewName: string,
   label: string,
   source: ViewSource,
-  tokens: readonly string[]
+  tokens: readonly string[],
+  kind: FileKind
 ): Promise<string[]> {
   if (tokens.length === 0) return [];
+  if (DECLARES_COLUMN_TYPES.has(kind)) return [];
   const view = quoteIdent(viewName);
 
   let names: string[];
@@ -646,13 +682,15 @@ async function interpretTextColumns(
     return [];
   }
 
-  const candidates: { column: string; locale: NumberLocale }[] = [];
+  const candidates: { column: string; locale: NumberLocale; integral: boolean }[] = [];
   const blanked: string[] = [];
   const refused: { column: string; residue: string[] }[] = [];
+  const unpreserved: string[] = [];
   for (const column of textColumns) {
     const values = sampled.get(column) ?? [];
     const verdict = classifyTextColumn(values, tokens);
-    if (verdict.kind === 'numeric') candidates.push({ column, locale: verdict.locale });
+    if (verdict.kind === 'numeric')
+      candidates.push({ column, locale: verdict.locale, integral: verdict.integral });
     else if (verdict.kind === 'markers-only') blanked.push(column);
     else if (verdict.reason !== 'empty' && values.some((v) => v !== null && isExcelError(v, tokens))) {
       // Only worth a notice when the column actually holds markers: that is a
@@ -670,11 +708,21 @@ async function interpretTextColumns(
   // silently become NULL, indistinguishable from the markers. Measured on
   // Raw_Data: 0.77s for 70 columns x 16,803 rows, so there is no case for
   // sampling it.
+  //
+  // The fidelity probes ride in the SAME query, which is why choosing an exact
+  // type costs nothing: the scan is what is expensive and there is still only
+  // one of it. An integral column asks about both integer widths at once rather
+  // than making two passes to find out that 18 digits were not enough.
   let counts: number[] = [];
+  const PROBES_PER_CANDIDATE = 4;
   const probes = [
     ...candidates.flatMap((c) => [
       markerCountExpr(c.column, tokens),
       markerResidueExpr(c.column, c.locale, tokens),
+      // For a non-integral column both slots ask about `double`, so the shape
+      // of the result stays rectangular and the indexing below stays simple.
+      markerFidelityExpr(c.column, c.locale, c.integral ? 'bigint' : 'double', tokens),
+      markerFidelityExpr(c.column, c.locale, c.integral ? 'hugeint' : 'double', tokens),
     ]),
     // The same question asked of a "nothing but markers" column: the sample
     // said it was empty, and one value anywhere in it says otherwise.
@@ -687,30 +735,48 @@ async function interpretTextColumns(
     return [];
   }
 
-  const converted: { column: string; locale: NumberLocale; markers: number }[] = [];
+  const converted: { column: string; locale: NumberLocale; target: PromotionTarget; markers: number }[] = [];
   candidates.forEach((c, i) => {
-    const markers = counts[2 * i] ?? 0;
-    const residue = counts[2 * i + 1] ?? 0;
-    if (residue > 0) refused.push({ column: c.column, residue: [] });
-    else converted.push({ ...c, markers });
+    const base = PROBES_PER_CANDIDATE * i;
+    const markers = counts[base] ?? 0;
+    const residue = counts[base + 1] ?? 0;
+    if (residue > 0) {
+      refused.push({ column: c.column, residue: [] });
+      return;
+    }
+    // The narrowest type that keeps every value. For an integral column that is
+    // bigint, then hugeint; for anything else, double. A column where none of
+    // them holds is left as text and SAID so -- promoting it would mean
+    // showing a number the file does not contain, which is the finding.
+    const target: PromotionTarget | null = c.integral
+      ? (counts[base + 2] ?? 0) === 0
+        ? 'bigint'
+        : (counts[base + 3] ?? 0) === 0
+          ? 'hugeint'
+          : null
+      : (counts[base + 2] ?? 0) === 0
+        ? 'double'
+        : null;
+    if (target === null) unpreserved.push(c.column);
+    else converted.push({ column: c.column, locale: c.locale, target, markers });
   });
   const blankedConfirmed: string[] = [];
   blanked.forEach((column, i) => {
-    if ((counts[2 * candidates.length + i] ?? 0) === 0) blankedConfirmed.push(column);
+    if ((counts[PROBES_PER_CANDIDATE * candidates.length + i] ?? 0) === 0) blankedConfirmed.push(column);
     // The sample saw only markers and the whole column disagrees. We have no
     // reading for values we never looked at, so the column keeps its text.
     else refused.push({ column, residue: [] });
   });
 
   if (converted.length === 0 && blankedConfirmed.length === 0) {
-    return refused.map(refusalNotice);
+    return [...refused.map(refusalNotice), ...unpreservedNotice(unpreserved)];
   }
 
   const byName = new Map(converted.map((c) => [c.column, c]));
   const blankSet = new Set(blankedConfirmed);
   const projection = names.map((name) => {
     const c = byName.get(name);
-    if (c) return `${markerNullExpr(name, c.locale, tokens)} as ${quoteIdent(name)}`;
+    if (c) return `${markerNullExpr(name, c.locale, c.target, tokens)} as ${quoteIdent(name)}`;
     // A column of nothing but markers: they still become NULL, because that is
     // what they mean, but no type is invented for a column that never showed
     // one. It stays VARCHAR, and every value in it is now empty.
@@ -758,7 +824,34 @@ async function interpretTextColumns(
     );
   }
   notices.push(...refused.map(refusalNotice));
+  notices.push(...unpreservedNotice(unpreserved));
   return notices;
+}
+
+/**
+ * Columns that ARE numbers and still keep their text, because no type this
+ * reader has would hold them without changing them.
+ *
+ * Worth its own notice rather than folding into refusalNotice, because it is a
+ * different thing to be told. A refused column holds something that is not a
+ * number; this one holds nothing but numbers and is still not promoted, which
+ * is surprising enough that saying only "left as text" would look like a bug.
+ *
+ * The two cases it covers are an identifier with leading zeros -- where `007`
+ * and `7` are different values and the padding is the data -- and an integer
+ * too wide for a 128-bit exact type, where the only remaining reading is an
+ * approximate one.
+ */
+function unpreservedNotice(columns: readonly string[]): string[] {
+  if (columns.length === 0) return [];
+  const n = columns.length;
+  return [
+    `${n} column${n === 1 ? '' : 's'} (${columns.slice(0, 3).map((c) => `"${c}"`).join(', ')}` +
+      `${n > 3 ? ', …' : ''}) hold only numbers but are shown as text: reading them as ` +
+      `numbers would change a value — a leading zero is part of an identifier, and an ` +
+      `integer too wide for an exact type can only be stored approximately. ` +
+      `They will sort and filter as text.`,
+  ];
 }
 
 /**
@@ -1813,7 +1906,9 @@ export class DuckDbFile {
       for (const [view, source] of viewSources) {
         if (source.derived) continue;
         openWarnings.push(
-          ...(await interpretTextColumns(connection, view, viewLabels.get(view) ?? view, source, nullText))
+          ...(await interpretTextColumns(
+            connection, view, viewLabels.get(view) ?? view, source, nullText, kind
+          ))
         );
       }
     }
@@ -2462,7 +2557,7 @@ export class DuckDbFile {
     // stages have run; neither helper throws for an unreadable optional view.
     await cacheSheetAsTable(this.connection, name, source);
     this.lateWarnings.push(
-      ...(await interpretTextColumns(this.connection, name, `"${name}"`, source, this.nullText))
+      ...(await interpretTextColumns(this.connection, name, `"${name}"`, source, this.nullText, this.kind))
     );
     source.prepared = true;
   }

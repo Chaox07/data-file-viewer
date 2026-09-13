@@ -288,6 +288,37 @@ def build_pandas() -> None:
     except Exception as exc:
         skipped.append(f"pandas dta: {exc}")
 
+    try:
+        # EXT-04 / E21. A .dta whose `id` column is DECLARED a string, carrying
+        # two exact integers either side of 2^53 and one padded identifier.
+        #
+        # It is here rather than in the TypeScript tests because neither DuckDB
+        # nor apache-arrow can write a .dta at all -- DuckDB's dta extension
+        # reads only -- so a fixture written by the reader's own library is not
+        # available even in principle. That is exactly what Tier B is for, and
+        # it makes this the strongest fixture of the four declared-type formats:
+        # nothing in its provenance has been anywhere near the reader.
+        #
+        # The values are the same three the Parquet, Arrow and Feather fixtures
+        # in test/integrityFindings.test.ts carry, so the four declarations are
+        # provably about the same data.
+        declared = pd.DataFrame(
+            {
+                "id": ["9007199254740993", "9007199254740995", "007"],
+                "note": ["a", "b", "c"],
+            }
+        )
+        declared.to_stata(OUT / "pandas-declared-text.dta", write_index=False, version=118)
+        record(
+            OUT / "pandas-declared-text.dta",
+            "pandas",
+            "Stata .dta declaring `id` a string: EXT-04's fixture for a stated schema "
+            "the viewer must not override (E21)",
+            expected=None,
+        )
+    except Exception as exc:
+        skipped.append(f"pandas declared-text dta: {exc}")
+
 
 def build_duckdb_python() -> None:
     import duckdb

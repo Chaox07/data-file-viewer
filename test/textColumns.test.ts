@@ -141,14 +141,14 @@ async function column(sql: string): Promise<unknown[]> {
 
 test('markerNullExpr nulls the markers and reads the numbers, under en', async () => {
   const values = await column(
-    `select ${markerNullExpr('v', 'en')} from (values ('1.5'), ('NA'), ('1,234.56'), ('#n/a'), (' 2.5 ')) t(v)`
+    `select ${markerNullExpr('v', 'en', 'double')} from (values ('1.5'), ('NA'), ('1,234.56'), ('#n/a'), (' 2.5 ')) t(v)`
   );
   assert.deepEqual(values, [1.5, null, 1234.56, null, 2.5]);
 });
 
 test('markerNullExpr reads Turkish numbers the way parseEu does', async () => {
   const values = await column(
-    `select ${markerNullExpr('v', 'eu')} from (values ('1.794.446,52'), ('NA'), ('12,5')) t(v)`
+    `select ${markerNullExpr('v', 'eu', 'double')} from (values ('1.794.446,52'), ('NA'), ('12,5')) t(v)`
   );
   assert.deepEqual(values, [1794446.52, null, 12.5]);
 });
@@ -182,14 +182,14 @@ test('markerBlankExpr empties the markers without inventing a type', async () =>
 
 test('a column name with a quote in it does not break out of its identifier', async () => {
   const values = await column(
-    `select ${markerNullExpr('od"d', 'en')} from (values ('1.5'), ('NA')) t("od""d")`
+    `select ${markerNullExpr('od"d', 'en', 'double')} from (values ('1.5'), ('NA')) t("od""d")`
   );
   assert.deepEqual(values, [1.5, null]);
 });
 
 test('a token with a quote in it does not break out of its literal', async () => {
   const values = await column(
-    `select ${markerNullExpr('v', 'en', ["it's missing"])} from (values ('1.5'), ('it''s missing')) t(v)`
+    `select ${markerNullExpr('v', 'en', 'double', ["it's missing"])} from (values ('1.5'), ('it''s missing')) t(v)`
   );
   assert.deepEqual(values, [1.5, null]);
 });
