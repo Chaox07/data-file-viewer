@@ -947,7 +947,9 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
         nullText: nullTextSetting(),
         sheetTables: sheetTablesSetting(),
       });
-      if (file.isReadOnly()) {
+      // A format that opens read-only by design says why in its own open
+      // warning below; "already open elsewhere" would be wrong about it.
+      if (file.isReadOnly() && !file.isReadOnlyByFormat()) {
         vscode.window.showWarningMessage(
           `${basename(uri.fsPath)}: opened read-only — this file is already open elsewhere. Edits will fail until the other handle is released.`
         );

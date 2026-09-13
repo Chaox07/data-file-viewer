@@ -10,7 +10,8 @@ import {
   StatementType,
 } from '@duckdb/node-api';
 import { basename, dirname, extname, join } from 'node:path';
-import { chmod, copyFile, mkdtemp, open, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdtemp, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
@@ -1530,8 +1531,20 @@ export class DuckDbFile {
     private readonly nullText: readonly string[] = EXCEL_ERROR_TOKENS
   ) {}
 
+  /**
+   * The file's modification time and size when the table editing works from
+   * was last read or written. writeBackFlatFile refuses to replace a file that
+   * no longer matches it -- another program wrote it in between.
+   */
+  private diskStamp: { mtimeMs: number; size: number } | undefined;
+
   isReadOnly(): boolean {
     return this.readOnly;
+  }
+
+  /** Read-only because of what the file IS (a .dta), not because it is locked. */
+  isReadOnlyByFormat(): boolean {
+    return this.kind === 'dta';
   }
 
   hasSibling(): boolean {
@@ -1931,6 +1944,22 @@ export class DuckDbFile {
     // this flag. Without it, "Live implies read-only" held for .duckdb/.sqlite
     // and quietly didn't for flat files.
     if (forceReadOnly) readOnly = true;
+
+    // A .dta opens for viewing only. Saving an edit rewrote the whole file
+    // through DuckDB's dta writer, which measured (EXT-01, 2026-09-13) turned a
+    // v117 file into v119 and dropped its dataset label, variable labels and
+    // value labels -- and afterwards pandas read an untouched string column
+    // (007, 010, 123) as 16777218, 33554434, 50331650 while this viewer still
+    // read the original text. Two readers disagreeing about cells nobody edited
+    // is not a save this viewer should offer.
+    if (kind === 'dta' && !readOnly) {
+      readOnly = true;
+      openWarnings.push(
+        `"${basename(path)}" is open read-only. Saving an edit to a Stata file would rewrite it ` +
+          `in a newer format without its dataset, variable and value labels, and other programs ` +
+          `can read the rewritten file differently.`
+      );
+    }
 
     let siblingCatalogName: string | undefined;
     let siblingIsSqlite = false;
@@ -3351,6 +3380,9 @@ export class DuckDbFile {
   private async materializeIfNeeded(): Promise<void> {
     if (this.materialized || !this.isFlatFileKind()) return;
     const tmpName = `${this.mainObjectName}__dfv_materialize`;
+    // Stamped BEFORE the read, so a write that lands while the table is being
+    // copied counts as a change on disk rather than as the state it was read from.
+    const source = await stat(this.path);
     await this.connection.run('begin transaction');
     try {
       await this.connection.run(
@@ -3364,6 +3396,7 @@ export class DuckDbFile {
       throw err;
     }
     this.materialized = true;
+    this.diskStamp = { mtimeMs: source.mtimeMs, size: source.size };
   }
 
   /**
@@ -3388,6 +3421,11 @@ export class DuckDbFile {
     // other kind here can be rewritten wholesale from the table DuckDB holds; an
     // .xlsx cannot, because that table is one sheet of many and holds none of
     // what makes a workbook a workbook. See xlsxWrite.ts.
+    // The grid already hides the edit affordance on a read-only file; this is
+    // the same promise kept one layer down, where the write actually happens.
+    if (this.readOnly) {
+      throw new Error(`"${basename(this.path)}" is open read-only, so it cannot be edited.`);
+    }
     if (this.kind === 'xlsx') {
       return this.updateXlsxCell(table, column, newValue, rowValues, onStatus);
     }
@@ -3411,12 +3449,46 @@ export class DuckDbFile {
     // which is already handled as a safe, surfaced error).
     const values = [newValue, ...whereCols.map((c) => rowValues[c])] as DuckDBValue[];
 
-    const result = await this.connection.run(sql, values);
-    const rowsChanged = result.rowsChanged;
+    if (!this.isFlatFileKind()) {
+      return (await this.connection.run(sql, values)).rowsChanged;
+    }
 
-    if (rowsChanged > 0 && this.isFlatFileKind()) {
-      onStatus?.('Saving…');
-      await this.writeBackFlatFile();
+    // A flat file is edited in two places -- the materialized table and the
+    // file on disk -- and they have to agree after every outcome. The UPDATE
+    // used to commit first and the write-back to follow, so a write-back that
+    // failed (a full disk, a revoked permission, a file changed underneath)
+    // left the table holding a value the file did not, and every later query
+    // and write-back worked from it (E15). Now the UPDATE stays uncommitted
+    // until the file is published: the write-back reads it inside the same
+    // transaction, and any failure before publication rolls it back.
+    await this.connection.run('begin transaction');
+    let rowsChanged: number;
+    try {
+      rowsChanged = (await this.connection.run(sql, values)).rowsChanged;
+      if (rowsChanged > 0) {
+        onStatus?.('Saving…');
+        await this.writeBackFlatFile();
+      }
+    } catch (err) {
+      await this.connection.run('rollback').catch(() => undefined);
+      throw err;
+    }
+    // Published. From here the file holds the edit, so a failure is not a
+    // failed edit and must not be reported as one -- the table is brought in
+    // line with the file instead, and only if even that fails is the user told
+    // the grid is behind.
+    try {
+      await this.connection.run('commit');
+    } catch {
+      await this.connection.run('rollback').catch(() => undefined);
+      try {
+        await this.connection.run(sql, values);
+      } catch {
+        this.lateWarnings.push(
+          `The edit was saved to the file, but "${table}" could not be updated to match — ` +
+            `the grid may show the previous value until you reopen the file.`
+        );
+      }
     }
     return rowsChanged;
   }
@@ -3554,42 +3626,69 @@ export class DuckDbFile {
    * formatting normalization (e.g. numeric precision, quoting).
    */
   private async writeBackFlatFile(): Promise<void> {
-    const filePath = this.path.replace(/'/g, "''");
     const table = quoteIdent(this.mainObjectName);
-    if (this.kind === 'csv') {
-      await this.connection.run(`copy ${table} to '${filePath}' (format csv, header true)`);
-    } else if (this.kind === 'parquet') {
-      await this.connection.run(`copy ${table} to '${filePath}' (format parquet)`);
-    } else if (this.kind === 'dta') {
-      // Outputs Stata format 119 (Stata 15) — the dta extension's write
-      // format, regardless of the original file's own format version.
-      await this.connection.run(`copy ${table} to '${filePath}' (format dta)`);
-    } else if (this.kind === 'arrow') {
-      await this.connection.run(`copy ${table} to '${filePath}' (format arrow)`);
-    } else if (this.kind === 'feather') {
-      // Two steps, because DuckDB writes only the stream encoding and the file
-      // this came from is the file encoding. Writing the stream bytes straight
-      // into the .feather path would "work" -- the viewer would even reopen it,
-      // since the kind is sniffed from magic bytes rather than the extension --
-      // and would hand every OTHER reader a file whose contents no longer match
-      // its name. pyarrow.feather.read_feather() and pandas.read_feather() both
-      // refuse it.
-      //
-      // Written to a temp file and moved into place, so an interrupted save
-      // leaves the original intact rather than half a table.
-      const tempDir = await mkdtemp(join(tmpdir(), 'dfv-feather-save-'));
-      try {
-        const streamPath = join(tempDir, 'out.arrows');
-        const featherPath = join(tempDir, 'out.feather');
-        await this.connection.run(`copy ${table} to '${streamPath.replace(/'/g, "''")}' (format arrow)`);
-        await streamArrowStreamToFeather(streamPath, featherPath);
-        // copyFile rather than rename: the temp dir is in the OS temp location,
-        // which is routinely a different filesystem from the user's file, and
-        // rename across devices fails with EXDEV.
-        await copyFile(featherPath, this.path);
-      } finally {
-        await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+    const literal = (p: string) => p.replace(/'/g, "''");
+    const format =
+      this.kind === 'csv' ? 'csv, header true'
+      : this.kind === 'parquet' ? 'parquet'
+      // Outputs Stata format 119 (Stata 15) regardless of the original's
+      // version. Unreachable while .dta opens read-only; see open().
+      : this.kind === 'dta' ? 'dta'
+      : this.kind === 'arrow' || this.kind === 'feather' ? 'arrow'
+      : undefined;
+    if (!format) return;
+
+    // Written beside the file under a name this save owns, then renamed over
+    // it. Every kind except Feather used to COPY straight onto the file, so a
+    // save that failed part-way left half a table where the whole one had
+    // been; Feather staged, but in the OS temp directory, which is routinely a
+    // different filesystem -- so it had to copyFile into place, which is not
+    // atomic either. A sibling is on the same filesystem, so rename is.
+    const staging = join(
+      dirname(this.path),
+      `.${basename(this.path)}.${randomBytes(4).toString('hex')}.saving${extname(this.path)}`
+    );
+    let tempDir: string | undefined;
+    try {
+      const current = await stat(this.path);
+      // The table was read from the file as it stood when editing began. If
+      // another program has written the file since, rewriting it from the
+      // table would silently discard that program's change.
+      if (
+        this.diskStamp &&
+        (current.mtimeMs !== this.diskStamp.mtimeMs || current.size !== this.diskStamp.size)
+      ) {
+        throw new Error(
+          `"${basename(this.path)}" was changed on disk by another program after editing began, ` +
+            `so this edit was not saved over it. Reopen the file to edit the current version.`
+        );
       }
+
+      if (this.kind === 'feather') {
+        // Two steps, because DuckDB writes only the stream encoding and the
+        // file this came from is the file encoding. Writing the stream bytes
+        // straight into the .feather path would "work" -- the viewer would even
+        // reopen it, since the kind is sniffed from magic bytes -- and would
+        // hand every OTHER reader a file whose contents no longer match its
+        // name. pyarrow.feather.read_feather() and pandas.read_feather() both
+        // refuse it.
+        tempDir = await mkdtemp(join(tmpdir(), 'dfv-feather-save-'));
+        const streamPath = join(tempDir, 'out.arrows');
+        await this.connection.run(`copy ${table} to '${literal(streamPath)}' (format arrow)`);
+        await streamArrowStreamToFeather(streamPath, staging);
+      } else {
+        await this.connection.run(`copy ${table} to '${literal(staging)}' (format ${format})`);
+      }
+
+      // A new file takes the process umask, not the original's mode; without
+      // this a save could widen or narrow who may read the user's file.
+      await chmod(staging, current.mode & 0o7777);
+      await rename(staging, this.path);
+      const published = await stat(this.path);
+      this.diskStamp = { mtimeMs: published.mtimeMs, size: published.size };
+    } finally {
+      await rm(staging, { force: true }).catch(() => undefined);
+      if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
     }
   }
 

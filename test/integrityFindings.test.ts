@@ -706,14 +706,12 @@ test('E14 control: an edit to a row nothing else matches changes exactly one', a
   }
 });
 
-test('E15: a failed write-back leaves memory holding a value the disk does not', async (t) => {
-  t.todo(
-    'E15: updateCell runs the UPDATE against the in-memory table and only then ' +
-      'writes the file. When the write fails the table keeps the new value, so ' +
-      'the grid, every later query and every subsequent write-back are working ' +
-      'from a number that is not in the file. EXT-01 owns the rollback and ' +
-      'publication contract.'
-  );
+test('E15: a failed write-back leaves memory and disk agreeing', async () => {
+  // Was pinned: updateCell committed the UPDATE and only then wrote the file, so
+  // a failed write left the table holding a value the file did not. Fixed in
+  // EXT-01 (2026-09-13): the UPDATE stays uncommitted until the file is
+  // published, and a failure before publication rolls it back. The wider
+  // save-state coverage is in ext01SaveState.test.ts.
   const path = await twoIdenticalRows('e15.csv');
   const file = await DuckDbFile.open(path);
   try {
@@ -744,11 +742,7 @@ test('E15: a failed write-back leaves memory holding a value the disk does not',
 
     const result = await file.runQuery(`select qty from "e15" where name = 'bolt'`);
     const inMemory = String(cell(result, 0, 'qty'));
-    assert.equal(
-      inMemory,
-      '42',
-      'this test pins the divergence; if memory no longer holds 42 the finding is fixed'
-    );
+    assert.equal(inMemory, '3', 'the table kept an edit the file refused');
   } finally {
     file.dispose();
   }
