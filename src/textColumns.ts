@@ -291,14 +291,60 @@ export function markerFidelityExpr(
 ): string {
   const col = ident(column);
   const n = normalisedExpr(column, locale);
-  const exact = `try_cast(${n} as decimal(38,15))`;
   const changed =
     target === 'double'
-      ? `(${exact} is null or ${exact} is distinct from try_cast(try_cast(try_cast(${n} as double) as varchar) as decimal(38,15)))`
+      ? doubleChangedExpr(column, locale)
       : `try_cast(${n} as ${target})::varchar is distinct from ${n}`;
   return (
     `count(*) filter (where ${col} is not null and trim(${col}) <> '' ` +
     `and not ${markerTest(column, tokens)} and ${changed})`
+  );
+}
+
+/** markerFidelityExpr's `double` test, for one value: see the note there. */
+function doubleChangedExpr(column: string, locale: NumberLocale): string {
+  const n = normalisedExpr(column, locale);
+  const exact = `try_cast(${n} as decimal(38,15))`;
+  return `(${exact} is null or ${exact} is distinct from try_cast(try_cast(try_cast(${n} as double) as varchar) as decimal(38,15)))`;
+}
+
+/**
+ * Values a `double` would change, in a CSV column DuckDB's sniffer typed DOUBLE,
+ * read back as the file's text (E23).
+ *
+ * Two kinds of value, told apart by how the file WRITES them, as isIntegral does:
+ *
+ *   - written as an integer: every digit is the value -- an identifier, a count --
+ *     so it must come back character for character. 9007199254740993 and a
+ *     23-digit id both fail; so does a padded integer, which the promotion then
+ *     keeps as text under EXT-04's identifier rule.
+ *   - written as a decimal or in exponent notation: a measurement. A double keeps
+ *     15 significant digits of any decimal (DBL_DIG), and the user decided
+ *     (2026-09-13) that digits past its precision -- 966.41641389214044 shown as
+ *     966.4164138921404 -- are not a changed value. So such a value changes only
+ *     when it does not fit a double at all.
+ *
+ * That second rule is looser than markerFidelityExpr's `double` test, which
+ * compares at 15 decimal places and so calls a 17th significant digit a loss. It
+ * is kept separate on purpose: applied here, that test turned every float column
+ * a program writes at full precision into text -- measured, a 500,000-row
+ * four-column file went from 142 ms to open as numbers to 1,986 ms to open as
+ * text.
+ *
+ * Text of 15 characters or fewer is skipped: it cannot hold more than 15 digits.
+ * The skip is a CASE, not an AND -- DuckDB evaluates both sides of an AND over the
+ * whole vector, so an AND still paid for the comparison on every row; a CASE
+ * evaluates each branch only for the rows that reach it.
+ */
+export function doubleFidelityExpr(column: string, locale: NumberLocale): string {
+  const col = ident(column);
+  const n = normalisedExpr(column, locale);
+  return (
+    `count(*) filter (where case ` +
+    `when ${col} is null or length(${col}) <= 15 then false ` +
+    `when regexp_full_match(${n}, '[+-]?[0-9]+') ` +
+    `then try_cast(try_cast(${n} as double) as hugeint)::varchar is distinct from ${n} ` +
+    `else coalesce(not isfinite(try_cast(${n} as double)), true) end)`
   );
 }
 

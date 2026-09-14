@@ -198,35 +198,34 @@ test('EXT-04: a wide integer column without leading zeros is promoted, exactly',
 // 23-digit identifier is past BIGINT and comfortably inside HUGEINT, and it
 // goes to DOUBLE regardless.
 //
-// NOT fixed here. The remedy is to read the main CSV view `all_varchar` and let
-// the (now exact) promotion assign types, and that is a much larger change than
-// it sounds -- the sniffer is also what types date and timestamp columns, which
-// the promotion does not handle. It needs its own package and its own decision.
+// Fixed in EXT-06 (2026-09-13), on the user's decision "sniff, then verify": the
+// sniffer still types the file -- it is what types dates -- and every column it
+// typed DOUBLE is read back as text and checked against what a double makes of
+// it. A column that would change is read as text and handed to the promotion.
+// Wider coverage is in ext06CsvTypes.test.ts.
 
-test('E23: a wide-integer CSV column is typed DOUBLE by the sniffer, before any of our code runs', async (t) => {
-  t.todo(
-    'E23: 23 digits is past BIGINT and well inside HUGEINT, and read_csv_auto ' +
-      'chooses DOUBLE anyway. interpretTextColumns never sees the column -- it ' +
-      'is not VARCHAR by the time it is offered one -- so EXT-04 cannot reach ' +
-      'this and did not try to.'
-  );
+test('E23: a wide-integer CSV column is read exactly, as HUGEINT', async () => {
+  // Was pinned: typed DOUBLE by the sniffer and shown 1.2345678901234568e+22.
   const path = join(dir, 'e23-hugeint.csv');
   await writeFile(path, 'id\n12345678901234567890123\n12345678901234567890124\n', 'utf8');
   const file = await DuckDbFile.open(path);
   try {
     const typed = await file.runQuery('select typeof(id) as t from "e23-hugeint" limit 1');
-    assert.equal(String(cell(typed, 0, 't')), 'HUGEINT', 'E23 is fixed; drop this pin');
+    assert.equal(String(cell(typed, 0, 't')), 'HUGEINT');
+    const result = await file.runQuery('select id from "e23-hugeint" order by id');
+    const at = result.columns.indexOf('id');
+    assert.deepEqual(result.rows.map((r) => String(r[at])), [
+      '12345678901234567890123',
+      '12345678901234567890124',
+    ]);
   } finally {
     file.dispose();
   }
 });
 
-test('E23: an integer past every exact type is shown in scientific notation', async (t) => {
-  t.todo(
-    'E23: 40 digits cannot be held exactly by anything, which is precisely when ' +
-      'the column must stay text -- EXT-04 decides exactly that for a column it ' +
-      'is given. This one it is not given: the sniffer typed it DOUBLE first.'
-  );
+test('E23: an integer past every exact type is shown as the text the file holds', async () => {
+  // Was pinned: 40 digits fit no exact type, so the column stays text -- which
+  // is what EXT-04 decided for a column it is offered, and now it is offered one.
   const path = join(dir, 'e23-astronomical.csv');
   await writeFile(
     path,
@@ -242,8 +241,7 @@ test('E23: an integer past every exact type is shown in scientific notation', as
       [
         '1234567890123456789012345678901234567890',
         '1234567890123456789012345678901234567891',
-      ],
-      'E23 is fixed; drop this pin'
+      ]
     );
   } finally {
     file.dispose();

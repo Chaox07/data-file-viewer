@@ -29,6 +29,7 @@ import {
   EXCEL_ERROR_TOKENS,
   type PromotionTarget,
   classifyTextColumn,
+  doubleFidelityExpr,
   isExcelError,
   markerBlankExpr,
   markerCountExpr,
@@ -565,15 +566,60 @@ async function cacheSheetAsTable(
   }
 }
 
-/** The read_csv() call for a CSV, with locale options only when we have grounds for them. */
-function csvReadExpr(filePath: string, locale: NumberLocale | null): string {
+/**
+ * The read_csv() call for a CSV, with locale options only when we have grounds for them.
+ *
+ * `textColumns` are read as VARCHAR whatever the sniffer would type them; every
+ * other column keeps the sniffer's type. See csvColumnsADoubleWouldChange.
+ */
+function csvReadExpr(filePath: string, locale: NumberLocale | null, textColumns: readonly string[] = []): string {
+  const types = textColumns.length
+    ? `, types={${textColumns.map((c) => `${quoteLiteral(c)}: 'VARCHAR'`).join(', ')}}`
+    : '';
   if (!locale || locale === 'en') {
     // "en" is already what read_csv_auto does; adding the options would only
     // disable its delimiter/header sniffing for no gain.
-    return `read_csv_auto(${quoteLiteral(filePath)})`;
+    return `read_csv_auto(${quoteLiteral(filePath)}${types})`;
   }
   const { decimal, thousands } = csvLocaleOptions(locale);
-  return `read_csv(${quoteLiteral(filePath)}, decimal_separator=${quoteLiteral(decimal)}, thousands=${quoteLiteral(thousands)})`;
+  return `read_csv(${quoteLiteral(filePath)}, decimal_separator=${quoteLiteral(decimal)}, thousands=${quoteLiteral(thousands)}${types})`;
+}
+
+/**
+ * CSV columns the sniffer typed DOUBLE whose own text a double does not hold (E23).
+ *
+ * read_csv_auto's candidate types stop at BIGINT and DOUBLE, so a column of
+ * 23-digit identifiers, or one mixing `1.5` with 9007199254740993, arrives as
+ * DOUBLE and already rounded -- before interpretTextColumns runs, which is only
+ * ever offered VARCHAR columns. The sniffer is still right about everything
+ * else, dates above all, so it keeps typing the file and only its DOUBLE columns
+ * are checked: each is read back as text and compared against what a double
+ * makes of it, in one scan. A column that would change is read as text, and the
+ * promotion then gives it an exact type or leaves it as text and says so.
+ *
+ * The scan happens only when a DOUBLE column exists. Any failure answers "none",
+ * which leaves the file exactly as it opened before this existed.
+ */
+async function csvColumnsADoubleWouldChange(
+  connection: DuckDBConnection,
+  filePath: string,
+  locale: NumberLocale | null,
+  viewName: string
+): Promise<string[]> {
+  try {
+    const head = await connection.runAndReadAll(`select * from ${quoteIdent(viewName)} limit 0`);
+    const typeIds = head.columnTypes().map((t) => t.typeId);
+    const doubles = head.columnNames().filter((_, i) => typeIds[i] === DuckDBTypeId.DOUBLE);
+    if (doubles.length === 0) return [];
+    const reader = await connection.runAndReadAll(
+      `select ${doubles.map((c) => doubleFidelityExpr(c, locale ?? 'en')).join(', ')} ` +
+        `from ${csvReadExpr(filePath, locale, doubles)}`
+    );
+    const counts = (reader.getRows()[0] as unknown[]).map(Number);
+    return doubles.filter((_, i) => (counts[i] ?? 0) > 0);
+  } catch {
+    return [];
+  }
 }
 
 /** How many rows to sample when deciding what a text column holds. */
@@ -1722,6 +1768,21 @@ export class DuckDbFile {
       );
       viewSources.set(mainObjectRawName, source);
       viewLabels.set(mainObjectRawName, mainObjectRawName);
+
+      const asText = await csvColumnsADoubleWouldChange(connection, path, sniffed.locale, mainObjectRawName);
+      if (asText.length > 0) {
+        source.readExpr = (p) => csvReadExpr(p, sniffed.locale, asText);
+        await connection.run(
+          `create or replace view ${quoteIdent(mainObjectRawName)} as ${viewBodySql(source, path, false)}`
+        );
+        const n = asText.length;
+        openWarnings.push(
+          `${n} column${n === 1 ? '' : 's'} (${asText.slice(0, 3).map((c) => `"${c}"`).join(', ')}` +
+            `${n > 3 ? ', …' : ''}) hold numbers a floating-point type would change — an integer ` +
+            `past 2^53 or wider than any exact type — so ${n === 1 ? 'it is' : 'they are'} read ` +
+            `from the file's own text instead.`
+        );
+      }
 
       for (const u of sniffed.undecidable) {
         const sample = u.samples[0] ?? '';
