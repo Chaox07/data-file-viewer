@@ -30,7 +30,8 @@ import { DuckDbFile } from '../src/duckdbConnection';
  * fixture on the path that works. E17 is the control for the whole file: exact
  * numeric transport already works, and no fix here may cost it.
  *
- * EXT-01 owns E15, EXT-02 owns E14/E16. These report; they fix nothing.
+ * E15 was fixed in EXT-01 and E14/E16 in EXT-02 (2026-09-13); their pins are
+ * now the expectations. EXT-02's wider coverage is in ext02CellTargeting.test.ts.
  */
 
 let dir: string;
@@ -659,31 +660,23 @@ async function twoIdenticalRows(name: string): Promise<string> {
   return path;
 }
 
-test('E14: editing one of two identical rows changes both', async (t) => {
-  t.todo(
-    'E14: the UPDATE matches on full-row equality, so rows identical in every ' +
-      'column are one row to it. The user edited one and two changed, with ' +
-      'nothing said. EXT-02 owns the policy decision -- refuse, keep the ' +
-      'explicit multi-row behaviour, or introduce row identity -- so this pins ' +
-      'the current behaviour rather than asserting a fix.'
-  );
+test('E14: editing one of two identical rows is refused, and neither changes', async () => {
+  // Was pinned: the UPDATE matched on full-row equality, so rows identical in
+  // every column were one row to it -- the user edited one and two changed,
+  // with nothing said. Fixed in EXT-02 (2026-09-13) on the user's decision to
+  // refuse, which is what the .xlsx path already did: nothing distinguishes the
+  // rows, so the edit is applied to neither.
   const path = await twoIdenticalRows('e14.csv');
+  const before = await readFile(path, 'utf8');
   const file = await DuckDbFile.open(path);
   try {
-    const changed = await file.updateCell('e14', 'qty', 99, { name: 'widget', qty: 2 });
-    assert.equal(
-      changed,
-      2,
-      'the edit matched a number of rows this test does not describe; re-read the finding'
+    await assert.rejects(
+      () => file.updateCell('e14', 'qty', 99, { name: 'widget', qty: 2 }),
+      /2 rows in "e14" are identical across every column/
     );
-
-    const after = await readFile(path, 'utf8');
-    const lines = after.trim().split('\n').slice(1);
-    assert.equal(
-      lines.filter((l) => l.includes('99')).length,
-      2,
-      `two rows should carry the new value on disk: ${JSON.stringify(lines)}`
-    );
+    assert.equal(await readFile(path, 'utf8'), before, 'the file changed');
+    const result = await file.runQuery('select count(*) as n from "e14" where qty = 99');
+    assert.equal(String(cell(result, 0, 'n')), '0', 'the table kept a refused edit');
   } finally {
     file.dispose();
   }
@@ -856,39 +849,24 @@ function patchA1(path: string, expectedCurrent: unknown, newValue: unknown) {
   });
 }
 
-test('E16: a numeric cell accepts an expected value that is not a number', async (t) => {
-  t.todo(
-    "E16: looksLikeSameValue answers true whenever exactly one side parses as a " +
-      'number, so a stored 123 "agrees" with an expected "not-a-date". The rule ' +
-      'exists for date columns, where the file holds a serial and the grid holds ' +
-      'a date -- but it cannot tell that case from a genuine disagreement, so it ' +
-      'lets every mismatch of that shape through. EXT-02 owns the source-aware ' +
-      'replacement.'
-  );
+test('E16: a numeric cell refuses an expected value that is not a number', async () => {
+  // Was pinned: the guard answered true whenever exactly one side parsed as a
+  // number, so a stored 123 "agreed" with an expected "not-a-date". Fixed in
+  // EXT-02 (2026-09-13): a mismatch of kinds is a mismatch, and the one real
+  // case the rule existed for -- a date shown for a serial -- is now judged by
+  // the cell's own date format instead.
   const path = await oneCellWorkbook('e16-text.xlsx', '123');
-  await patchA1(path, 'not-a-date', 999);
-  assert.match(
-    await sheetOf(path),
-    /<c r="A1"><v>999<\/v><\/c>/,
-    'the write was refused; the finding is fixed and this test should now assert that'
-  );
+  await assert.rejects(() => patchA1(path, 'not-a-date', 999), /Refusing to overwrite/);
+  assert.match(await sheetOf(path), /<c r="A1"><v>123<\/v><\/c>/, 'the cell was written anyway');
 });
 
-test('E16: a numeric cell accepts an expected value one part in a billion away', async (t) => {
-  t.todo(
-    'E16: the relative tolerance is 1e-9, which at this magnitude is a whole ' +
-      'unit -- so a stored 1000000001 "agrees" with an expected 1000000000 and ' +
-      'a stale grid can overwrite a cell that has since changed. The tolerance ' +
-      'exists because Excel stores a double at up to 17 digits while the grid ' +
-      'shows fewer; a source-aware comparison would not need to guess.'
-  );
+test('E16: a numeric cell refuses an expected value one unit away at 10^9', async () => {
+  // Was pinned: a relative tolerance of 1e-9 is a whole unit at this magnitude.
+  // Fixed in EXT-02: integers compare as integers of any width, and other
+  // numbers as the same double -- which is what the grid's value already is.
   const path = await oneCellWorkbook('e16-near.xlsx', '1000000001');
-  await patchA1(path, 1000000000, 7);
-  assert.match(
-    await sheetOf(path),
-    /<c r="A1"><v>7<\/v><\/c>/,
-    'the write was refused; the finding is fixed and this test should now assert that'
-  );
+  await assert.rejects(() => patchA1(path, 1000000000, 7), /Refusing to overwrite/);
+  assert.match(await sheetOf(path), /<c r="A1"><v>1000000001<\/v><\/c>/, 'the cell was written anyway');
 });
 
 test('E16 control: a stale expectation far from the stored value is refused', async () => {

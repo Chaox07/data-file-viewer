@@ -117,6 +117,104 @@ function isNonEmpty(row: RowBlock): boolean {
   return /<c\b/.test(row.xml);
 }
 
+/** One cell as the file stores it: what it says, what type and style it declares, any formula. */
+interface StoredCell {
+  text: string;
+  /** The `t=` attribute; absent means a number. */
+  type: string | undefined;
+  style: number | undefined;
+  /** The formula's text when the cell holds one ('' for a shared-formula child). */
+  formula: string | undefined;
+}
+
+function storedCellOf(rowXml: string, letters: string, sharedStrings: string[]): StoredCell {
+  const cellRe = new RegExp(`<c\\b([^>]*?\\br="${letters}\\d+"[^>]*?)(?:/>|>([\\s\\S]*?)</c>)`);
+  const match = cellRe.exec(rowXml);
+  if (!match) return { text: '', type: undefined, style: undefined, formula: undefined };
+  const attrs = match[1];
+  const body = match[2] ?? '';
+  const style = /\bs="(\d+)"/.exec(attrs)?.[1];
+  const formula = /<f\b[^>]*?(?:\/>|>([\s\S]*?)<\/f>)/.exec(body);
+  return {
+    text: cellTextsOf(match[0], sharedStrings).get(letters) ?? '',
+    type: /\bt="([a-zA-Z]+)"/.exec(attrs)?.[1],
+    style: style === undefined ? undefined : Number(style),
+    formula: formula ? unescapeXmlText(formula[1] ?? '') : undefined,
+  };
+}
+
+/** Built-in number formats that display a date or a time (ECMA-376 18.8.30, plus the East Asian date ids). */
+const BUILTIN_DATE_FORMATS = new Set([
+  14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 45, 46, 47, 50, 51,
+  52, 53, 54, 55, 56, 57, 58,
+]);
+
+/** Whether a custom format code shows a date or time: a d/m/y/h/s token outside quotes, escapes and [colour] blocks. */
+function isDateFormatCode(code: string): boolean {
+  const bare = code
+    .replace(/"[^"]*"/g, '')
+    .replace(/\\./g, '')
+    .replace(/[_*]./g, '')
+    .replace(/\[(?!h+\]|m+\]|s+\])[^\]]*\]/gi, '');
+  return /[dmyhs]/i.test(bare);
+}
+
+/** Style indices (positions in cellXfs) whose number format is a date or time. */
+function readDateStyles(files: Record<string, Uint8Array>): Set<number> {
+  const part = files['xl/styles.xml'];
+  const out = new Set<number>();
+  if (!part) return out;
+  const xml = strFromU8(part);
+  const custom = new Map<number, string>();
+  for (const m of xml.matchAll(/<numFmt\b[^>]*?\bnumFmtId="(\d+)"[^>]*?\bformatCode="([^"]*)"/g)) {
+    custom.set(Number(m[1]), unescapeXmlText(m[2]));
+  }
+  const xfs = /<cellXfs\b[^>]*>([\s\S]*?)<\/cellXfs>/.exec(xml)?.[1] ?? '';
+  let index = 0;
+  for (const xf of xfs.matchAll(/<xf\b[^>]*?(?:\/>|>[\s\S]*?<\/xf>)/g)) {
+    const id = Number(/\bnumFmtId="(\d+)"/.exec(xf[0])?.[1] ?? '0');
+    const code = custom.get(id);
+    if (code !== undefined ? isDateFormatCode(code) : BUILTIN_DATE_FORMATS.has(id)) out.add(index);
+    index++;
+  }
+  return out;
+}
+
+function usesDate1904(files: Record<string, Uint8Array>): boolean {
+  const part = files['xl/workbook.xml'];
+  return part ? /<workbookPr\b[^>]*\bdate1904="(1|true)"/.test(strFromU8(part)) : false;
+}
+
+const DAY_MS = 86_400_000;
+
+/**
+ * An ISO date, date-time or time of day as an Excel serial, or undefined when
+ * the text is not one. What the grid shows for DATE, TIMESTAMP and TIME columns.
+ */
+function isoToSerial(text: string, date1904: boolean): number | undefined {
+  const time = /^(\d{2}):(\d{2})(?::(\d{2}(?:\.\d+)?))?$/.exec(text);
+  if (time) {
+    const [h, m, s] = [Number(time[1]), Number(time[2]), Number(time[3] ?? 0)];
+    return h < 24 && m < 60 && s < 60 ? (h * 3600 + m * 60 + s) / 86_400 : undefined;
+  }
+  const d = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}(?:\.\d+)?))?)?$/.exec(text);
+  if (!d) return undefined;
+  const [y, mo, day] = [Number(d[1]), Number(d[2]), Number(d[3])];
+  const [h, mi, s] = [Number(d[4] ?? 0), Number(d[5] ?? 0), Number(d[6] ?? 0)];
+  const ms = Date.UTC(y, mo - 1, day);
+  const check = new Date(ms);
+  // Date.UTC rolls 2026-02-30 over into March; a date that does not exist is not one.
+  if (check.getUTCMonth() !== mo - 1 || check.getUTCDate() !== day || h >= 24 || mi >= 60 || s >= 60) {
+    return undefined;
+  }
+  const epoch = date1904 ? Date.UTC(1904, 0, 1) : Date.UTC(1899, 11, 30);
+  let serial = (ms - epoch) / DAY_MS + (h * 3600 + mi * 60 + s) / 86_400;
+  // The 1900 system counts a 29 February 1900 that never happened, so serials
+  // before 1 March 1900 are one lower than the arithmetic gives.
+  if (!date1904 && serial < 61) serial -= 1;
+  return serial >= 0 ? serial : undefined;
+}
+
 /** The display text of every cell in a row, keyed by column letters. */
 function cellTextsOf(rowXml: string, sharedStrings: string[]): Map<string, string> {
   const out = new Map<string, string>();
@@ -261,38 +359,54 @@ export interface PatchCellRequest {
   newValue: unknown;
 }
 
+const INTEGER_TEXT = /^-?\d+$/;
+const NUMBER_TEXT = /^-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/;
+
 /**
- * Whether the cell's stored text is the value the grid was showing.
+ * Whether the cell holds the value the grid was showing, judged by what the
+ * cell declares itself to be.
  *
- * Deliberately loose about FORM and strict about VALUE. Excel stores 12.5 as
- * "12.5", 12.50 as "12.5", and a date as the serial number 45678 -- so a
- * character comparison would refuse most legitimate edits, while a comparison
- * that gave up and returned true would defeat the check entirely. Numbers are
- * compared as numbers, everything else as trimmed text, and a value this cannot
- * put in either bucket (a date against its serial number) answers true, because
- * the ordinal already agreed and refusing on a comparison this function is
- * simply not equipped to make would block editing every dated sheet.
+ * Loose about FORM, exact about VALUE. Excel stores 12.50 as "12.5" and a date
+ * as its serial number, so a character comparison would refuse legitimate
+ * edits. But nothing here guesses (E16): this used to accept any number within
+ * one part in a billion -- a whole unit at 10^9 -- and any pair where only one
+ * side was numeric, which let a stale grid overwrite exactly the cells the
+ * check exists to protect.
+ *
+ *   - a text cell matches only its own text;
+ *   - a number matches exactly: integers as integers of any width, anything
+ *     else as the same double, which is what DuckDB read the cell as and what
+ *     the grid's JSON carries back unchanged;
+ *   - a date-formatted number also matches the ISO date, date-time or time the
+ *     grid shows for it.
  */
-function looksLikeSameValue(stored: string, expected: unknown): boolean {
-  if (expected === null || expected === undefined) return stored.trim() === '';
-  if (typeof expected === 'boolean') return stored.trim() === (expected ? '1' : '0');
+function holdsExpectedValue(
+  cell: StoredCell,
+  expected: unknown,
+  dateStyled: boolean,
+  date1904: boolean
+): boolean {
+  const stored = cell.text.trim();
+  if (expected === null || expected === undefined) return stored === '';
+  const wanted = String(expected).trim();
+  if (stored === wanted) return true;
 
-  const expectedText = String(expected).trim();
-  const storedText = stored.trim();
-  if (storedText === expectedText) return true;
+  if (cell.type === 'b') return (stored === '1' ? 'true' : 'false') === wanted.toLowerCase();
+  if (cell.type !== undefined && cell.type !== 'n') return false;
+  if (!NUMBER_TEXT.test(stored)) return false;
 
-  const a = Number(storedText);
-  const b = Number(expectedText);
-  if (Number.isFinite(a) && Number.isFinite(b)) {
-    // Relative tolerance: Excel writes a double at up to 17 digits and the grid
-    // shows fewer, so exact equality would refuse edits to ordinary numbers.
-    const scale = Math.max(Math.abs(a), Math.abs(b), 1);
-    return Math.abs(a - b) <= scale * 1e-9;
+  if (NUMBER_TEXT.test(wanted)) {
+    if (INTEGER_TEXT.test(stored) && INTEGER_TEXT.test(wanted)) return BigInt(stored) === BigInt(wanted);
+    return Number(stored) === Number(wanted);
   }
-  // One side numeric and the other not: a date column, where the file holds a
-  // serial number and the grid holds a date. Not a disagreement this function
-  // can adjudicate -- see the note above.
-  return Number.isFinite(a) !== Number.isFinite(b);
+  if (!dateStyled) return false;
+  const serial = isoToSerial(wanted, date1904);
+  if (serial === undefined) return false;
+  const value = Number(stored);
+  // A date-only value is the day the cell falls on, whatever time it carries;
+  // a date-time or time is compared to the millisecond.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(wanted)) return Math.floor(value) === serial;
+  return Math.abs(value - serial) * DAY_MS < 1;
 }
 
 /**
@@ -403,8 +517,11 @@ export async function patchCell(request: PatchCellRequest): Promise<void> {
   // The second reading. DuckDB said this is the row; the file has to agree that
   // this cell currently holds what the grid was showing, or the two disagree
   // about which row is which and nothing should be written.
-  const current = cellTextsOf(target.xml, sharedStrings).get(letters) ?? '';
-  if (!looksLikeSameValue(current, expectedCurrent)) {
+  const cell = storedCellOf(target.xml, letters, sharedStrings);
+  const current = cell.text;
+  const dateStyled = cell.style !== undefined && readDateStyles(files).has(cell.style);
+  const date1904 = usesDate1904(files);
+  if (!holdsExpectedValue(cell, expectedCurrent, dateStyled, date1904)) {
     throw new Error(
       `Cell ${ref} holds ${current === '' ? '(empty)' : `"${current}"`}, but the grid was ` +
         `showing ${expectedCurrent === null || expectedCurrent === undefined
@@ -414,7 +531,33 @@ export async function patchCell(request: PatchCellRequest): Promise<void> {
     );
   }
 
-  const patched = spliceCell(target.xml, ref, letters, newValue);
+  // Writing a value over a formula deletes the formula, and the grid shows only
+  // its last result, so the edit would look like a correction to a number.
+  if (cell.formula !== undefined) {
+    throw new Error(
+      `Cell ${ref} holds a formula${cell.formula ? ` (=${cell.formula})` : ''}, and editing it ` +
+        `would replace the formula with a fixed value. The workbook was not changed.`
+    );
+  }
+
+  // A date typed into a date-formatted cell is written as the serial number
+  // Excel stores dates as. Written as the typed text it would keep the date
+  // style and stop being a date: no longer sortable, no longer in any date sum.
+  let value = newValue;
+  if (dateStyled && typeof newValue === 'string' && newValue.trim() !== '') {
+    const typed = newValue.trim();
+    const serial = isoToSerial(typed, date1904);
+    if (serial !== undefined) {
+      value = serial;
+    } else if (!NUMBER_TEXT.test(typed)) {
+      throw new Error(
+        `Cell ${ref} is formatted as a date, and "${typed}" is not one it can store. Type it as ` +
+          `YYYY-MM-DD, YYYY-MM-DD HH:MM:SS or HH:MM:SS. The workbook was not changed.`
+      );
+    }
+  }
+
+  const patched = spliceCell(target.xml, ref, letters, value);
 
   const updatedSheet = sheetXml.slice(0, target.start) + patched + sheetXml.slice(target.end);
   files[sheetPath] = strToU8(updatedSheet);

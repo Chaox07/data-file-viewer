@@ -3404,11 +3404,11 @@ export class DuckDbFile {
    * value (null-safe via IS NOT DISTINCT FROM) — DuckDB has no stable rowid
    * across plain tables, attached SQLite tables, and materialized flat-file
    * tables alike, so there's no cheaper universal row identity available.
-   * Accepted limitation: rows that are identical across every column all
-   * update together (same risk-tolerance precedent as the positional-row-
-   * diff limitation in diffQueryAgainstBackup above). Returns the number of
-   * rows actually matched/updated, so the caller can distinguish "no
-   * matching row" (0) from a successful edit.
+   * Rows identical across every column cannot be told apart that way, so an
+   * edit matching more than one is refused and nothing changes (E14 — they
+   * used to update together, silently). Returns the number of rows actually
+   * matched/updated, so the caller can distinguish "no matching row" (0)
+   * from a successful edit.
    */
   async updateCell(
     table: string,
@@ -3425,6 +3425,10 @@ export class DuckDbFile {
     // the same promise kept one layer down, where the write actually happens.
     if (this.readOnly) {
       throw new Error(`"${basename(this.path)}" is open read-only, so it cannot be edited.`);
+    }
+    // No row values means no WHERE clause, and an UPDATE without one is every row.
+    if (Object.keys(rowValues).length === 0) {
+      throw new Error(`The edit did not say which row of "${table}" it is for, so nothing was changed.`);
     }
     if (this.kind === 'xlsx') {
       return this.updateXlsxCell(table, column, newValue, rowValues, onStatus);
@@ -3448,9 +3452,28 @@ export class DuckDbFile {
     // WHERE match for an untouched column, worst case is 0 rows matched,
     // which is already handled as a safe, surfaced error).
     const values = [newValue, ...whereCols.map((c) => rowValues[c])] as DuckDBValue[];
+    // Counted inside the write's own transaction, so the refusal is a rollback
+    // rather than a second query that could disagree with the UPDATE.
+    const refuseAmbiguous = (rowsChanged: number) => {
+      if (rowsChanged > 1) {
+        throw new Error(
+          `${rowsChanged} rows in "${table}" are identical across every column, so there ` +
+            `is no way to tell which one you edited. The file was not changed.`
+        );
+      }
+    };
 
     if (!this.isFlatFileKind()) {
-      return (await this.connection.run(sql, values)).rowsChanged;
+      await this.connection.run('begin transaction');
+      try {
+        const { rowsChanged } = await this.connection.run(sql, values);
+        refuseAmbiguous(rowsChanged);
+        await this.connection.run('commit');
+        return rowsChanged;
+      } catch (err) {
+        await this.connection.run('rollback').catch(() => undefined);
+        throw err;
+      }
     }
 
     // A flat file is edited in two places -- the materialized table and the
@@ -3465,6 +3488,7 @@ export class DuckDbFile {
     let rowsChanged: number;
     try {
       rowsChanged = (await this.connection.run(sql, values)).rowsChanged;
+      refuseAmbiguous(rowsChanged);
       if (rowsChanged > 0) {
         onStatus?.('Saving…');
         await this.writeBackFlatFile();
