@@ -597,8 +597,8 @@ function csvReadExpr(filePath: string, locale: NumberLocale | null, textColumns:
  * makes of it, in one scan. A column that would change is read as text, and the
  * promotion then gives it an exact type or leaves it as text and says so.
  *
- * The scan happens only when a DOUBLE column exists. Any failure answers "none",
- * which leaves the file exactly as it opened before this existed.
+ * The scan happens only when a DOUBLE column exists. A failed verification
+ * refuses the open rather than presenting unverified values.
  */
 async function csvColumnsADoubleWouldChange(
   connection: DuckDBConnection,
@@ -617,8 +617,8 @@ async function csvColumnsADoubleWouldChange(
     );
     const counts = (reader.getRows()[0] as unknown[]).map(Number);
     return doubles.filter((_, i) => (counts[i] ?? 0) > 0);
-  } catch {
-    return [];
+  } catch (error) {
+    throw new Error(`CSV fidelity verification failed; the file was not opened: ${String(error)}`);
   }
 }
 
@@ -1582,10 +1582,11 @@ export class DuckDbFile {
    * was last read or written. writeBackFlatFile refuses to replace a file that
    * no longer matches it -- another program wrote it in between.
    */
+  private editsBlocked = false;
   private diskStamp: { mtimeMs: number; size: number } | undefined;
 
   isReadOnly(): boolean {
-    return this.readOnly;
+    return this.readOnly || this.editsBlocked;
   }
 
   /** Read-only because of what the file IS (a .dta), not because it is locked. */
@@ -1769,7 +1770,13 @@ export class DuckDbFile {
       viewSources.set(mainObjectRawName, source);
       viewLabels.set(mainObjectRawName, mainObjectRawName);
 
-      const asText = await csvColumnsADoubleWouldChange(connection, path, sniffed.locale, mainObjectRawName);
+      let asText: string[];
+      try {
+        asText = await csvColumnsADoubleWouldChange(connection, path, sniffed.locale, mainObjectRawName);
+      } catch (error) {
+        connection.closeSync();
+        throw error;
+      }
       if (asText.length > 0) {
         source.readExpr = (p) => csvReadExpr(p, sniffed.locale, asText);
         await connection.run(
@@ -3391,7 +3398,7 @@ export class DuckDbFile {
     // 1.0. Nothing is regenerated now: xlsxWrite.ts rewrites the single <c>
     // element inside the worksheet XML and leaves the rest of the package
     // byte-for-byte, so none of that is on the table.
-    if (this.readOnly || this.kind === 'kdb') return { editable: false };
+    if (this.isReadOnly() || this.kind === 'kdb') return { editable: false };
     const trimmed = sql.trim();
 
     try {
@@ -3484,7 +3491,7 @@ export class DuckDbFile {
     // what makes a workbook a workbook. See xlsxWrite.ts.
     // The grid already hides the edit affordance on a read-only file; this is
     // the same promise kept one layer down, where the write actually happens.
-    if (this.readOnly) {
+    if (this.isReadOnly()) {
       throw new Error(`"${basename(this.path)}" is open read-only, so it cannot be edited.`);
     }
     // No row values means no WHERE clause, and an UPDATE without one is every row.
@@ -3567,11 +3574,22 @@ export class DuckDbFile {
     } catch {
       await this.connection.run('rollback').catch(() => undefined);
       try {
-        await this.connection.run(sql, values);
+        const source = this.viewSources.get(this.mainObjectName);
+        if (!source) throw new Error('No source for saved-file reconciliation');
+        let conversion: {streamPath: string; tempDir: string} | undefined;
+        try {
+          const filePath = this.kind === 'feather'
+            ? (conversion = await convertFeatherToStream(this.path)).streamPath
+            : this.path;
+          await this.connection.run(`create or replace table ${quoteIdent(table)} as ${viewBodySql(source, filePath, false)}`);
+        } finally {
+          if (conversion) await rm(conversion.tempDir, {recursive: true, force: true}).catch(() => undefined);
+        }
       } catch {
+        this.editsBlocked = true;
         this.lateWarnings.push(
           `The edit was saved to the file, but "${table}" could not be updated to match — ` +
-            `the grid may show the previous value until you reopen the file.`
+            `further editing is disabled until you reopen the file.`
         );
       }
     }
@@ -3694,7 +3712,7 @@ export class DuckDbFile {
         // is in the file would be the worse of the two.
         this.lateWarnings.push(
           `The edit was saved, but "${table}" could not be re-read from the workbook — ` +
-            `the grid may show the previous value until you reopen the file.`
+            `further editing is disabled until you reopen the file.`
         );
       }
     }
@@ -3768,9 +3786,15 @@ export class DuckDbFile {
       // A new file takes the process umask, not the original's mode; without
       // this a save could widen or narrow who may read the user's file.
       await chmod(staging, current.mode & 0o7777);
+      const stagedStamp = await stat(staging);
       await rename(staging, this.path);
-      const published = await stat(this.path);
-      this.diskStamp = { mtimeMs: published.mtimeMs, size: published.size };
+      this.diskStamp = { mtimeMs: stagedStamp.mtimeMs, size: stagedStamp.size };
+      try {
+        const published = await stat(this.path);
+        this.diskStamp = { mtimeMs: published.mtimeMs, size: published.size };
+      } catch {
+        this.lateWarnings.push('The edit was saved; its metadata could not be reread. The saved staging metadata is retained.');
+      }
     } finally {
       await rm(staging, { force: true }).catch(() => undefined);
       if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);

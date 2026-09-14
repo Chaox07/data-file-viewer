@@ -291,9 +291,10 @@ export function markerFidelityExpr(
 ): string {
   const col = ident(column);
   const n = normalisedExpr(column, locale);
+  const identifierChanged = `regexp_full_match(${n}, '[+-]?[0-9]+') and try_cast(${n} as hugeint)::varchar is distinct from ${n}`;
   const changed =
     target === 'double'
-      ? doubleChangedExpr(column, locale)
+      ? `(${identifierChanged} or ${doubleChangedExpr(column, locale)})`
       : `try_cast(${n} as ${target})::varchar is distinct from ${n}`;
   return (
     `count(*) filter (where ${col} is not null and trim(${col}) <> '' ` +
@@ -305,7 +306,7 @@ export function markerFidelityExpr(
 function doubleChangedExpr(column: string, locale: NumberLocale): string {
   const n = normalisedExpr(column, locale);
   const exact = `try_cast(${n} as decimal(38,15))`;
-  return `(${exact} is null or ${exact} is distinct from try_cast(try_cast(try_cast(${n} as double) as varchar) as decimal(38,15)))`;
+  return `(try_cast(${n} as double) = 0 and regexp_matches(split_part(lower(${n}), 'e', 1), '[1-9]') or ${exact} is null or ${exact} is distinct from try_cast(try_cast(try_cast(${n} as double) as varchar) as decimal(38,15)))`;
 }
 
 /**
@@ -331,20 +332,20 @@ function doubleChangedExpr(column: string, locale: NumberLocale): string {
  * four-column file went from 142 ms to open as numbers to 1,986 ms to open as
  * text.
  *
- * Text of 15 characters or fewer is skipped: it cannot hold more than 15 digits.
- * The skip is a CASE, not an AND -- DuckDB evaluates both sides of an AND over the
- * whole vector, so an AND still paid for the comparison on every row; a CASE
- * evaluates each branch only for the rows that reach it.
+ * Every numeric spelling is checked: short text can still carry a padded
+ * identifier, overflow (1e309), or underflow (1e-400).
  */
 export function doubleFidelityExpr(column: string, locale: NumberLocale): string {
   const col = ident(column);
   const n = normalisedExpr(column, locale);
+  const value = `try_cast(${n} as double)`;
+  // Nonzero mantissas that underflow are losses, even in short strings (1e-400).
+  const nonzero = `regexp_matches(split_part(lower(${n}), 'e', 1), '[1-9]')`;
   return (
-    `count(*) filter (where case ` +
-    `when ${col} is null or length(${col}) <= 15 then false ` +
+    `count(*) filter (where case when ${col} is null then false ` +
     `when regexp_full_match(${n}, '[+-]?[0-9]+') ` +
-    `then try_cast(try_cast(${n} as double) as hugeint)::varchar is distinct from ${n} ` +
-    `else coalesce(not isfinite(try_cast(${n} as double)), true) end)`
+    `then try_cast(${value} as hugeint)::varchar is distinct from ${n} ` +
+    `else coalesce(not isfinite(${value}), true) or (${value} = 0 and ${nonzero}) end)`
   );
 }
 

@@ -386,6 +386,11 @@ function holdsExpectedValue(
   dateStyled: boolean,
   date1904: boolean
 ): boolean {
+  if (cell.type !== undefined && cell.type !== 'n' && cell.type !== 'b') {
+    return expected !== null && expected !== undefined
+      ? cell.text === String(expected)
+      : cell.text === '';
+  }
   const stored = cell.text.trim();
   if (expected === null || expected === undefined) return stored === '';
   const wanted = String(expected).trim();
