@@ -218,6 +218,54 @@ test('a string edit goes in as an inline string, escaped', async () => {
   assert.equal(await partOf(path, 'xl/sharedStrings.xml'), SHARED);
 });
 
+test('numeric-looking text typed into a text cell stays text', async () => {
+  // Found by Kod's phase 8 (INT-01): an ETL workbook's identifier "0007",
+  // edited to "0009", was rewritten as <v>0009</v> -- the number 9 to Excel,
+  // openpyxl and ETL -- while this viewer read the raw "0009" back and showed
+  // the edit as correct. A cell stored as text keeps being text.
+  const path = await makeWorkbook('text-stays-text.xlsx');
+  const edit = (rowOrdinal: number, expectedCurrent: string, newValue: string) =>
+    patchCell({
+      filePath: path,
+      sheetPath: 'xl/worksheets/sheet1.xml',
+      columnName: 'name',
+      rowOrdinal,
+      columnNames: ['name', 'qty', 'total'],
+      expectedCurrent,
+      newValue,
+    });
+  await edit(1, 'widget', '0009'); // B2, a shared string
+  await edit(3, 'nut', '42'); // B4, an inline string
+  const sheet = await partOf(path, 'xl/worksheets/sheet1.xml');
+  assert.match(sheet, /<c r="B2" t="inlineStr"><is><t xml:space="preserve">0009<\/t><\/is><\/c>/);
+  assert.match(sheet, /<c r="B4" t="inlineStr"><is><t xml:space="preserve">42<\/t><\/is><\/c>/);
+
+  const file = await DuckDbFile.open(path);
+  try {
+    const seen = await file.runQuery('select "B" from "data" where "B" in (\'0009\', \'42\') order by 1');
+    assert.deepEqual(seen.rows, [['0009'], ['42']]);
+  } finally {
+    file.dispose();
+  }
+});
+
+test('numeric text typed into a numeric cell is still written as a number', async () => {
+  // The control for the case above: the webview sends every typed value as
+  // text, and a qty cell must stay numeric so its format and every SUM apply.
+  const path = await makeWorkbook('number-stays-number.xlsx');
+  await patchCell({
+    filePath: path,
+    sheetPath: 'xl/worksheets/sheet1.xml',
+    columnName: 'qty',
+    rowOrdinal: 1,
+    columnNames: ['name', 'qty', 'total'],
+    expectedCurrent: 2,
+    newValue: '12.5',
+  });
+  const sheet = await partOf(path, 'xl/worksheets/sheet1.xml');
+  assert.match(sheet, /<c r="C2" s="4"><v>12.5<\/v><\/c>/);
+});
+
 test('a cell Excel never wrote is inserted in column order', async () => {
   // Row 4 has B and C but no D. Appending it would leave the row out of
   // column order, which Excel reads as a corrupt sheet.

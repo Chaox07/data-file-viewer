@@ -272,7 +272,7 @@ function readSharedStrings(files: Record<string, Uint8Array>): string[] {
  * somebody typed, and keeping the formula beside it would mean Excel
  * recomputing the edit away on the next open.
  */
-function buildCell(ref: string, styleAttr: string, value: unknown): string {
+function buildCell(ref: string, styleAttr: string, value: unknown, keepText = false): string {
   if (value === null || value === undefined || value === '') {
     return `<c r="${ref}"${styleAttr}/>`;
   }
@@ -290,7 +290,12 @@ function buildCell(ref: string, styleAttr: string, value: unknown): string {
   // Written as a number so the column stays numeric and the cell's own format
   // still applies -- writing "12.5" as text into a formatted column is how an
   // edited cell ends up left-aligned and excluded from every SUM around it.
-  if (/^-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(text.trim())) {
+  //
+  // Not when the cell was stored as text (`keepText`). An identifier column
+  // holds "0007" as text on purpose, and rewriting "0009" as <v>0009</v> made
+  // it the number 9 in Excel, openpyxl and ETL alike, while this viewer read
+  // the raw "0009" back and showed the edit as correct (phase 8, INT-01).
+  if (!keepText && /^-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(text.trim())) {
     return `<c r="${ref}"${styleAttr}><v>${text.trim()}</v></c>`;
   }
   return (
@@ -299,8 +304,11 @@ function buildCell(ref: string, styleAttr: string, value: unknown): string {
   );
 }
 
-/** Put `cellXml` into `rowXml` at `ref`, replacing or inserting in column order. */
-function spliceCell(rowXml: string, ref: string, letters: string, value: unknown): string {
+/**
+ * Put `cellXml` into `rowXml` at `ref`, replacing or inserting in column order.
+ * `keepText`: the cell being replaced was stored as text, so text stays text.
+ */
+function spliceCell(rowXml: string, ref: string, letters: string, value: unknown, keepText = false): string {
   const cellRe = new RegExp(`<c\\b[^>]*?\\br="${letters}\\d+"[^>]*?(?:/>|>[\\s\\S]*?</c>)`);
   const existing = cellRe.exec(rowXml);
   if (existing) {
@@ -308,7 +316,7 @@ function spliceCell(rowXml: string, ref: string, letters: string, value: unknown
     // font and borders. Dropping it is how an edited date cell comes back as
     // 45678 and an edited currency cell loses its symbol.
     const style = /\bs="(\d+)"/.exec(existing[0]);
-    return rowXml.replace(cellRe, buildCell(ref, style ? ` s="${style[1]}"` : '', value));
+    return rowXml.replace(cellRe, buildCell(ref, style ? ` s="${style[1]}"` : '', value, keepText));
   }
 
   // The cell is absent -- an empty cell Excel never wrote out. Cells must sit
@@ -562,7 +570,10 @@ export async function patchCell(request: PatchCellRequest): Promise<void> {
     }
   }
 
-  const patched = spliceCell(target.xml, ref, letters, value);
+  // A shared string, an inline string or a formula's text result: the cell
+  // says it holds text, and an edit keeps that.
+  const storedAsText = cell.type === 's' || cell.type === 'inlineStr' || cell.type === 'str';
+  const patched = spliceCell(target.xml, ref, letters, value, storedAsText);
 
   const updatedSheet = sheetXml.slice(0, target.start) + patched + sheetXml.slice(target.end);
   files[sheetPath] = strToU8(updatedSheet);

@@ -9,6 +9,21 @@ DuckDB is the engine reading most of these formats under the hood; kdb+
 files are parsed directly in their own real format (see the kdb+ section
 below).
 
+
+### SQLite columns without declared types
+
+The viewer reads untyped text, integer and real columns using their stored value
+classes. Real numbers retain their binary floating-point value. A column mixing
+real numbers with integers outside the safe double range is shown as exact text,
+with a notice, so the integers are not rounded. These numeric untyped columns
+remain read-only; editing them would change their storage class.
+
+Live refresh rechecks untyped columns after file changes, including changes to
+stored classes without a schema change. Cell edits are refused when a user
+column named `rowid` hides SQLite's internal row identifier, or when the table
+has no usable row identifier. Every successful edit must update exactly one row;
+an unexpected count rolls back the write.
+
 ## Opening files
 
 | Format | Opens automatically on double-click? |

@@ -39,6 +39,12 @@ import {
   nonMarkerCountExpr,
 } from './textColumns';
 import { patchCell as patchXlsxCell, columnIndexOf, columnLettersOf } from './xlsxWrite';
+import {
+  createSqliteViews,
+  planSqliteTables,
+  planStillFits,
+  type SqlitePlan,
+} from './sqliteTypes';
 
 export type StatsKind = 'numeric' | 'datetime' | 'other';
 
@@ -1216,6 +1222,37 @@ function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
 }
 
+/**
+ * Where a SQLite file is really attached, given the name it is known by. The
+ * suffix keeps it clear of the view catalog that carries the file's own name,
+ * and of any table name a file could contain.
+ */
+function sqliteSourceCatalogOf(viewCatalog: string): string {
+  return `${viewCatalog}__dfv_sqlite_source`;
+}
+
+/**
+ * Says so when a column the file declares with no type is being read as what
+ * its values actually are. Worth a notice rather than silence: the grid is
+ * showing something the file does not literally declare, and the reason a
+ * column of digits sorts as numbers here is this decision, not the file.
+ */
+function sqliteRetypeNotices(plan: SqlitePlan): string[] {
+  const notices: string[] = [];
+  for (const [table, tablePlan] of plan) {
+    if (tablePlan.retyped.size === 0) continue;
+    const described = [...tablePlan.retyped]
+      .map(([column, type]) => `"${column}" as ${tablePlan.numericText.has(column) ? 'exact numeric text (integers exceed the safe DOUBLE range)' : type === 'VARCHAR' ? 'text' : type === 'BIGINT' ? 'whole numbers' : 'numbers'}`)
+      .join(', ');
+    notices.push(
+      `"${table}": ${described} — the file declares no type for ${
+        tablePlan.retyped.size === 1 ? 'that column' : 'those columns'
+      }, so each is read as what its stored values are.`
+    );
+  }
+  return notices;
+}
+
 function quoteLiteral(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
@@ -1574,7 +1611,15 @@ export class DuckDbFile {
      */
     private readonly pendingSheets: Map<string, PendingSheet> = new Map(),
     private readonly tableMode: SheetTableMode = 'grid',
-    private readonly nullText: readonly string[] = EXCEL_ERROR_TOKENS
+    private readonly nullText: readonly string[] = EXCEL_ERROR_TOKENS,
+    /**
+     * For .sqlite/.db only: how each table is read through its view, and which
+     * of its columns the file declares with no type. An edit needs both — the
+     * row is found through the same expressions the grid showed, and a column
+     * with no declared type cannot be written the way a typed one can.
+     * See sqliteTypes.ts.
+     */
+    private sqlitePlan: SqlitePlan = new Map()
   ) {}
 
   /**
@@ -1652,6 +1697,9 @@ export class DuckDbFile {
     const pendingSheets = new Map<string, PendingSheet>();
     /** Whether to look for tables inside a sheet at all; see DuckDbFileOpenOptions. */
     const tableMode: SheetTableMode = options?.sheetTables ?? 'grid';
+    // How each SQLite table is read, including any column the file declares
+    // with no type at all. Set by the isSqlite branch; empty for every other kind.
+    let sqlitePlan: SqlitePlan = new Map();
     const looksArrow = /\.(arrows?|feather)$/i.test(path);
     const isFeather = looksArrow && (await isFeatherEncoding(path));
     const isArrow = looksArrow && !isFeather;
@@ -1945,24 +1993,36 @@ export class DuckDbFile {
     if (isSqlite) {
       await ensureSqliteExtension(connection);
       const filePath = path.replace(/'/g, "''");
+      // The file itself is attached out of the way, under a name nothing else
+      // here uses, and the name this file is KNOWN by belongs to an in-memory
+      // catalog of views over it (see sqliteTypes.ts). That indirection is
+      // what lets a column SQLite declares with no type be read as what it
+      // actually holds; every other catalog-qualified path in this class
+      // keeps working unchanged, because the name they qualify with is the
+      // view catalog.
+      const sourceCatalog = sqliteSourceCatalogOf(mainObjectName);
       if (forceReadOnly) {
-        await connection.run(`attach '${filePath}' as "${mainObjectName}" (type sqlite, read_only)`);
+        await connection.run(`attach '${filePath}' as ${quoteIdent(sourceCatalog)} (type sqlite, read_only)`);
         readOnly = true;
       } else {
         try {
-          await connection.run(`attach '${filePath}' as "${mainObjectName}" (type sqlite)`);
+          await connection.run(`attach '${filePath}' as ${quoteIdent(sourceCatalog)} (type sqlite)`);
         } catch (err) {
           // Same fallback as the direct .duckdb path above, for attached
           // SQLite files (a .db/.sqlite backup file attached elsewhere).
           if (isLockConflict(err)) {
-            await connection.run(`attach '${filePath}' as "${mainObjectName}" (type sqlite, read_only)`);
+            await connection.run(`attach '${filePath}' as ${quoteIdent(sourceCatalog)} (type sqlite, read_only)`);
             readOnly = true;
           } else {
             throw err;
           }
         }
       }
+      await connection.run(`attach ':memory:' as "${mainObjectName}"`);
+      sqlitePlan = await planSqliteTables(connection, sourceCatalog);
+      await createSqliteViews(connection, mainObjectName, sqlitePlan);
       await connection.run(`use "${mainObjectName}"`);
+      openWarnings.push(...sqliteRetypeNotices(sqlitePlan));
     }
 
     // NOTE: a workbook does none of its reading here.
@@ -2055,7 +2115,8 @@ export class DuckDbFile {
       viewSources,
       pendingSheets,
       tableMode,
-      nullText
+      nullText,
+      sqlitePlan
     );
   }
 
@@ -2069,7 +2130,14 @@ export class DuckDbFile {
       const filePath = siblingPath.replace(/'/g, "''");
       if (isSiblingSqlite) {
         await ensureSqliteExtension(connection);
-        await connection.run(`attach '${filePath}' as ${quoteIdent(alias)} (type sqlite, read_only)`);
+        // The hot half of a pair is read through views too, for the same
+        // reason the cold half is — and because the combined view UNIONs the
+        // two, so a column read as text on one side and as bytes on the other
+        // would not even line up as one column.
+        const sourceCatalog = sqliteSourceCatalogOf(alias);
+        await connection.run(`attach '${filePath}' as ${quoteIdent(sourceCatalog)} (type sqlite, read_only)`);
+        await connection.run(`attach ':memory:' as ${quoteIdent(alias)}`);
+        await createSqliteViews(connection, alias, await planSqliteTables(connection, sourceCatalog));
       } else {
         await connection.run(`attach '${filePath}' as ${quoteIdent(alias)} (read_only)`);
       }
@@ -2082,10 +2150,15 @@ export class DuckDbFile {
       );
       return { alias, isSqlite: isSiblingSqlite };
     } catch {
-      try {
-        await connection.run(`detach ${quoteIdent(alias)}`);
-      } catch {
-        // Attach itself never succeeded — nothing to detach.
+      // Either name may or may not have been attached before the failure, so
+      // both are cleared independently — a leftover holds the alias against
+      // the next attempt.
+      for (const name of [alias, sqliteSourceCatalogOf(alias)]) {
+        try {
+          await connection.run(`detach ${quoteIdent(name)}`);
+        } catch {
+          // Attach itself never succeeded — nothing to detach.
+        }
       }
       return undefined;
     }
@@ -2336,15 +2409,24 @@ export class DuckDbFile {
       switch (this.kind) {
         case 'sqlite': {
           // The SQLite scanner holds its own file handle, so re-ATTACHing is
-          // what actually makes another process's commits visible. A catalog
-          // can't detach itself, hence the hop through the root catalog.
+          // what actually makes another process's commits visible. What is
+          // swapped is the file's own attachment, underneath the view catalog
+          // this connection is standing in — which is why there is no hop
+          // through the root catalog here any more: the catalog being
+          // detached is never the current one.
           const filePath = this.path.replace(/'/g, "''");
-          await this.connection.run(`use ${quoteIdent(this.rootCatalogName)}`);
-          await this.connection.run(`detach ${quoteIdent(this.catalogName)}`);
+          const sourceCatalog = sqliteSourceCatalogOf(this.mainObjectName);
+          await this.connection.run(`detach ${quoteIdent(sourceCatalog)}`);
           await this.connection.run(
-            `attach '${filePath}' as ${quoteIdent(this.catalogName)} (type sqlite, read_only)`
+            `attach '${filePath}' as ${quoteIdent(sourceCatalog)} (type sqlite, read_only)`
           );
-          await this.connection.run(`use ${quoteIdent(this.catalogName)}`);
+          // Untyped storage classes can change without DDL. Recheck them on
+          // file changes; fully declared tables reuse their schema-only plans.
+          const plan = await planSqliteTables(this.connection, sourceCatalog, this.sqlitePlan);
+          if (!planStillFits(plan, this.sqlitePlan)) {
+            await createSqliteViews(this.connection, this.mainObjectName, plan);
+          }
+          this.sqlitePlan = plan;
           break;
         }
         case 'parquet':
@@ -2411,6 +2493,11 @@ export class DuckDbFile {
   private async refreshSibling(): Promise<void> {
     if (!this.siblingCatalogName || !this.siblingPath) return;
     await this.connection.run(`detach ${quoteIdent(this.siblingCatalogName)}`);
+    if (this.siblingIsSqlite) {
+      await this.connection
+        .run(`detach ${quoteIdent(sqliteSourceCatalogOf(this.siblingCatalogName))}`)
+        .catch(() => undefined);
+    }
     const attached = await DuckDbFile.tryAttachSibling(this.connection, this.siblingPath);
     // A sibling that has since vanished or gone unreadable degrades to "no
     // sibling", exactly as it would have on a fresh open.
@@ -2846,19 +2933,37 @@ export class DuckDbFile {
   }
 
   private async runQueryOnce(sql: string, maxRows = 0): Promise<QueryResult> {
-    const capped = maxRows > 0;
-    // One past the cap: that extra row is what distinguishes "exactly maxRows
-    // rows exist" from "there were more", without reading the rest.
-    const reader = capped
-      ? await this.connection.streamAndReadUntil(sql, maxRows + 1)
-      : await this.connection.streamAndReadAll(sql);
-    const columns = reader.columnNames();
-    let rows = reader.getRowsJson() as unknown[][];
-    // Rows arrive a vector at a time, so a read of maxRows + 1 can overshoot.
-    const truncated = capped && rows.length > maxRows;
-    if (truncated) rows = rows.slice(0, maxRows);
-    const columnStatsKind = reader.columnTypes().map((t) => classifyForStats(t.typeId));
-    return { columns, rows, columnStatsKind, truncated };
+    // sqlite_query holds a SQLite statement owned by the current transaction.
+    // Keep that transaction alive until a streaming read has consumed its rows
+    // (including capped reads), otherwise the extension releases its handle early.
+    const needsSnapshot = this.siblingIsSqlite || [...this.sqlitePlan.values()].some(
+      (p) => p.numericText.size > 0 || [...p.retyped.values()].includes('DOUBLE')
+    );
+    let snapshot = false;
+    if (needsSnapshot) {
+      const statements = await this.connection.extractStatements(sql);
+      if (statements.count === 1 && (await statements.prepare(0)).statementType === StatementType.SELECT) {
+        await this.connection.run('begin transaction');
+        snapshot = true;
+      }
+    }
+    try {
+      const capped = maxRows > 0;
+      // One past the cap: that extra row is what distinguishes "exactly maxRows
+      // rows exist" from "there were more", without reading the rest.
+      const reader = capped
+        ? await this.connection.streamAndReadUntil(sql, maxRows + 1)
+        : await this.connection.streamAndReadAll(sql);
+      const columns = reader.columnNames();
+      let rows = reader.getRowsJson() as unknown[][];
+      // Rows arrive a vector at a time, so a read of maxRows + 1 can overshoot.
+      const truncated = capped && rows.length > maxRows;
+      if (truncated) rows = rows.slice(0, maxRows);
+      const columnStatsKind = reader.columnTypes().map((t) => classifyForStats(t.typeId));
+      return { columns, rows, columnStatsKind, truncated };
+    } finally {
+      if (snapshot) await this.connection.run('rollback');
+    }
   }
 
   /**
@@ -3142,9 +3247,17 @@ export class DuckDbFile {
       return;
     }
     if (this.kind === 'sqlite') {
+      // Read exactly as the live file is read, views and all. Comparing a
+      // retyped live table against a raw backup would report every row of
+      // every untyped column as changed, because one side is text and the
+      // other the bytes behind it — a Safe Mode that cries wolf is worse
+      // than no Safe Mode, since its whole job is to say what really changed.
+      const sourceCatalog = sqliteSourceCatalogOf('backup_cmp');
       await this.connection.run(
-        `attach ${quoteLiteral(this.lastBackupPath)} as backup_cmp (type sqlite, read_only)`
+        `attach ${quoteLiteral(this.lastBackupPath)} as ${quoteIdent(sourceCatalog)} (type sqlite, read_only)`
       );
+      await this.connection.run(`attach ':memory:' as backup_cmp`);
+      await createSqliteViews(this.connection, 'backup_cmp', await planSqliteTables(this.connection, sourceCatalog));
       return;
     }
 
@@ -3249,6 +3362,14 @@ export class DuckDbFile {
 
   private async detachBackupCatalog(): Promise<void> {
     await this.connection.run('detach backup_cmp');
+    if (this.kind === 'sqlite') {
+      // The file under the backup's views. Best-effort by the same reasoning
+      // as createBackup's unconditional detach: a half-detached state must not
+      // be what a later attempt trips over.
+      await this.connection
+        .run(`detach ${quoteIdent(sqliteSourceCatalogOf('backup_cmp'))}`)
+        .catch(() => undefined);
+    }
     await this.clearBackupTempDir();
   }
 
@@ -3501,6 +3622,9 @@ export class DuckDbFile {
     if (this.kind === 'xlsx') {
       return this.updateXlsxCell(table, column, newValue, rowValues, onStatus);
     }
+    if (this.kind === 'sqlite') {
+      return this.updateSqliteCell(table, column, newValue, rowValues);
+    }
 
     if (!this.materialized && this.isFlatFileKind()) {
       onStatus?.('Preparing file for editing…');
@@ -3594,6 +3718,130 @@ export class DuckDbFile {
       }
     }
     return rowsChanged;
+  }
+
+  /**
+   * One cell of one SQLite table, written to the file the views read.
+   *
+   * An edit cannot go through the view (DuckDB will not update one), and it
+   * cannot be aimed at the table by full-row equality the way every other kind
+   * is either: the values being matched are what the VIEW showed, so a retyped
+   * column's text would be compared against the BLOB the scanner sees and the
+   * comparison would fail on its own conversion. The row is therefore found
+   * through the same expressions the grid was reading, and its `rowid` — which
+   * SQLite gives every ordinary table — carries the identity to the UPDATE.
+   *
+   * The write itself is the other half. A column with no declared type has no
+   * affinity, so SQLite stores whatever class it is handed, and handing it a
+   * BLOB (which is what DuckDB would bind for a BLOB-typed column) would turn
+   * a text value into a blob in somebody's file. `sqlite_all_varchar` makes
+   * the scanner present that column as VARCHAR for the one statement, so the
+   * value lands as text, as it was.
+   */
+  private async updateSqliteCell(
+    table: string,
+    column: string,
+    newValue: unknown,
+    rowValues: Record<string, unknown>
+  ): Promise<number> {
+    const plan = this.sqlitePlan.get(table);
+    const sourceRef = `${quoteIdent(sqliteSourceCatalogOf(this.mainObjectName))}.main.${quoteIdent(table)}`;
+    // DuckDB exposes SQLite's hidden identity only as rowid. A real column
+    // with that name shadows it, so no unique internal identity is available.
+    if (!plan || plan.columns.some((c) => c.toLowerCase() === 'rowid')) {
+      throw new Error(`The table "${table}" has no unshadowed rowid available; the edit was refused.`);
+    }
+    const targetType = plan?.retyped.get(column);
+    if ((targetType && targetType !== 'VARCHAR') || plan.numericText.has(column)) {
+      // Text can be written back as text. A number cannot be written back as a
+      // number: with no declared type there is no affinity to convert it, and
+      // the only class this can hand SQLite for such a column is text — which
+      // would leave one cell of a column of numbers holding "42" as text, a
+      // difference every other reader of the file would see. Refused rather
+      // than done quietly.
+      throw new Error(
+        `"${column}" is declared with no type in "${basename(this.path)}", and its values are stored as ` +
+          `numbers. Saving an edit here would store text instead, which would change what other programs ` +
+          `read, so this column cannot be edited.`
+      );
+    }
+
+    const whereCols = Object.keys(rowValues);
+    const whereClause = whereCols.map((c, i) => `${quoteIdent(c)} is not distinct from $${i + 1}`).join(' and ');
+    const whereValues = whereCols.map((c) => rowValues[c]) as DuckDBValue[];
+
+    // Finding the row comes FIRST, and outside the write's transaction, for a
+    // reason worth stating: a table's column types are settled the first time
+    // a transaction touches it, so a lookup inside the transaction would fix
+    // this table as BLOB and leave `sqlite_all_varchar` with nothing to change.
+    // What the transaction loses by that ordering, the UPDATE takes back below
+    // by re-checking the cell's own value as it writes.
+    let matched: unknown[][];
+    try {
+      matched = (
+        await this.connection.runAndReadAll(
+          `select ${quoteIdent(plan.rowIdentity)} from (${plan.lookupSql}) where ${whereClause} limit 2`,
+          whereValues
+        )
+      ).getRows();
+    } catch (err) {
+      // WITHOUT ROWID tables have no rowid to select. Nothing here can
+      // identify a row in one, so the edit is refused with the reason rather
+      // than aimed at whatever else might match.
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `The row to edit in "${table}" could not be identified, so nothing was changed. (${message})`
+      );
+    }
+    if (matched.length === 0) return 0;
+    if (matched.length > 1) {
+      throw new Error(
+        `${matched.length} rows in "${table}" are identical across every column, so there ` +
+          `is no way to tell which one you edited. The file was not changed.`
+      );
+    }
+
+    // `rowid` says WHICH row, and the cell's pre-edit value says the row is
+    // still the one that was on screen -- so a row rewritten by another
+    // process between the lookup and the write updates nothing (0 rows, which
+    // the caller reports as "no matching row") rather than being overwritten.
+    const rowid = matched[0][0] as DuckDBValue;
+    const sql =
+      `update ${sourceRef} set ${quoteIdent(column)} = $1 ` +
+      `where rowid = $2 and ${quoteIdent(column)} is not distinct from $3`;
+    const previous = rowValues[column];
+    await this.connection.run('begin transaction');
+    try {
+      if (targetType === 'VARCHAR') {
+        // Set before anything in this transaction reads the table, and
+        // restored even if the UPDATE throws: while it is on, every SQLite
+        // column on this connection reads as text.
+        await this.connection.run('set sqlite_all_varchar = true');
+        try {
+          const { rowsChanged } = await this.connection.run(sql, [
+            newValue === null || newValue === undefined ? null : String(newValue),
+            rowid,
+            previous === null || previous === undefined ? null : String(previous),
+          ] as DuckDBValue[]);
+          if (rowsChanged !== 1) throw new Error('The SQLite edit did not update exactly one row; rolled back.');
+          await this.connection.run('commit');
+          return rowsChanged;
+        } finally {
+          await this.connection.run('set sqlite_all_varchar = false').catch(() => undefined);
+        }
+      }
+      const { rowsChanged } = await this.connection.run(sql, [
+        newValue as DuckDBValue,
+        rowid,
+        previous as DuckDBValue,
+      ]);
+      if (rowsChanged !== 1) throw new Error('The SQLite edit did not update exactly one row; rolled back.');
+      await this.connection.run('commit');
+      return rowsChanged;
+    } catch (err) {
+      await this.connection.run('rollback').catch(() => undefined);
+      throw err;
+    }
   }
 
   /**
