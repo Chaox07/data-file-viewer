@@ -4,6 +4,13 @@ Date: 2026-09-23. Investigated version: 0.0.13, commit `46ae830`.
 
 **Status: planning only. No application changes are implemented by this document.**
 
+The required security controls, test matrix and release gates are specified in
+[the security and reliability suite plan](sql-filtering-security-suite-plan.md).
+That companion is part of this implementation scope, including the existing
+shared SQL paths exercised by the new controls. It supersedes weaker error,
+configuration and release assumptions below; the feature must not ship without
+its security gates.
+
 ## 1. Verified problem
 
 The reported query was:
@@ -108,7 +115,9 @@ joins, projections and ORDER BY invalidate worksheet coordinates.
 
 ### C. Explain date/type and worksheet-target errors
 
-Preserve the original engine error, but add a short contextual explanation:
+Preserve the engine error category and useful location, redact credentials,
+unrequested cell values and unrelated paths as defined in the security plan,
+and add a short contextual explanation:
 
 - `VARCHAR` compared with an integer: explain that the stored column is text.
   For date intent, present an explicit date-cast example; do not rewrite SQL.
@@ -119,7 +128,7 @@ Preserve the original engine error, but add a short contextual explanation:
 
 Diagnostics must use known relation/column metadata, not assume that every
 column named Date contains dates or that every integer is a year. Where the SQL
-target is ambiguous, show the schema and original error without guessing.
+target is ambiguous, show the schema and sanitized engine error without guessing.
 Use a separate small helper such as `src/queryDiagnostics.ts` for classification
 and messages; the host remains responsible for metadata and execution.
 
@@ -160,7 +169,10 @@ and require target reselection before generating replacement SQL.
 | 4. Lifecycle corrections, if reproduced | connection/provider/state files | Cold first use, failed-query discovery and refreshed targets work without changing SQL meaning. |
 | 5. Validation and documentation | focused tests, browser harness, `README.md` | Verified user workflows, known failures reported, documentation matches behavior. |
 
-No new user configuration is needed. Preserve Safe Mode, query cancellation,
+No new configuration is needed for table selection or date guidance. Security
+policy and any necessary compatibility choices follow the companion plan;
+internal limits must not become a collection of user-facing settings.
+Preserve Safe Mode, query cancellation,
 result caps, editability checks, full-query sorting and exact query-based plotting.
 Do not extend arbitrary SQL editability or undertake SQL-engine/parser replacement.
 No changes to other projects, source workbooks or database schemas are included.
@@ -194,6 +206,8 @@ files for local acceptance. Never commit those files or extracted row data.
 
 Run typecheck, focused connection/provider/reducer tests, proportionate browser
 checks and the complete existing suite. Report skipped and known cases separately.
+The companion plan additionally requires adversarial, containment, cross-document,
+fuzz, packaging and installed-host checks with explicit pass/fail conditions.
 
 ## 6. Delivery gate
 
