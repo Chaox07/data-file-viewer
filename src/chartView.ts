@@ -22,6 +22,7 @@ import {
 // registers every chart type and component and took a bundle from 468 KB to
 // 1.5 MB. This registers the line chart and the components actually used
 // below, and nothing else.
+import { DETAIL_POINT_LIMIT, countVisiblePoints, zoomBounds, detailStyle, type ZoomRange } from './chartDetail';
 import * as echarts from 'echarts/core';
 import { LineChart, ScatterChart } from 'echarts/charts';
 import {
@@ -98,15 +99,6 @@ const X_AXIS_INDEX = 0;
 
 /** y ticks per axis -- `y_ticks` in long_run_3.R. */
 const Y_TICKS = 8;
-
-/**
- * Above this many points IN VIEW the tooltip switches itself off, and back on
- * once a zoom brings the count down -- `zoom_threshold` in long_run_3.R, and
- * the reason e_zoom_aware_detail exists over there. With thousands of points
- * overplotted into the same few pixels, the value under the cursor is not the
- * value the eye is on, so the number it reports is close to meaningless.
- */
-const TOOLTIP_POINT_LIMIT = 3000;
 
 // A drag narrower than this is a click, not a zoom. Load-bearing for
 // double-click-to-reset: with the brush cursor active every click IS a
@@ -227,9 +219,9 @@ function formatAxisNumber(value: number): string {
   return value.toLocaleString(undefined, { maximumSignificantDigits: 3 });
 }
 
-/** Tooltip values: four significant digits -- build_tooltip_formatter's fmtValue. */
+/** Keep every digit available in the plotted numeric value. */
 function formatTooltipNumber(value: number): string {
-  return Number(value).toPrecision(4);
+  return String(value);
 }
 
 interface TooltipParam {
@@ -250,7 +242,9 @@ function formatTooltip(
   const header = isCategory
     ? (first.axisValueLabel ?? '')
     : pointDateLabel((first.value as [number, unknown])?.[0], frequency);
-  const lines = [`<b>${escapeHtml(header)}</b>`];
+  const timestamp = !isCategory ? (first.value as [number, unknown])?.[0] : undefined;
+  const exactX = timestamp != null && Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : '';
+  const lines = [`<b>${escapeHtml(header)}</b>${exactX ? `<br/>${escapeHtml(exactX)}` : ''}`];
   for (const p of params) {
     const raw = isCategory ? p.value : (p.value as [number, unknown])?.[1];
     if (raw === null || raw === undefined || typeof raw !== 'number') continue;
@@ -338,19 +332,22 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
     return isCategory ? toCategoryValues(ys) : toSeriesPoints(xs, ys);
   });
 
+  const positions = data.map(points => points.flatMap((point, index) => {
+    const x = Array.isArray(point) ? point[0] : index;
+    const y = Array.isArray(point) ? point[1] : point;
+    return y != null && Number.isFinite(y) ? [x] : [];
+  }).sort((a, b) => a - b));
+  let detailShown = positions.reduce((n, xs) => n + xs.length, 0) <= DETAIL_POINT_LIMIT;
+
   buildSeries = (forMode: ChartMode) =>
     message.yColumns.map((name, i) => ({
+      id: `data-${i}`,
       name,
       data: data[i],
       ...seriesShape(forMode, SERIES_COLOURS[i % SERIES_COLOURS.length]),
-      // large/progressive keep a long daily series interactive, on either mark
-      // -- the R traces carry them on both too. No sampling: lttb invents sharp
-      // spikes at the zoomed-out view that are not in the data, which is the
-      // same reason the R scripts turn it off.
-      large: true,
-      largeThreshold: 2000,
-      progressive: 2000,
-      progressiveThreshold: 2000,
+      // Dense scatter views use canvas batching; detail uses individual
+      // symbols for hover. Keep every observation without sampling.
+      ...detailStyle(forMode, detailShown),
     }));
 
   // A new plot is a new question, so the mark goes back to the line the R
@@ -434,9 +431,8 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
     tooltip: {
       trigger: 'axis',
       // Starts off when the opening view is already too dense to hover
-      // usefully; the datazoom handler below turns it back on. Same gate, and
-      // the same starting condition, as e_zoom_aware_detail.
-      show: drawn <= TOOLTIP_POINT_LIMIT,
+      // usefully; the datazoom handler below turns it back on.
+      show: detailShown,
       formatter: (params: unknown) => formatTooltip(params as TooltipParam[], isCategory, frequency),
       backgroundColor: '#ffffff',
       borderColor: '#000000',
@@ -565,36 +561,33 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
     chart?.dispatchAction({ type: 'brush', areas: [] });
   });
 
-  // The other half of the density gate: recount what is in view after every
-  // zoom and switch the tooltip accordingly. Only the top-level `show` flag is
-  // touched, so the formatter and styling above survive the merge.
-  //
-  // The range comes off the EVENT, not from chart.getOption(). ECharts
-  // documents getOption() as returning a deep copy of the whole option object
-  // -- series data included -- so reading it here deep-cloned every point on
-  // the chart on every single scroll-wheel step. On a 12,000-point series
-  // that is the difference between panning smoothly and not. (The same bug
-  // was in long_run_3.R's handler, which this was ported from; both are
-  // fixed.) A user drag/wheel puts the range on params directly; a
-  // dispatchAction -- which is what the brush-zoom and reset above both do --
-  // puts it under params.batch[0].
-  //
-  // The flag is also latched: setOption() forces an option merge and a
-  // re-render, and firing it on every event meant hundreds of no-op redraws
-  // during one drag.
-  let tooltipShown = drawn <= TOOLTIP_POINT_LIMIT;
-  chart.on('datazoom', (params: unknown) => {
+  // Read both percentage wheel events and value-based brush events. Counting
+  // sorted positions also handles irregular dates without cloning chart data.
+  const fullRange: [number, number] = isCategory
+    ? [0, Math.max(0, labels.length - 1)]
+    : [xRange?.min ?? 0, xRange?.max ?? 0];
+  let visibleRange: [number, number] = fullRange;
+  let selected: Record<string, boolean> = {};
+  const syncDetail = () => {
     if (!chart) return;
-    const p = params as { start?: number; end?: number; batch?: { start?: number; end?: number }[] };
-    const src = p?.batch?.length ? p.batch[0] : p;
-    if (!src || (src.start == null && src.end == null)) return;
-    const from = src.start ?? 0;
-    const to = src.end ?? 100;
-    const visible = (drawn * (to - from)) / 100;
-    const want = visible <= TOOLTIP_POINT_LIMIT;
-    if (want === tooltipShown) return;
-    tooltipShown = want;
-    chart.setOption({ tooltip: { show: want } });
+    const visible = positions.reduce((n, xs, i) =>
+      n + (selected[message.yColumns[i]] === false ? 0 : countVisiblePoints(xs, visibleRange)), 0);
+    const want = visible <= DETAIL_POINT_LIMIT;
+    if (want === detailShown) return;
+    detailShown = want;
+    if (!want) chart.dispatchAction({ type: 'hideTip' });
+    chart.setOption({
+      tooltip: { show: want },
+      series: message.yColumns.map((_, i) => ({ id: `data-${i}`, ...detailStyle(mode, want) })),
+    });
+  };
+  chart.on('datazoom', (params: unknown) => {
+    visibleRange = zoomBounds(params as ZoomRange, fullRange, visibleRange, isCategory);
+    syncDetail();
+  });
+  chart.on('legendselectchanged', (params: unknown) => {
+    selected = (params as { selected: Record<string, boolean> }).selected;
+    syncDetail();
   });
 
   armBrush();

@@ -9,6 +9,14 @@ DuckDB is the engine reading most of these formats under the hood; kdb+
 files are parsed directly in their own real format (see the kdb+ section
 below).
 
+### 0.0.12: inspect points after zooming
+
+Zooming to at most 3,000 visible, non-null points reveals line markers and
+hover values. The count follows the actual observations and visible series,
+including irregular dates and category axes. Tooltips retain all digits of
+the plotted number and include the timestamp in UTC. Drag zoom, wheel zoom,
+reset and line/scatter switching keep the detail state consistent.
+
 ### 0.0.11: restore table preview controls
 
 Automatic and sidebar previews of DuckDB and other non-Excel tables again
@@ -304,6 +312,11 @@ the complete table; its chart uses exactly the filtered, display-limited rows.
   the plot (or ⟲ in the top right) puts it back. There is no slider along the
   bottom: that is a second, smaller
   copy of the chart you have to aim at before you can look at the real one.
+
+  At **3,000 visible points or fewer**, individual line markers and hover
+  values appear automatically. Hover shows the category or UTC timestamp and
+  the plotted numeric value without rounding to four significant digits.
+  Zooming out hides detail again to keep dense views readable.
 
   **∴ beside ⟲ switches the line to a scatter**, and pressing it again switches
   back — one button, because the only other state is the one you came from. It
