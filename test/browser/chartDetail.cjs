@@ -27,9 +27,26 @@ const assert = require('node:assert/strict');
       const chart = viewerTest.testChart();
       const state = () => {
         const option = chart.getOption();
-        return { tooltip: option.tooltip[0].show, symbols: option.series[0].showSymbol, large: option.series[0].large, type: option.series[0].type };
+        return { tooltip: option.tooltip[0].showContent, symbols: option.series[0].showSymbol, large: option.series[0].large, type: option.series[0].type };
+      };
+      const inspectCross = async () => {
+        const labelsBefore = chart.getZr().storage.getDisplayList().filter(el => el.type === 'tspan').length;
+        chart.dispatchAction({ type: 'updateAxisPointer', x: 413, y: 213 });
+        await pause();
+        chart.getZr().flush();
+        const display = chart.getZr().storage.getDisplayList(true);
+        const lines = display.filter(el => el.type.toLowerCase() === 'line').map(el => el.shape);
+        const option = chart.getOption().tooltip[0];
+        return {
+          vertical: lines.some(s => Math.abs(s.x1 - 413) <= 1 && s.x1 === s.x2 && Math.abs(s.y2 - s.y1) > 100),
+          horizontal: lines.some(s => Math.abs(s.y1 - 213) <= 1 && s.y1 === s.y2 && Math.abs(s.x2 - s.x1) > 100),
+          extraLabels: display.filter(el => el.type === 'tspan').length - labelsBefore,
+          popup: option.showContent,
+          trigger: option.trigger,
+        };
       };
       const initial = state();
+      const denseCross = await inspectCross();
       chart.dispatchAction({ type: 'dataZoom', startValue: start, endValue: start + 2999 * 1000 });
       await pause();
       const boundary = state();
@@ -49,6 +66,7 @@ const assert = require('node:assert/strict');
       document.querySelector('.chart-reset').click();
       await pause();
       const reset = state();
+      const resetCross = await inspectCross();
       document.querySelector('.chart-mode').click();
       await pause();
       const lineReset = state();
@@ -58,16 +76,23 @@ const assert = require('node:assert/strict');
       const categoryChart = viewerTest.testChart();
       categoryChart.dispatchAction({ type: 'dataZoom', startValue: 0, endValue: 1999 });
       await pause();
-      const category = categoryChart.getOption().tooltip[0].show;
+      const category = categoryChart.getOption().tooltip[0].showContent;
       categoryChart.dispatchAction({ type: 'dataZoom', start: 0, end: 100 });
       categoryChart.dispatchAction({ type: 'legendUnSelect', name: 'a' });
       // legendUnSelect emits legendunselected, whereas a click emits legendselectchanged.
       categoryChart.dispatchAction({ type: 'legendToggleSelect', name: 'a' });
       categoryChart.dispatchAction({ type: 'legendToggleSelect', name: 'a' });
       await pause();
-      const hidden = categoryChart.getOption().tooltip[0].show;
-      return { initial, boundary, over, wheel, scatter, reset, lineReset, renderedSymbols, text, category, hidden };
+      const hidden = categoryChart.getOption().tooltip[0].showContent;
+      return { initial, boundary, over, wheel, scatter, reset, lineReset, renderedSymbols, text, category, hidden, denseCross, resetCross };
     });
+    for (const cross of [result.denseCross, result.resetCross]) {
+      assert.equal(cross.vertical, true, JSON.stringify(cross));
+      assert.equal(cross.horizontal, true, JSON.stringify(cross));
+      assert.equal(cross.extraLabels, 0);
+      assert.equal(cross.popup, false);
+      assert.equal(cross.trigger, 'none');
+    }
     assert.equal(result.initial.tooltip, false);
     assert.equal(result.initial.symbols, false);
     assert.equal(result.boundary.tooltip, true);
@@ -99,9 +124,27 @@ const assert = require('node:assert/strict');
     await page.mouse.move(drag[1].x, drag[1].y, { steps: 10 });
     await page.mouse.up();
     await page.waitForTimeout(150);
-    assert.equal(await page.evaluate(() => viewerTest.testChart().getOption().tooltip[0].show), true);
+    assert.equal(await page.evaluate(() => viewerTest.testChart().getOption().tooltip[0].showContent), true);
     await page.locator('.chart-reset').click();
-    assert.equal(await page.evaluate(() => viewerTest.testChart().getOption().tooltip[0].show), false);
+    assert.equal(await page.evaluate(() => viewerTest.testChart().getOption().tooltip[0].showContent), false);
+    const box = await page.locator('.chart-canvas').boundingBox();
+    await page.mouse.move(box.x + 413, box.y + 213);
+    await page.waitForTimeout(100);
+    const mouseCross = await page.evaluate(() => {
+      const chart = viewerTest.testChart();
+      const lines = chart.getZr().storage.getDisplayList(true)
+        .filter(el => el.type.toLowerCase() === 'line').map(el => el.shape);
+      const popups = [...document.querySelectorAll('div')].filter(el =>
+        el.style.position === 'absolute' && el.textContent.includes('row') &&
+        getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none');
+      return {
+        vertical: lines.some(s => Math.abs(s.x1 - 413) <= 1 && s.x1 === s.x2 && Math.abs(s.y2 - s.y1) > 100),
+        horizontal: lines.some(s => Math.abs(s.y1 - 213) <= 1 && s.y1 === s.y2 && Math.abs(s.x2 - s.x1) > 100),
+        popups: popups.length,
+        emphasis: chart.getOption().axisPointer[0].triggerEmphasis,
+      };
+    });
+    assert.deepEqual(mouseCross, { vertical: true, horizontal: true, popups: 0, emphasis: false });
     assert.deepEqual(errors, []);
     console.log('Chrome chart checks passed: 200,000 points, exact tooltip, markers, threshold, wheel/brush/reset, scatter, categories, gaps and legend.');
   } finally { await browser.close(); }

@@ -9,6 +9,12 @@ DuckDB is the engine reading most of these formats under the hood; kdb+
 files are parsed directly in their own real format (see the kdb+ section
 below).
 
+### 0.0.13: crosshair in dense charts
+
+Dense charts now show a crosshair for estimating positions against the axes,
+without a data popup or floating value labels. Zooming in still enables the
+point markers and exact hover values introduced in 0.0.12.
+
 ### 0.0.12: inspect points after zooming
 
 Zooming to at most 3,000 visible, non-null points reveals line markers and
@@ -316,7 +322,8 @@ the complete table; its chart uses exactly the filtered, display-limited rows.
   At **3,000 visible points or fewer**, individual line markers and hover
   values appear automatically. Hover shows the category or UTC timestamp and
   the plotted numeric value without rounding to four significant digits.
-  Zooming out hides detail again to keep dense views readable.
+  Zooming out hides detail again, while a crosshair remains available for
+  estimating positions against the axes without a data popup or value labels.
 
   **∴ beside ⟲ switches the line to a scatter**, and pressing it again switches
   back — one button, because the only other state is the one you came from. It

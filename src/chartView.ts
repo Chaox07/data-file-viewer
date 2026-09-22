@@ -428,11 +428,13 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
       message.yColumns.length > 1
         ? { bottom: 0, textStyle: { color: INK, fontFamily: CHART_FONT, fontSize: 11 } }
         : undefined,
+    axisPointer: { triggerEmphasis: detailShown },
     tooltip: {
-      trigger: 'axis',
-      // Starts off when the opening view is already too dense to hover
-      // usefully; the datazoom handler below turns it back on.
-      show: detailShown,
+      // Keep the crosshair active even when the data popup is hidden. In
+      // dense views it follows the cursor instead of snapping to a data row.
+      show: true,
+      showContent: detailShown,
+      trigger: detailShown ? 'axis' : 'none',
       formatter: (params: unknown) => formatTooltip(params as TooltipParam[], isCategory, frequency),
       backgroundColor: '#ffffff',
       borderColor: '#000000',
@@ -442,6 +444,7 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
       // axis is half of what a hover is for.
       axisPointer: {
         type: 'cross',
+        animation: false,
         crossStyle: { color: '#000000', width: 1, type: 'solid' },
         label: { show: false },
       },
@@ -577,7 +580,8 @@ function render(message: Extract<ChartMessage, { command: 'chart' }>): void {
     detailShown = want;
     if (!want) chart.dispatchAction({ type: 'hideTip' });
     chart.setOption({
-      tooltip: { show: want },
+      axisPointer: { triggerEmphasis: want },
+      tooltip: { showContent: want, trigger: want ? 'axis' : 'none' },
       series: message.yColumns.map((_, i) => ({ id: `data-${i}`, ...detailStyle(mode, want) })),
     });
   };
