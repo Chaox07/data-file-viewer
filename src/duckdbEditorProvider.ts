@@ -1272,7 +1272,9 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
           document.lastQueriedBaseTable =
             document.combinedQueryMap.get(sql) ?? (editability.editable ? editability.table : undefined);
           document.lastSheetPreview =
-            message.sheetPreview && baseTableOfSelect(sql) === message.sheetPreview
+            message.sheetPreview &&
+            document.file.isWorksheet(message.sheetPreview) &&
+            baseTableOfSelect(sql) === message.sheetPreview
               ? message.sheetPreview
               : undefined;
 

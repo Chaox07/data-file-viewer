@@ -9,6 +9,12 @@ DuckDB is the engine reading most of these formats under the hood; kdb+
 files are parsed directly in their own real format (see the kdb+ section
 below).
 
+### 0.0.11: restore table preview controls
+
+Automatic and sidebar previews of DuckDB and other non-Excel tables again
+show sorting, statistics and eligible plot buttons. Only actual Excel
+worksheets use worksheet header controls, including when table detection is off.
+
 
 ### SQLite columns without declared types
 

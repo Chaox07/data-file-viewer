@@ -2205,6 +2205,11 @@ export class DuckDbFile {
     return tables.filter((name) => this.viewSources.get(name)?.derived !== true);
   }
 
+  /** Only original workbook sheets have worksheet coordinates, even with detection off. */
+  isWorksheet(name: string): boolean {
+    return this.kind === 'xlsx' && this.xlsxSheetPaths.has(name);
+  }
+
   getDetectedSheetTables(sheet: string): DetectedSheetTable[] {
     return (this.detectedSheetTables.get(sheet) ?? []).map((table) => ({
       ...table,
