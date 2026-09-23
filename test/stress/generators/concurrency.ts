@@ -60,7 +60,7 @@ async function documentFor(path: string): Promise<DuckDBDocument> {
 registerCase({
   name: 'concurrency_exclusive_work_does_not_overlap',
   family: 'concurrency',
-  expect: { note: 'twenty queued jobs run one at a time, in submission order' },
+  expect: { note: 'twenty submissions respect the bounded queue; accepted jobs run one at a time, in submission order' },
   build: async (ctx) => ({ path: await w.duckdbFile(join(ctx.dir, 'seed.duckdb'), [SPEC]) }),
   check: async (file, ctx, built) => {
     file.dispose();
@@ -70,7 +70,7 @@ registerCase({
       let maxInFlight = 0;
       const order: number[] = [];
 
-      await Promise.all(
+      const submissions = await Promise.allSettled(
         Array.from({ length: 20 }, (_, i) =>
           doc.runExclusive(async () => {
             inFlight++;
@@ -90,7 +90,11 @@ registerCase({
           `${maxInFlight} jobs held the connection at once — this is the use-after-close the lock exists to prevent`
         );
       }
-      const expected = Array.from({ length: 20 }, (_, i) => i);
+      const rejected = submissions.filter(result => result.status === 'rejected');
+      if (rejected.length !== 12 || rejected.some(result => result.status === 'rejected' && !/Too many queued/.test(String(result.reason)))) {
+        ctx.fail('crash', 'excess queue submissions did not receive the explicit bounded-queue rejection');
+      }
+      const expected = Array.from({ length: 8 }, (_, i) => i);
       if (order.join(',') !== expected.join(',')) {
         ctx.fail('crash', `queued work ran out of order: [${order.join(', ')}]`);
       }

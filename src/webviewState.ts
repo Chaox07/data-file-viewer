@@ -1,4 +1,5 @@
 import type { StatsKind } from './gridFormat';
+import type { QueryTarget, QueryColumn } from './queryCatalog';
 import type { SortState } from './gridOrder';
 import type { DetectedSheetTable } from './duckdbConnection';
 
@@ -59,6 +60,9 @@ export interface ColumnStatsFields {
 }
 
 export type ExtensionMessage =
+  | { command: 'queryCatalog'; targets: QueryTarget[]; generation: number; cursor: number; nextCursor?: number; requestId?: number }
+  | { command: 'queryTargetDetails'; target: QueryTarget; columns: QueryColumn[]; requestId?: number }
+  | { command: 'querySqlDraft'; target: QueryTarget; sql: string; requestId?: number }
   | { command: 'tables'; tables: string[]; combinedTableNames: string[]; previewFirst?: boolean }
   | ({ command: 'queryResult' } & QueryResultFields)
   | ({ command: 'sortQueryResult' } & QueryResultFields)

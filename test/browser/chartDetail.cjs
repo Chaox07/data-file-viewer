@@ -1,6 +1,5 @@
 // Uses installed Chrome. From the repository root:
-// npm install --prefix /tmp/dfv-browser playwright --no-audit --no-fund
-// NODE_PATH=/tmp/dfv-browser/node_modules node test/browser/chartDetail.cjs
+// npm ci && node test/browser/chartDetail.cjs
 const { chromium } = require('playwright');
 const esbuild = require('esbuild');
 const fs = require('node:fs');
@@ -10,7 +9,7 @@ const assert = require('node:assert/strict');
     stdin: { contents: fs.readFileSync('src/chartView.ts', 'utf8') + '\nexport function testChart() { return chart; }', resolveDir: require('node:path').resolve('src'), loader: 'ts' },
     bundle: true, write: false, format: 'iife', globalName: 'viewerTest', platform: 'browser',
   });
-  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  const browser = await chromium.launch({ channel: process.env.CI ? undefined : 'chrome', headless: true });
   try {
     const page = await browser.newPage({ viewport: { width: 1000, height: 700 } });
     const errors = [];

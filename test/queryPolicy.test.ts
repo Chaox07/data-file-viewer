@@ -31,6 +31,8 @@ test('native AST policy accepts ordinary queries and rejects side effects, macro
       'with x as (select * from data) select * from x',
       'select * from data a join data b on a.i=b.i',
       'select sum(i) from range(10) t(i)',
+      'explain select * from data', 'explain analyze select * from data',
+      'describe data', 'summarize select * from data', '/* outer /* nested */ comment */ explain select * from data',
     ]) await policy.validate(sql, relations);
     for (const sql of [
       'select * from bad', 'select secret()', "select current_setting('temp_directory')",
@@ -38,6 +40,7 @@ test('native AST policy accepts ordinary queries and rejects side effects, macro
       'select * from backup_cmp.data', 'select * from read_text(\'/tmp/synthetic\')',
       'select 1; delete from data', 'with x as (select 1) delete from data',
       'call checkpoint()', 'select nextval(\'x\')',
+      'explain analyze select * from bad', 'describe duckdb_databases()',
       'with x as (with sqlite_master as (select 1) select 1) select * from sqlite_master',
     ]) await assert.rejects(policy.validate(sql, relations), QueryPolicyError);
     assert.equal((await c.runAndReadAll('select count(*) from data')).getRows()[0][0], 1n);
@@ -47,6 +50,13 @@ test('native AST policy accepts ordinary queries and rejects side effects, macro
 test('result budget refuses rather than truncating a large single value', () => {
   validateResultSize({ rows: [['unchanged']] });
   assert.throws(() => validateResultSize({ rows: [['x'.repeat(32 * 1024 * 1024)]] }), QueryPolicyError);
+});
+
+test('result budget enforces per-cell UTF-8 bytes and aggregate payload independently', () => {
+  validateResultSize({ rows: [['x'.repeat(4 * 1024 * 1024)]] });
+  assert.throws(() => validateResultSize({ rows: [['é'.repeat(2 * 1024 * 1024 + 1)]] }), /4 MiB/);
+  assert.throws(() => validateResultSize({ rows: Array.from({ length: 9 }, () => ['x'.repeat(4 * 1024 * 1024)]) }), /32 MiB/);
+  validateResultSize({ rows: Array.from({ length: 200000 }, (_, i) => [i]) });
 });
 
 test('engine policy locks capabilities, bounds memory and disables spill', async () => {

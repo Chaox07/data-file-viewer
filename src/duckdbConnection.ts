@@ -12,7 +12,10 @@ import {
 import { basename, dirname, extname, join } from 'node:path';
 import { chmod, copyFile, mkdtemp, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
-import { ReadSqlPolicy, restrictQueryEngine, validateSqlSize, validateResultSize, referencedQueryTables, type QueryRelation } from './queryPolicy';
+import { ReadSqlPolicy, QueryPolicyError, restrictQueryEngine, validateSqlSize, validateResultSize, referencedQueryTables, type QueryRelation } from './queryPolicy';
+import { validateTableFilters } from './queryMessages';
+import type { QueryCatalogRelation, QueryColumn } from './queryCatalog';
+import { WORKBOOK_LIMITS } from './xlsxBudget';
 import { createWriteStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
@@ -141,6 +144,8 @@ export type FileKind = 'duckdb' | 'parquet' | 'sqlite' | 'csv' | 'dta' | 'arrow'
 export interface DuckDbFileOpenOptions {
   /** Internal read-worker mode. Never populated from a webview message. */
   restrictedReads?: boolean;
+  /** Internal: an existing backup created by this document's trusted save path. */
+  backupPath?: string;
   /** Request read-only up front (live-refresh reconnects) instead of trying read-write first. */
   forceReadOnly?: boolean;
   /** Absolute path to the other half of a hot/cold pair, if one was found — see duckdbEditorProvider.ts's sibling detection. */
@@ -1562,10 +1567,14 @@ export function baseTableOfSelect(sql: string | undefined): string | undefined {
 
 export class DuckDbFile {
   private readPolicy?: ReadSqlPolicy;
+  private instance?: DuckDBInstance;
+  private readonly combinedQueries = new Set<string>();
   private lastBackupPath: string | undefined;
   private backupAttached = false;
+  private backupViewSourceCount = 0;
   /** Temp dir holding a Feather backup's stream conversion, if any. */
   private backupTempDir: string | undefined;
+  private backupReadPath: string | undefined;
   private materialized = false;
   /** Set once this workbook's views have been re-created with ignore_errors. */
   private xlsxErrorsTolerated = false;
@@ -1668,7 +1677,12 @@ export class DuckDbFile {
     // dedicated kdb+ explorer-context command, see duckdbEditorProvider.ts)
     // knows this from which viewType it opened through and says so directly.
     if (forceKind === 'kdb') {
-      return DuckDbFile.openKdb(path);
+      const file = await DuckDbFile.openKdb(path);
+      if (options?.restrictedReads) {
+        await restrictQueryEngine(file.connection, []);
+        file.readPolicy = new ReadSqlPolicy(file.connection, file.catalogName);
+      }
+      return file;
     }
 
     const isParquet = path.toLowerCase().endsWith('.parquet');
@@ -1946,6 +1960,9 @@ export class DuckDbFile {
       if (damaged) {
         throw new Error(`"${basename(path)}" is not a complete .xlsx package: ${damaged}`);
       }
+      if (options?.restrictedReads && [...sheetDims.values()].some(dim => declaredCellCount(dim) > WORKBOOK_LIMITS.cellsPerSheet)) {
+        throw new QueryPolicyError('Workbook contains a worksheet exceeding the 10 million cell parsing limit.');
+      }
       for (const sheet of sheets) {
         // read_xlsx addresses a sheet by NAME, so the sheet name is a SQL
         // string literal here and a quoted identifier for the view -- two
@@ -2122,10 +2139,19 @@ export class DuckDbFile {
       nullText,
       sqlitePlan
     );
+    file.instance = instance;
     if (options?.restrictedReads) {
       try {
+        if (options.backupPath) {
+          file.lastBackupPath = options.backupPath;
+          await file.attachBackupCatalog();
+          file.backupAttached = true;
+          file.backupViewSourceCount = file.viewSources.size;
+        }
         await restrictQueryEngine(connection, [...new Set([
           path, ...(options.siblingPath ? [options.siblingPath] : []),
+          ...(options.backupPath ? [options.backupPath] : []),
+          ...(file.backupReadPath ? [file.backupReadPath] : []),
           ...[...viewSources.values()].map(source => source.sourcePath),
         ])]);
         file.readPolicy = new ReadSqlPolicy(connection, catalogName);
@@ -2135,21 +2161,32 @@ export class DuckDbFile {
   }
 
   /** Metadata queries here are fixed host SQL, not user SQL. No row sampling. */
-  private async approvedQueryRelations(): Promise<QueryRelation[]> {
+  private async approvedQueryRelations(includeSibling = false): Promise<QueryRelation[]> {
     const reader = await this.connection.runAndReadAll(`
       select t.table_catalog, t.table_schema, t.table_name, v.view_definition
       from information_schema.tables t left join information_schema.views v
         on t.table_catalog=v.table_catalog and t.table_schema=v.table_schema and t.table_name=v.table_name
-      where t.table_catalog=current_database()`);
+      where t.table_catalog=current_database()${includeSibling && this.siblingCatalogName ? ` or t.table_catalog=${quoteLiteral(this.siblingCatalogName)}` : ''}`);
     return reader.getRows().map(row => ({
       catalog: String(row[0]), schema: String(row[1]), name: String(row[2]),
       viewSql: row[3] == null ? undefined : String(row[3]),
-      trustedView: this.viewSources.has(String(row[2])) || this.kind === 'sqlite',
+      trustedView: (String(row[0]) === this.catalogName && (this.viewSources.has(String(row[2])) || this.kind === 'sqlite')) ||
+        (String(row[0]) === this.siblingCatalogName && this.siblingIsSqlite),
     }));
   }
 
   private async assertReadSql(sql: string): Promise<void> {
-    if (this.readPolicy) await this.readPolicy.validate(sql, await this.approvedQueryRelations());
+    if (this.readPolicy) await this.readPolicy.validate(sql, await this.approvedQueryRelations(this.combinedQueries.has(sql)));
+  }
+
+  private rememberCombined(sql: string): string {
+    if (this.combinedQueries.size >= 64) this.combinedQueries.delete(this.combinedQueries.values().next().value!);
+    this.combinedQueries.add(sql);
+    return sql;
+  }
+
+  private derivedQuery(base: string, sql: string): string {
+    return this.combinedQueries.has(base) ? this.rememberCombined(sql) : sql;
   }
 
   private static async tryAttachSibling(
@@ -2168,7 +2205,7 @@ export class DuckDbFile {
         // would not even line up as one column.
         const sourceCatalog = sqliteSourceCatalogOf(alias);
         await connection.run(`attach '${filePath}' as ${quoteIdent(sourceCatalog)} (type sqlite, read_only)`);
-        await connection.run(`attach ':memory:' as ${quoteIdent(alias)}`);
+        await connection.run(`attach ':memory:' as ${quoteIdent(alias)} (read_write)`);
         await createSqliteViews(connection, alias, await planSqliteTables(connection, sourceCatalog));
       } else {
         await connection.run(`attach '${filePath}' as ${quoteIdent(alias)} (read_only)`);
@@ -2214,7 +2251,9 @@ export class DuckDbFile {
     const catalogReader = await connection.runAndReadAll('select current_database()');
     const catalogName = String(catalogReader.getRows()[0][0]);
 
-    return new DuckDbFile(connection, path, 'kdb', catalogName, mainObjectName, false, undefined);
+    const file = new DuckDbFile(connection, path, 'kdb', catalogName, mainObjectName, false, undefined);
+    file.instance = instance;
+    return file;
   }
 
   async listTables(): Promise<string[]> {
@@ -2235,6 +2274,37 @@ export class DuckDbFile {
     const tables = await this.listTables();
     if (this.kind !== 'xlsx') return tables;
     return tables.filter((name) => this.viewSources.get(name)?.derived !== true);
+  }
+
+  async getQueryCatalog(offset = 0): Promise<QueryCatalogRelation[]> {
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000) throw new Error('Invalid catalog page.');
+    const reader = await this.connection.runAndReadAll(`
+      select table_catalog, table_schema, table_name from information_schema.tables
+      where table_catalog=current_database()
+      order by table_schema, table_name limit 100 offset ${offset}`);
+    return reader.getRows().map(row => {
+      const [catalog, schema, name] = row.map(String);
+      const detected = [...this.detectedSheetTables.values()].flat().find(table => table.name === name);
+      return {
+        catalog, schema, name, sqlName: [catalog, schema, name].map(quoteIdent).join('.'),
+        worksheet: detected?.sheet ?? (this.isWorksheet(name) ? name : undefined),
+        rawWorksheet: this.isWorksheet(name), prepared: !this.pendingSheets.has(name),
+        range: detected ? `${tableColumnLetters(detected.left)}${detected.top + 1}:${tableColumnLetters(detected.right - 1)}${detected.bottom}` : undefined,
+      };
+    });
+  }
+
+  async getQueryColumns(catalog: string, schema: string, name: string): Promise<QueryColumn[]> {
+    if (catalog !== this.catalogName) throw new Error('Unknown query catalog.');
+    if (this.kind === 'xlsx') {
+      if (this.pendingSheets.has(name)) await this.ensureSheetPrepared(name);
+      await this.ensureDerivedPrepared(name);
+    }
+    const reader = await this.connection.runAndReadAll(`
+      select column_name, data_type from information_schema.columns
+      where table_catalog=${quoteLiteral(catalog)} and table_schema=${quoteLiteral(schema)} and table_name=${quoteLiteral(name)}
+      order by ordinal_position`);
+    return reader.getRows().map(row => ({ name: String(row[0]), type: String(row[1]) }));
   }
 
   /** Only original workbook sheets have worksheet coordinates, even with detection off. */
@@ -2332,12 +2402,12 @@ export class DuckDbFile {
 
     const timeColumn = await this.resolveTimeColumn(table);
     if (!timeColumn) {
-      return { sql: `select *\nfrom (\n  ${union}\n) as _combined`, timeColumn: null };
+      return { sql: this.rememberCombined(`select *\nfrom (\n  ${union}\n) as _combined`), timeColumn: null };
     }
     const col = quoteIdent(timeColumn);
     const safeLimit = Number.isInteger(limitN) && limitN > 0 ? limitN : DuckDbFile.DEFAULT_COMBINED_LIMIT;
     const sql = `select * from (\n  select *\n  from (\n    ${union}\n  ) as _union\n  order by ${col} desc\n  limit ${safeLimit}\n) as _combined\norder by ${col} asc`;
-    return { sql, timeColumn };
+    return { sql: this.rememberCombined(sql), timeColumn };
   }
 
   private isMainHot(): boolean {
@@ -2798,6 +2868,7 @@ export class DuckDbFile {
     sort?: DetectedTableSort,
     limit = 0
   ): Promise<string> {
+    validateTableFilters(filters, sort, limit);
     const source = this.viewSources.get(table);
     if (!source?.derived || !source.tableOrigin) {
       throw new Error(`"${table}" is not a table detected inside a worksheet.`);
@@ -2807,13 +2878,13 @@ export class DuckDbFile {
     const types = await this.getColumnTypes(table, this.catalogName);
     const columns = new Set(types.keys());
     const predicates: string[] = [];
-    for (const filter of filters.slice(0, 100)) {
+    for (const filter of filters) {
       if (!columns.has(filter.column)) {
         throw new Error(`Column "${filter.column}" does not exist in "${table}".`);
       }
       const column = quoteIdent(filter.column);
-      const value = String(filter.value ?? '').slice(0, 4_000);
-      const valueTo = String(filter.valueTo ?? '').slice(0, 4_000);
+      const value = String(filter.value ?? '');
+      const valueTo = String(filter.valueTo ?? '');
       const sqlType = types.get(filter.column) ?? 'VARCHAR';
       // Checked and canonicalised here rather than left to cast_to_type, for
       // two reasons the filter box makes concrete -- see filterValueForType.
@@ -2866,7 +2937,7 @@ export class DuckDbFile {
       }
       sql += ` order by ${quoteIdent(sort.column)} ${sort.direction === 'desc' ? 'desc' : 'asc'} nulls last`;
     }
-    if (Number.isInteger(limit) && limit > 0) sql += ` limit ${Math.min(limit, 100_000)}`;
+    if (limit > 0) sql += ` limit ${limit}`;
     return sql;
   }
 
@@ -3143,12 +3214,12 @@ export class DuckDbFile {
       const sql =
         `select ${xExpr} as ${x}, ${ys} from ${wrapAsSubquery(inner)} as _chart ` +
         `where ${xExpr} is not null order by 1 asc`;
-      return { ...(await this.runQuery(sql, maxPoints)), xAxisMode: 'time' };
+      return { ...(await this.runQuery(this.derivedQuery(baseSql, sql), maxPoints)), xAxisMode: 'time' };
     }
 
     const sql =
       `select ${x}, ${ys} from ${wrapAsSubquery(inner)} as _chart where ${x} is not null`;
-    return { ...(await this.runQuery(sql, maxPoints)), xAxisMode: 'category' };
+    return { ...(await this.runQuery(this.derivedQuery(baseSql, sql), maxPoints)), xAxisMode: 'category' };
   }
 
   async runSortedQuery(
@@ -3173,7 +3244,7 @@ export class DuckDbFile {
     const sortedSql = `select * from ${wrapAsSubquery(inner)} as _sorted order by ${col} ${dir} nulls last${limitSuffix}`;
     // The cap applies to the sorted result, so it stays "the true top N by
     // this column" rather than "N arbitrary rows, then sorted".
-    const result = await this.runQuery(sortedSql, maxRows);
+    const result = await this.runQuery(this.derivedQuery(baseSql, sortedSql), maxRows);
     // Handed back because the caller has to diff against the backup using the
     // *same* ordering: diffQueryAgainstBackup compares row-by-row positionally,
     // so running the unsorted base query on the backup side lights up nearly
@@ -3272,6 +3343,7 @@ export class DuckDbFile {
     this.lastBackupPath = backupPath;
     await this.attachBackupCatalog();
     this.backupAttached = true;
+    this.backupViewSourceCount = this.viewSources.size;
 
     return backupPath;
   }
@@ -3374,6 +3446,7 @@ export class DuckDbFile {
       const converted = await convertFeatherToStream(backupPath);
       readPath = converted.streamPath;
       this.backupTempDir = converted.tempDir;
+      this.backupReadPath = converted.streamPath;
     }
 
     // Rebuilt through the view's own ViewSource, so everything decided at open
@@ -3393,6 +3466,7 @@ export class DuckDbFile {
     if (!this.backupTempDir) return;
     const dir = this.backupTempDir;
     this.backupTempDir = undefined;
+    this.backupReadPath = undefined;
     await rm(dir, { recursive: true, force: true }).catch(() => undefined);
   }
 
@@ -3410,7 +3484,17 @@ export class DuckDbFile {
   }
 
   /** Table-level "did anything in this table change since the backup" summary for the sidebar. */
+  private async synchronizeBackupViews(): Promise<void> {
+    if (this.kind !== 'xlsx' || !this.backupAttached || this.backupViewSourceCount === this.viewSources.size) return;
+    await this.detachBackupCatalog();
+    this.backupAttached = false;
+    await this.attachBackupCatalog();
+    this.backupAttached = true;
+    this.backupViewSourceCount = this.viewSources.size;
+  }
+
   async compareToBackup(): Promise<Record<string, 'unchanged' | 'changed' | 'new'>> {
+    await this.synchronizeBackupViews();
     if (!this.lastBackupPath) return {};
     const status: Record<string, 'unchanged' | 'changed' | 'new'> = {};
     const tables = await this.listTables();
@@ -3460,6 +3544,7 @@ export class DuckDbFile {
    */
   async diffQueryAgainstBackup(sql: string, liveColumns: string[], liveRows: unknown[][]): Promise<QueryDiff | null> {
     await this.assertReadSql(sql);
+    await this.synchronizeBackupViews();
     if (!this.lastBackupPath) return null;
     let backupColumns: string[];
     let backupRows: unknown[][];
@@ -3542,7 +3627,7 @@ export class DuckDbFile {
    * real, unambiguous row in a real table. Never trust the webview's own
    * opinion of whether a result is editable; this is always re-derived here.
    */
-  async checkEditableSelect(sql: string): Promise<EditabilityInfo> {
+  async checkEditableSelect(sql: string, describeOnly = false): Promise<EditabilityInfo> {
     await this.assertReadSql(sql);
     // kdb+ tables are read from the real on-disk file (see kdbParser.ts) into
     // an in-memory table purely so this viewer can query it -- there is no
@@ -3557,7 +3642,7 @@ export class DuckDbFile {
     // 1.0. Nothing is regenerated now: xlsxWrite.ts rewrites the single <c>
     // element inside the worksheet XML and leaves the rest of the package
     // byte-for-byte, so none of that is on the table.
-    if (this.isReadOnly() || this.kind === 'kdb') return { editable: false };
+    if ((this.isReadOnly() && !describeOnly) || this.isReadOnlyByFormat() || this.kind === 'kdb') return { editable: false };
     const trimmed = sql.trim();
 
     try {
@@ -4161,6 +4246,8 @@ export class DuckDbFile {
 
   dispose(): void {
     this.connection.closeSync();
+    this.instance?.closeSync();
+    this.instance = undefined;
     if (this.backupTempDir) {
       void rm(this.backupTempDir, { recursive: true, force: true }).catch(() => undefined);
       this.backupTempDir = undefined;

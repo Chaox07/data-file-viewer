@@ -1,5 +1,20 @@
 import { QueryPolicyError } from './queryPolicy';
 
+/** Notices can contain sampled cells and file-controlled labels. Classify them
+ * before they cross into notifications; leave exact values in requested grids. */
+export function queryNotices(notices: readonly string[]): string[] {
+  return [...new Set(notices.map(notice => {
+    if (/edit was saved/i.test(notice)) return 'The edit was saved, but its displayed data could not be refreshed. Reopen the file before editing again.';
+    if (/floating-point|past 2\^53|exact type|precision/i.test(notice)) return 'Some columns remain text to preserve numeric precision. The source file is unchanged.';
+    if (/decimal convention|read as Turkish|numberLocale/i.test(notice)) return 'Some columns have an ambiguous decimal convention and remain text. Set dataFileViewer.numberLocale only when the source convention is known.';
+    if (/text column.*read as numbers/i.test(notice)) return 'Numeric text was interpreted as numbers; configured missing-value markers may appear empty. Set dataFileViewer.nullText to [] to read the source literally.';
+    if (/error markers|could not compute/i.test(notice)) return 'Configured spreadsheet error markers appear empty in detected tables. The raw worksheet retains their original text.';
+    if (/left as text|kept as text|remain.*text/i.test(notice)) return 'Some columns remain text because their values cannot all be interpreted consistently. The source file is unchanged.';
+    if (/Stata|dataset, variable and value labels/i.test(notice)) return 'Stata files are read-only to preserve their original data types and labels.';
+    return 'The dataset opened with a reading notice. Check the column types and raw worksheet before interpreting the result; the source file is unchanged.';
+  }))];
+}
+
 export interface QueryDiagnostic {
   category: 'blocked' | 'type' | 'column' | 'conversion' | 'syntax' | 'resource' | 'cancelled' | 'unknown';
   message: string;

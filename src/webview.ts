@@ -1,6 +1,8 @@
 import { EditorView, basicSetup } from 'codemirror';
 import { keymap } from '@codemirror/view';
-import { sql } from '@codemirror/lang-sql';
+import { Compartment } from '@codemirror/state';
+import { sql, type SQLNamespace } from '@codemirror/lang-sql';
+import type { QueryTarget, QueryColumn } from './queryCatalog';
 import { json } from '@codemirror/lang-json';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { pickXAxis, plottableColumns } from './chartSpec';
@@ -32,7 +34,19 @@ type StatsKind = 'numeric' | 'datetime' | 'other';
 
 
 
-const vscode = acquireVsCodeApi();
+const hostApi = acquireVsCodeApi();
+let transportSequence = 0;
+let queryGeneration = 0;
+let targetRequestId = 0;
+let catalogRequestId = 0;
+const vscode = {
+  postMessage(message: Record<string, unknown>): void {
+    const requestId = ++transportSequence;
+    if (['queryTarget', 'queryTargetSql', 'sheetTableSql'].includes(String(message.command))) targetRequestId = requestId;
+    if (message.command === 'queryCatalog') catalogRequestId = requestId;
+    hostApi.postMessage({ ...message, requestId, generation: queryGeneration });
+  },
+};
 
 const root = document.getElementById('root');
 if (!root) throw new Error('missing #root element');
@@ -46,7 +60,7 @@ root.innerHTML = `
     <div class="main">
       <div class="editor-toolbar">
         <button id="run-btn" title="Run (Ctrl/Cmd+Enter)">Run &#9654;</button>
-        <label id="safe-mode-label" class="toolbar-check" title="Blocks write/destructive statements until unchecked">
+        <label id="safe-mode-label" class="toolbar-check" title="Prevents cell edits. SQL queries always remain read-only.">
           <input type="checkbox" id="safe-mode-check" checked /> Safe Mode
         </label>
         <span id="unlock-options" class="unlock-options" hidden>
@@ -71,6 +85,15 @@ root.innerHTML = `
           <span id="live-status" class="live-status"></span>
         </span>
       </div>
+      <div class="query-target-toolbar">
+        <label for="query-target">Query table</label>
+        <select id="query-target"><option value="">Choose a table…</option></select>
+        <button id="query-use" disabled>Use in SQL</button>
+        <button id="query-more" hidden>More tables</button>
+        <button id="query-restore" hidden>Restore draft</button>
+        <button id="query-worksheet" hidden>Worksheet preview</button>
+      </div>
+      <div id="query-schema" class="query-schema" aria-live="polite"></div>
       <div id="editor" class="editor"></div>
       <div id="results" class="results"></div>
     </div>
@@ -91,6 +114,17 @@ const modeLiveRadio = document.getElementById('mode-live-radio') as HTMLInputEle
 const liveOptionsEl = document.getElementById('live-options') as HTMLSpanElement;
 const liveIntervalInput = document.getElementById('live-interval-input') as HTMLInputElement;
 const liveStatusEl = document.getElementById('live-status') as HTMLSpanElement;
+const queryTargetEl = document.getElementById('query-target') as HTMLSelectElement;
+const queryUseEl = document.getElementById('query-use') as HTMLButtonElement;
+const queryMoreEl = document.getElementById('query-more') as HTMLButtonElement;
+const queryRestoreEl = document.getElementById('query-restore') as HTMLButtonElement;
+const queryWorksheetEl = document.getElementById('query-worksheet') as HTMLButtonElement;
+const querySchemaEl = document.getElementById('query-schema') as HTMLDivElement;
+let nextCatalogCursor: number | undefined;
+const queryTargets = new Map<string, QueryTarget>();
+const queryColumns = new Map<string, QueryColumn[]>();
+const drafts: string[] = [];
+let selectedQueryTarget: QueryTarget | undefined;
 
 let running = false;
 
@@ -138,9 +172,10 @@ const runKeymap = keymap.of([
   },
 ]);
 
+const sqlLanguage = new Compartment();
 const editor = new EditorView({
   doc: '',
-  extensions: [basicSetup, sql(), runKeymap, oneDark, selectionColor],
+  extensions: [basicSetup, sqlLanguage.of(sql()), runKeymap, oneDark, selectionColor],
   parent: document.getElementById('editor') as HTMLDivElement,
 });
 
@@ -149,6 +184,55 @@ function setEditorText(text: string): void {
     changes: { from: 0, to: editor.state.doc.length, insert: text },
   });
 }
+
+function refreshQueryTargets(): void {
+  const selected = selectedQueryTarget?.id ?? '';
+  queryTargetEl.replaceChildren(new Option('Choose a table…', ''));
+  const groups = new Map<string, HTMLOptGroupElement>();
+  for (const target of queryTargets.values()) {
+    const groupName = target.worksheet ?? `${target.catalog}.${target.schema}`;
+    let group = groups.get(groupName);
+    if (!group) { group = document.createElement('optgroup'); group.label = groupName; groups.set(groupName, group); queryTargetEl.append(group); }
+    const label = target.rawWorksheet ? `${target.name} — Raw worksheet (A, B, C…)${target.prepared ? '' : ' — not prepared'}`
+      : `${target.name}${target.range ? ` — ${target.range}` : ''}`;
+    group.append(new Option(label, target.id));
+  }
+  queryTargetEl.value = selected;
+  queryUseEl.disabled = !selectedQueryTarget;
+  queryWorksheetEl.hidden = !selectedQueryTarget?.worksheet;
+  queryMoreEl.hidden = nextCatalogCursor === undefined;
+}
+
+function refreshSqlCompletion(): void {
+  const schema: Record<string, any> = Object.create(null);
+  for (const target of queryTargets.values()) {
+    const catalog = schema[target.catalog] ??= Object.create(null);
+    const namespace = catalog[target.schema] ??= Object.create(null);
+    namespace[target.name] = (queryColumns.get(target.id) ?? []).map(column => ({ label: column.name, type: 'property', detail: column.type }));
+  }
+  editor.dispatch({ effects: sqlLanguage.reconfigure(sql({ schema: schema as SQLNamespace })) });
+}
+
+queryTargetEl.addEventListener('change', () => {
+  selectedQueryTarget = queryTargets.get(queryTargetEl.value);
+  querySchemaEl.textContent = selectedQueryTarget ? 'Loading column types…' : '';
+  refreshQueryTargets();
+  if (selectedQueryTarget) vscode.postMessage({ command: 'queryTarget', targetId: selectedQueryTarget.id, generation: queryGeneration });
+});
+queryUseEl.addEventListener('click', () => {
+  if (selectedQueryTarget) vscode.postMessage({ command: 'queryTargetSql', targetId: selectedQueryTarget.id, generation: queryGeneration });
+});
+queryMoreEl.addEventListener('click', () => {
+  if (nextCatalogCursor !== undefined) vscode.postMessage({ command: 'queryCatalog', cursor: nextCatalogCursor });
+});
+queryRestoreEl.addEventListener('click', () => {
+  const draft = drafts.pop();
+  if (draft !== undefined) setEditorText(draft);
+  queryRestoreEl.hidden = drafts.length === 0;
+});
+queryWorksheetEl.addEventListener('click', () => {
+  if (selectedQueryTarget?.worksheet) previewTable(selectedQueryTarget.worksheet);
+});
 
 function runQuery(sqlText: string): void {
   if (running) return;
@@ -948,6 +1032,16 @@ function appendInlineHeaderControls(
       : `${table.rowCount} rows`;
     label.textContent = `${table.name.slice(table.name.lastIndexOf('·'))} · ${count}`;
     controls.appendChild(label);
+    const sqlButton = document.createElement('button');
+    sqlButton.className = 'sheet-table-sql';
+    sqlButton.textContent = 'SQL';
+    sqlButton.title = 'Open this table’s current filter and sort in the SQL editor';
+    sqlButton.addEventListener('click', event => {
+      event.stopPropagation();
+      vscode.postMessage({ command: 'sheetTableSql', table: table.name, filters: filtersForMessage(current), sort: current.sort,
+        limit: sheetTableDisplayLimit(table), generation: queryGeneration });
+    });
+    controls.appendChild(sqlButton);
   }
 
   const isActiveSort = current.sort?.column === column;
@@ -1468,9 +1562,52 @@ function applyEffect(effect: Effect): void {
 }
 
 window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
+  const message = event.data;
+  const wasRunning = running;
+  if (message.command === 'queryCatalog') {
+    if (message.requestId !== catalogRequestId) return;
+    if (message.generation < queryGeneration) return;
+    if (message.generation !== queryGeneration) {
+      queryTargets.clear(); queryColumns.clear(); selectedQueryTarget = undefined;
+      querySchemaEl.textContent = 'The source changed. Select a query table again.';
+    }
+    queryGeneration = message.generation;
+    if (message.cursor === 0) queryTargets.clear();
+    for (const target of message.targets) queryTargets.set(target.id, target);
+    if (selectedQueryTarget && !queryTargets.has(selectedQueryTarget.id)) selectedQueryTarget = undefined;
+    nextCatalogCursor = message.nextCursor;
+    refreshQueryTargets(); refreshSqlCompletion();
+    return;
+  }
+  if (message.command === 'queryTargetDetails') {
+    if (message.requestId !== targetRequestId) return;
+    if (message.target.generation !== queryGeneration) return;
+    queryTargets.set(message.target.id, message.target);
+    queryColumns.set(message.target.id, message.columns);
+    if (!selectedQueryTarget || selectedQueryTarget.id === message.target.id) {
+      selectedQueryTarget = message.target;
+      querySchemaEl.textContent = message.columns.map(column => `${column.name}: ${column.type}`).join(' · ');
+    }
+    refreshQueryTargets(); refreshSqlCompletion();
+    return;
+  }
+  if (message.command === 'querySqlDraft') {
+    if (message.requestId !== targetRequestId) return;
+    if (message.target.generation !== queryGeneration) return;
+    if (drafts.length >= 8) { statusEl.textContent = 'Restore a saved draft before opening another SQL draft.'; return; }
+    drafts.push(editor.state.doc.toString());
+    selectedQueryTarget = message.target; queryTargets.set(message.target.id, message.target);
+    setEditorText(message.sql); queryRestoreEl.hidden = false; refreshQueryTargets();
+    querySchemaEl.textContent = (queryColumns.get(message.target.id) ?? []).map(column => `${column.name}: ${column.type}`).join(' · ');
+    editor.focus();
+    return;
+  }
   const { state: nextState, effects } = reduce(state, event.data);
   state = nextState;
   for (const effect of effects) applyEffect(effect);
+  if (message.command === 'queryResult' || message.command === 'cellUpdated' || (message.command === 'error' && wasRunning) || message.command === 'tables' || (message.command === 'liveTick' && !message.unchanged)) {
+    vscode.postMessage({ command: 'queryCatalog', cursor: 0 });
+  }
 });
 
 vscode.postMessage({ command: 'ready' });

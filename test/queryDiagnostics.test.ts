@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { queryDiagnostic } from '../src/queryDiagnostics';
+import { queryDiagnostic, queryNotices } from '../src/queryDiagnostics';
 
 test('diagnostics preserve categories without exposing echoed rows, SQL, paths or credentials', () => {
   const sentinel = 'SYNTHETIC_PRIVATE_VALUE';
@@ -10,6 +10,20 @@ test('diagnostics preserve categories without exposing echoed rows, SQL, paths o
   }
   assert.equal(queryDiagnostic(new Error('Parser Error: syntax\nLINE 3: secret')).line, 3);
   assert.equal(queryDiagnostic(new Error('interrupt')).category, 'cancelled');
+});
+
+test('reading notices do not expose sampled values or hostile labels', () => {
+  const sentinel = 'SYNTHETIC_PRIVATE_VALUE';
+  const notices = queryNotices([
+    `Column "${sentinel}" was left as text: ${sentinel} is ambiguous. Set dataFileViewer.numberLocale.`,
+    `${sentinel}: 2 text columns read as numbers`,
+    `${sentinel}: unknown diagnostic`,
+    `The edit was saved, but "${sentinel}" could not be re-read`,
+  ]);
+  assert.equal(notices.length, 4);
+  assert.ok(!JSON.stringify(notices).includes(sentinel));
+  assert.match(notices[0], /decimal convention/);
+  assert.match(notices[3], /edit was saved/);
 });
 
 test('type guidance distinguishes text comparisons and raw worksheet columns', () => {

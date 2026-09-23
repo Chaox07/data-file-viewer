@@ -8,11 +8,11 @@ release or a claim that the installed extension has these protections.
 
 | Phase | Status |
 | --- | --- |
-| 1. Baseline and execution design | In progress: engine capabilities and synthetic regressions verified; runtime ownership prototype next. |
-| 2. Restricted execution and cancellation | Restricted engine, native AST authorization and read worker tested; provider/save handoff not yet integrated. |
-| 3. Catalog and SQL handoff | Not started. |
-| 4. User workflow and diagnostics | Not started. |
-| 5. Acceptance | Not started. |
+| 1. Baseline and execution design | Baseline captured; design implemented. Performance acceptance remains open. |
+| 2. Restricted execution and cancellation | Provider integrated with killable restricted reader and separate trusted saves; security acceptance in progress. |
+| 3. Catalog and SQL handoff | Implemented: document-owned targets, actual types, lazy sheet preparation and inline SQL. |
+| 4. User workflow and diagnostics | Browser workflow passes; diagnostic and notice privacy checks pass. Installed-host checks remain open. |
+| 5. Acceptance | In progress; full matrix is not yet closed. |
 | 6. Release and installation | Not started. |
 
 ## Baseline
@@ -47,8 +47,9 @@ Excel RSS includes native allocations outside DuckDB's query memory budget.
 - Writes: backup publication, explicit cell updates, flat-file materialization,
   SQLite transactions, workbook patching and atomic file replacement.
 
-The existing document serializes connection use, but the queue is unbounded.
-Native parsing and query work currently run inside the extension host.
+The baseline document serialized connection use with an unbounded queue.
+The implementation now bounds that queue and moves read parsing/query work into
+the reader process. Explicit saves still run through the trusted host writer.
 
 Implementation design: a document-owned child process holds the restricted read
 connection and worksheet caches. Only explicit host RPC methods are exposed.
@@ -89,17 +90,44 @@ owning view and source generation.
 
 `test/queryPolicy.test.ts` covers byte-based SQL budgets, explicit result-size
 rejection, locked capability settings, query memory/thread limits and no spill.
-`src/queryPolicy.ts` is used by the internal restricted read mode. The provider
-still uses its original runtime until save-handoff validation passes.
+`src/queryPolicy.ts` is used by the restricted reader, now integrated into the
+provider through `ViewerFile`.
 
-The child-process prototype passes cooperative native cancellation and a separate
-uncooperative-process hard-stop test (about 2.03 seconds locally). Requests are
+The child process passes native cancellation and a separate uncooperative-process
+hard-stop test. Cancel now invalidates pending replies and kills the reader
+immediately, because ingestion helpers may catch interrupts. Requests are
 bounded; cancellation/disposal rejects pending promises and worker generations
 prevent old replies from satisfying new requests. Read RPC exposes no save method.
 
-Current full regression run: 721 tests, 689 passed, 0 failed, 28 skipped, 4 TODO.
+Current full regression run: 740 tests, 708 passed, 0 failed, 28 skipped, 4 TODO.
 Typecheck and diff whitespace checks pass. This is intermediate evidence, not
 completion of the plan's acceptance matrix.
+
+Additional current evidence:
+
+- Real-provider browser workflow: target types, unchanged selection draft,
+  explicit SQL handoff/restoration, inline filters, exact date filtering,
+  failed-query discovery and hostile metadata rendered without resource fetches.
+- Chart browser regression: 200,000 points, crosshair, exact hover values after
+  zoom, wheel/brush/reset, line/scatter, categories, gaps and legend changes.
+- Save/backup comparison: CSV, DuckDB, XLSX, SQLite, Parquet, Arrow stream and
+  Feather pass. This exposed and fixed a missing precise allowlist entry for
+  Feather's converted backup; no directory-wide grant was added.
+- Worker tests cover deadlines, late-success cancellation, private scratch
+  cleanup after close/crash, environment filtering and the four-worker pool.
+- Workbook preflight tests cover unsafe paths, entities, actual aggregate
+  inflation, part/count/compressed budgets and refusal to loosen limits.
+- Result tests cover UTF-8 cell limits, aggregate payload limits and 200,000
+  small rows. Reading notices and raw native failures omit sampled values.
+- Paired-file checks exposed a read-only attachment regression: SQLite sibling
+  views now use an explicitly writable in-memory catalog while source files stay
+  read-only. Exact host-built grants survive reader refresh; altered queries
+  cannot reuse those grants. View trust is scoped to its catalog.
+
+Remaining gates include the complete adversarial/lifecycle matrix,
+high-load measurements, disposition of existing skips/TODOs,
+package inspection, installed-host verification and macOS/Windows CI. The
+installed extension remains 0.0.13. No release claim is made by this checkpoint.
 
 All remaining SEC, REL, INT, PERF, DOS and PKG families from the unified plan
 remain required. No family is complete merely because a baseline probe passes.

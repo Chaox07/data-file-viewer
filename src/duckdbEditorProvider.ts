@@ -22,6 +22,11 @@ import { ChartPanel } from './chartPanel';
 import { pickXAxis } from './chartSpec';
 import { destructiveReason, hasMultipleStatements } from './sqlSafety';
 import { LiveRefreshController, LiveStatus } from './liveRefresh';
+import { ViewerFile, type DocumentFile } from './viewerFile';
+import { QUERY_LIMITS, QueryPolicyError } from './queryPolicy';
+import { queryDiagnostic } from './queryDiagnostics';
+import { validateQueryMessage } from './queryMessages';
+import type { QueryTarget } from './queryCatalog';
 
 // Real, permanent debug channel rather than throwaway instrumentation — this
 // feature accumulates enough internal state machinery (backoff phase,
@@ -35,7 +40,7 @@ function isDebugLiveRefreshEnabled(): boolean {
   return vscode.workspace.getConfiguration('dataFileViewer').get<boolean>('debugLiveRefresh', false) === true;
 }
 
-function logLive(message: string): void {
+function logLive(message: 'stat-gate skipped' | 'connection busy' | 'tick complete' | 'tick timeout' | 'scheduler event' | 'refresh started' | 'reconnect failed' | 'refresh stopped'): void {
   if (!isDebugLiveRefreshEnabled()) return;
   liveRefreshChannel.appendLine(`[${new Date().toISOString()}] ${message}`);
 }
@@ -409,6 +414,9 @@ async function acquireFileLock(path: string): Promise<() => void> {
 // all reachable from an instance. Nothing outside this file constructs one.
 export class DuckDBDocument implements vscode.CustomDocument {
   private tablesCache: string[] | undefined;
+  queryCatalogGeneration = 0;
+  readonly queryTargets = new Map<string, QueryTarget>();
+  activeQueryRequest = 0;
   // name (e.g. "orders_combined") -> the synthesized SQL that entry runs.
   combinedQueryMap = new Map<string, string>();
 
@@ -467,7 +475,7 @@ export class DuckDBDocument implements vscode.CustomDocument {
 
   constructor(
     readonly uri: vscode.Uri,
-    public file: DuckDbFile,
+    public file: DocumentFile,
     private readonly onDispose?: () => void,
     /** Set only for kinds that can't be sniffed from the path (kdb+), so a live reconnect re-opens as the right kind. */
     readonly forceKind?: FileKind
@@ -479,8 +487,13 @@ export class DuckDBDocument implements vscode.CustomDocument {
 
   /** Queues `fn` behind whatever else holds the connection. Use for user-initiated work, which must never be dropped. */
   runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.lockDepth >= QUERY_LIMITS.queuedRequests) return Promise.reject(new QueryPolicyError('Too many queued operations. Wait or cancel the current query.'));
     this.lockDepth++;
-    const run = this.lockChain.then(fn);
+    const run = this.lockChain.then(() => {
+      if (this.disposed) throw new QueryPolicyError('This document is closed.');
+      if (vscode.workspace.isTrusted === false) throw new QueryPolicyError('Trust this workspace before opening datasets or running queries.');
+      return fn();
+    });
     // Both arms settle the chain, so one failed job can't wedge every later
     // one behind a permanently rejected promise.
     this.lockChain = run.then(
@@ -519,6 +532,29 @@ export class DuckDBDocument implements vscode.CustomDocument {
 
   invalidateTablesCache(): void {
     this.tablesCache = undefined;
+    this.queryCatalogGeneration++;
+    this.queryTargets.clear();
+  }
+
+  async queryCatalogPage(cursor = 0): Promise<{ targets: QueryTarget[]; generation: number; nextCursor?: number }> {
+    const relations = await this.file.getQueryCatalog(cursor);
+    const targets = relations.map(relation => {
+      const existing = [...this.queryTargets.values()].find(target =>
+        target.catalog === relation.catalog && target.schema === relation.schema && target.name === relation.name);
+      const target = { ...relation, id: existing?.id ?? randomBytes(16).toString('hex'), generation: this.queryCatalogGeneration };
+      this.queryTargets.set(target.id, target);
+      return target;
+    });
+    if (this.queryTargets.size > 5000) throw new QueryPolicyError('The query catalog exceeds 5,000 targets.');
+    const result = { targets, generation: this.queryCatalogGeneration, nextCursor: relations.length === 100 ? cursor + 100 : undefined };
+    if (Buffer.byteLength(JSON.stringify(result)) > QUERY_LIMITS.catalogBytes) throw new QueryPolicyError('The catalog page exceeds 1 MiB.');
+    return result;
+  }
+
+  queryTarget(id: string, generation: number): QueryTarget {
+    const target = this.queryTargets.get(id);
+    if (generation !== this.queryCatalogGeneration || !target) throw new QueryPolicyError('The query target changed. Select it again.');
+    return target;
   }
 
   // Capped insert — cheap insurance against unbounded growth if caching
@@ -555,41 +591,34 @@ export class DuckDBDocument implements vscode.CustomDocument {
   }
 
   dispose(): void {
+    if (this.disposed) return;
     this.disposed = true;
     this.liveRefreshController?.dispose();
     this.liveRefreshController = undefined;
-    if (this.hasBackup && this.checkForChanges) {
-      // Fire-and-forget: the webview is already gone by the time dispose()
-      // runs, so a VS Code notification is the only place left to report
-      // this. Connection is closed either way once the comparison settles.
-      this.file
-        .compareToBackup()
-        .then((status) => {
-          const entries = Object.entries(status);
-          const changed = entries.filter(([, s]) => s !== 'unchanged');
-          const fileName = basename(this.uri.fsPath);
-          if (changed.length > 0) {
-            vscode.window.showInformationMessage(
-              `${fileName}: ${changed.length} of ${entries.length} table(s) changed since backup (${changed
-                .map(([table]) => table)
-                .join(', ')}).`
-            );
-          } else if (entries.length > 0) {
-            vscode.window.showInformationMessage(`${fileName}: no changes since backup.`);
-          }
-        })
-        .catch(() => {
-          // Best-effort notification only — never block closing the file over this.
-        })
-        .finally(() => {
-          this.file.dispose();
-          this.onDispose?.();
-        });
-    } else {
-      this.file.dispose();
-      this.onDispose?.();
-    }
+    this.file.interruptCurrentQuery();
+    const finish = async () => {
+      try {
+        if (this.hasBackup && this.checkForChanges && vscode.workspace.isTrusted !== false) {
+          const entries = Object.entries(await this.file.compareToBackup());
+          const changed = entries.filter(([, status]) => status !== 'unchanged');
+          if (entries.length) vscode.window.showInformationMessage(
+            changed.length ? `${basename(this.uri.fsPath)}: ${changed.length} of ${entries.length} table(s) changed since backup.`
+              : `${basename(this.uri.fsPath)}: no changes since backup.`
+          );
+        }
+      } catch { /* Closing never publishes raw errors or prevents cleanup. */ }
+      finally {
+        this.file.dispose();
+        this.queryTargets.clear(); this.combinedQueryMap.clear(); this.statsCache.clear();
+        this.lastSql = undefined; this.lastEditableColumns = undefined;
+        this.onDispose?.();
+      }
+    };
+    // A trusted save must finish before its filesystem lock is released.
+    if (this.lockDepth > 0) void this.lockChain.then(finish);
+    else void finish();
   }
+
 }
 
 /**
@@ -613,7 +642,8 @@ async function reconnectDocument(document: DuckDBDocument, forceReadOnly: boolea
   }
 
   const siblingPath = document.getSiblingPath();
-  const newFile = await DuckDbFile.open(document.uri.fsPath, document.forceKind, {
+  const runtime = document.file instanceof ViewerFile ? ViewerFile : DuckDbFile;
+  const newFile = await runtime.open(document.uri.fsPath, document.forceKind, {
     forceReadOnly,
     siblingPath,
     numberLocale: numberLocaleSetting(),
@@ -636,17 +666,18 @@ async function reconnectDocument(document: DuckDBDocument, forceReadOnly: boolea
 
 async function runLiveTick(document: DuckDBDocument, webview: vscode.Webview, generation: number): Promise<void> {
   const label = basename(document.uri.fsPath);
+  const queryOwner = document.activeQueryRequest;
   // A tick abandoned at its deadline can still settle later. Nothing it
   // computed may reach the view after that point — the scheduler has already
   // moved on, and a late post would overwrite fresher data with older data.
   const isCurrent = () =>
-    !document.disposed && document.liveRefreshController?.isCurrentGeneration(generation) === true;
+    !document.disposed && queryOwner === document.activeQueryRequest && document.liveRefreshController?.isCurrentGeneration(generation) === true;
 
   const paths = watchPathsFor(document.uri.fsPath, document.getSiblingPath());
   const stats = await statAll(paths);
 
   if (!statsChanged(document.lastFileStats, stats)) {
-    logLive(`[${label}] skipped (stat-gate: no change on disk)`);
+    logLive('stat-gate skipped');
     if (isCurrent()) {
       webview.postMessage({ command: 'liveTick', lastUpdatedMs: Date.now(), unchanged: true });
     }
@@ -669,7 +700,7 @@ async function runLiveTick(document: DuckDBDocument, webview: vscode.Webview, ge
   if (!outcome.ran) {
     // A user-initiated query holds the connection. Not a failure — deliberately
     // not counted as one, since it says nothing about the file's health.
-    logLive(`[${label}] skipped (connection busy with a user request)`);
+    logLive('connection busy');
     return;
   }
   if (outcome.value === undefined || !isCurrent()) return;
@@ -688,11 +719,7 @@ async function runLiveTick(document: DuckDBDocument, webview: vscode.Webview, ge
   // data until the file happened to change again.
   document.lastFileStats = stats;
 
-  logLive(
-    `[${label}] tick ok — ${rowCount} row(s)${unchanged ? ', unchanged (not reposted)' : ', reposted'}${
-      shouldHash ? '' : ' (hash skipped, over size threshold)'
-    }`
-  );
+  logLive('tick complete');
 
   if (unchanged) {
     webview.postMessage({ command: 'liveTick', lastUpdatedMs: Date.now(), unchanged: true });
@@ -795,7 +822,7 @@ async function startLiveRefresh(
     // stuck on so the next tick has a chance of getting through. Best-effort
     // by design — the scheduler doesn't wait for this to take effect.
     onTimeout: () => {
-      logLive(`[${label}] tick deadline exceeded — interrupting the in-flight query`);
+      logLive('tick timeout');
       try {
         document.file.interruptCurrentQuery();
       } catch {
@@ -803,7 +830,7 @@ async function startLiveRefresh(
       }
     },
     onStatus: (status) => postLiveStatus(webview, status),
-    onLog: (msg) => logLive(`[${label}] ${msg}`),
+    onLog: () => logLive('scheduler event'),
   });
   document.liveRefreshController = controller;
 
@@ -818,7 +845,7 @@ async function startLiveRefresh(
     hasSource: document.file.hasSibling(),
     sourceLookedFor: candidates.map((c) => basename(c)).join(', '),
   });
-  logLive(`[${label}] live refresh started, interval ${intervalMs}ms${suggestedSeconds ? ` (auto-detected ${suggestedSeconds}s)` : ''}`);
+  logLive('refresh started');
 
   // start() schedules the first tick at delay 0. Running one directly here as
   // well used to produce two concurrent first ticks, each reconnecting and
@@ -831,7 +858,7 @@ function postLiveStatus(webview: vscode.Webview, status: LiveStatus): void {
     command: 'liveStatus',
     stale: status.stale,
     failureCount: status.failureCount,
-    lastError: status.lastError,
+    lastError: status.lastError ? queryDiagnostic(new Error(status.lastError)).message : undefined,
     lastSuccessMs: status.lastSuccessMs,
   });
 }
@@ -849,7 +876,7 @@ async function stopLiveRefresh(document: DuckDBDocument, webview: vscode.Webview
     // perfectly usable for browsing, so keep it — but say so, rather than
     // leaving the user with silently-disabled editing and a generic error.
     restoredWritable = false;
-    logLive(`[${basename(document.uri.fsPath)}] could not restore a writable connection: ${(err as Error).message}`);
+    logLive('reconnect failed');
   }
   if (document.disposed) return;
 
@@ -857,7 +884,7 @@ async function stopLiveRefresh(document: DuckDBDocument, webview: vscode.Webview
     command: 'liveRefreshStopped',
     readOnly: !restoredWritable || document.file.isReadOnly(),
   });
-  logLive(`[${basename(document.uri.fsPath)}] live refresh stopped`);
+  logLive('refresh stopped');
 }
 
 export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider<DuckDBDocument> {
@@ -941,7 +968,8 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
       if (isFlatFile) releaseLock = await acquireFileLock(uri.fsPath);
 
       const siblingPath = forceKind === 'kdb' ? undefined : resolveSiblingPath(uri.fsPath);
-      const file = await DuckDbFile.open(uri.fsPath, forceKind, {
+      if (vscode.workspace.isTrusted === false) throw new QueryPolicyError('Trust this workspace before opening datasets or running queries.');
+      const file = await ViewerFile.open(uri.fsPath, forceKind, {
         siblingPath,
         numberLocale: numberLocaleSetting(),
         nullText: nullTextSetting(),
@@ -977,7 +1005,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
       );
     } catch (err) {
       releaseLock?.();
-      const message = err instanceof Error ? err.message : String(err);
+      const message = queryDiagnostic(err).message;
       vscode.window.showErrorMessage(message);
       throw err;
     }
@@ -1009,9 +1037,12 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
     // nothing about the live tick, which uses the same connection and disposes
     // it on reconnect. User-initiated work queues (never silently dropped);
     // live ticks yield (see tryRunExclusive).
-    type IncomingMessage =
+    type IncomingPayload =
       | { command: 'ready' }
       | { command: 'runQuery'; sql: string; sheetPreview?: string }
+      | { command: 'queryCatalog'; cursor?: number }
+      | { command: 'queryTarget' | 'queryTargetSql'; targetId: string; generation: number }
+      | { command: 'sheetTableSql'; table: string; filters: DetectedTableFilter[]; sort?: DetectedTableSort; limit: number; generation: number }
       | { command: 'cancelQuery' }
       | { command: 'diffQuery' }
       | { command: 'sortQuery'; column: string; direction: 'asc' | 'desc' }
@@ -1056,7 +1087,75 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
     // plot that one, and look at both" is the whole point of that.
     const chartPanels = new Map<string, ChartPanel>();
 
+    type IncomingMessage = IncomingPayload & { requestId?: number };
+    const hostWebview = webview;
     const messageSub = webview.onDidReceiveMessage(async (message: IncomingMessage) => {
+      const queryCommands = ['runQuery', 'runCombinedQuery', 'sortQuery'];
+      let owner = document.activeQueryRequest;
+      const webview = new Proxy(hostWebview, {
+        get(target, property) {
+          if (property === 'postMessage') return (payload: Record<string, unknown>) => {
+            const sensitive = ['queryResult', 'sortQueryResult', 'rowTotal', 'error', 'columnStatsResult', 'columnStatsError', 'cellUpdated', 'cellUpdateError'];
+            if (document.disposed || (sensitive.includes(String(payload.command)) && owner !== document.activeQueryRequest)) return Promise.resolve(false);
+            return target.postMessage({ ...payload, requestId: message?.requestId });
+          };
+          const value = Reflect.get(target, property);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      if (!message || typeof message !== 'object' || Array.isArray(message) || typeof message.command !== 'string' || document.disposed) return;
+      try { validateQueryMessage(message); }
+      catch (error) { webview.postMessage({ command: 'error', message: queryDiagnostic(error).message }); return; }
+      if (queryCommands.includes(message.command)) owner = ++document.activeQueryRequest;
+      if (vscode.workspace.isTrusted === false) {
+        webview.postMessage({ command: 'error', message: 'Trust this workspace before opening datasets or running queries.' });
+        return;
+      }
+      if (message.command === 'queryCatalog') {
+        try {
+          const catalog = await document.runExclusive(() => document.queryCatalogPage(message.cursor ?? 0));
+          webview.postMessage({ command: 'queryCatalog', ...catalog, cursor: message.cursor ?? 0 });
+        } catch (error) { webview.postMessage({ command: 'error', message: queryDiagnostic(error).message }); }
+        return;
+      }
+      if (message.command === 'queryTarget' || message.command === 'queryTargetSql') {
+        try {
+          const details = await document.runExclusive(async () => {
+            const target = document.queryTarget(message.targetId, message.generation);
+            const columns = await document.file.getQueryColumns(target.catalog, target.schema, target.name);
+            return { target, columns };
+          });
+          webview.postMessage({ command: 'queryTargetDetails', ...details });
+          if (message.command === 'queryTargetSql') webview.postMessage({
+            command: 'querySqlDraft', target: details.target, sql: `SELECT *\nFROM ${details.target.sqlName}\nLIMIT 100;`,
+          });
+          const catalog = await document.runExclusive(() => document.queryCatalogPage());
+          webview.postMessage({ command: 'queryCatalog', ...catalog, cursor: 0 });
+        } catch (error) { webview.postMessage({ command: 'error', message: queryDiagnostic(error).message }); }
+        return;
+      }
+      if (message.command === 'sheetTableSql') {
+        try {
+          const draft = await document.runExclusive(async () => {
+            if (message.generation !== document.queryCatalogGeneration) throw new QueryPolicyError('The worksheet changed. Select the table again.');
+            const sql = await document.file.buildDetectedTableQuery(message.table, message.filters, message.sort, message.limit);
+            let cursor = 0;
+            let target: QueryTarget | undefined;
+            do {
+              const page = await document.queryCatalogPage(cursor);
+              target = page.targets.find(target => target.name === message.table && target.worksheet);
+              if (target || page.nextCursor === undefined) break;
+              cursor = page.nextCursor;
+            } while (cursor < 5000);
+            if (!target) throw new QueryPolicyError('The detected table is no longer available.');
+            const columns = await document.file.getQueryColumns(target.catalog, target.schema, target.name);
+            return { sql, target, columns };
+          });
+          webview.postMessage({ command: 'queryTargetDetails', target: draft.target, columns: draft.columns });
+          webview.postMessage({ command: 'querySqlDraft', sql: draft.sql, target: draft.target });
+        } catch (error) { webview.postMessage({ command: 'error', message: queryDiagnostic(error).message }); }
+        return;
+      }
       if (message.command === 'ready') {
         try {
           const tables = await document.runExclusive(() => document.getTables());
@@ -1067,7 +1166,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             previewFirst: isPreviewFirstTableEnabled(),
           });
         } catch (err) {
-          webview.postMessage({ command: 'error', message: (err as Error).message });
+          webview.postMessage({ command: 'error', message: queryDiagnostic(err).message });
         }
         return;
       }
@@ -1092,13 +1191,13 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
           try {
             await startLiveRefresh(document, webview, message.intervalMs);
           } catch (err) {
-            webview.postMessage({ command: 'error', message: (err as Error).message });
+            webview.postMessage({ command: 'error', message: queryDiagnostic(err).message });
           }
         } else {
           try {
             await stopLiveRefresh(document, webview);
           } catch (err) {
-            webview.postMessage({ command: 'error', message: (err as Error).message });
+            webview.postMessage({ command: 'error', message: queryDiagnostic(err).message });
           }
         }
         return;
@@ -1144,7 +1243,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
               : 'No shared time column found between hot and cold — showing an unbounded union instead of a tail window.',
           });
         } catch (err) {
-          webview.postMessage({ command: 'error', message: (err as Error).message });
+          webview.postMessage({ command: 'error', message: queryDiagnostic(err).message });
         }
         return;
       }
@@ -1167,7 +1266,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             } catch (err) {
               webview.postMessage({
                 command: 'backupStatus',
-                message: `Could not create backup — Safe Mode stays on: ${(err as Error).message}`,
+                message: `Could not create backup — Safe Mode stays on: ${queryDiagnostic(err).message}`,
               });
             }
           } else {
@@ -1183,7 +1282,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
               const status = await document.runExclusive(() => document.file.compareToBackup());
               webview.postMessage({ command: 'tableChangeStatus', status });
             } catch (err) {
-              webview.postMessage({ command: 'error', message: (err as Error).message });
+              webview.postMessage({ command: 'error', message: queryDiagnostic(err).message });
             }
           } else {
             webview.postMessage({ command: 'tableChangeStatus', status: {} });
@@ -1230,6 +1329,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
           // result of this query, and has to be told.
           const hadPendingSheets = document.file.hasPendingSheets();
           const { result, diffFields, diffSkipped, editability } = await document.runExclusive(async () => {
+            if (document.safeMode && destructive) throw new QueryPolicyError('Blocked by Safe Mode.');
             const queryResult = await document.file.runQuery(sql, getMaxResultRows());
             document.lastSql = sql;
             document.statsCache.clear();
@@ -1312,10 +1412,9 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
           }
           void reportRowTotal(document, webview, sql, result);
         } catch (err) {
-          const message2 = (err as Error).message;
           webview.postMessage({
             command: 'error',
-            message: /interrupt/i.test(message2) ? 'Query cancelled.' : message2,
+            message: queryDiagnostic(err, !!message.sheetPreview).message,
           });
         }
         return;
@@ -1347,7 +1446,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             editableTable: document.lastEditableTable,
           });
         } catch (err) {
-          webview.postMessage({ command: 'error', message: (err as Error).message });
+          webview.postMessage({ command: 'error', message: queryDiagnostic(err).message });
         }
         return;
       }
@@ -1367,7 +1466,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
           webview.postMessage({
             command: 'sheetTableError',
             table: message.table,
-            message: (err as Error).message,
+            message: queryDiagnostic(err).message,
           });
         }
         return;
@@ -1412,7 +1511,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
           webview.postMessage({
             command: 'sheetTableError',
             table: message.table,
-            message: (err as Error).message,
+            message: queryDiagnostic(err).message,
           });
         }
         return;
@@ -1459,7 +1558,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             maxPoints: cap,
           });
         } catch (err) {
-          chartPanel.reveal(label, { command: 'chartError', message: (err as Error).message });
+          chartPanel.reveal(label, { command: 'chartError', message: queryDiagnostic(err).message });
         }
         return;
       }
@@ -1540,7 +1639,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
           // In the chart's own tab, not the grid's status line: the tab is
           // where the user is looking, and a chart that silently never appears
           // is the failure worth avoiding.
-          chartPanel.reveal(label, { command: 'chartError', message: (err as Error).message });
+          chartPanel.reveal(label, { command: 'chartError', message: queryDiagnostic(err).message });
         }
         return;
       }
@@ -1607,7 +1706,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             editableTable: document.lastEditableTable,
           });
         } catch (err) {
-          webview.postMessage({ command: 'error', message: (err as Error).message });
+          webview.postMessage({ command: 'error', message: queryDiagnostic(err).message });
         }
         return;
       }
@@ -1643,7 +1742,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             });
           }
         } catch (err) {
-          webview.postMessage({ command: 'columnStatsError', column: message.column, message: (err as Error).message });
+          webview.postMessage({ command: 'columnStatsError', column: message.column, message: queryDiagnostic(err).message });
         }
         return;
       }
@@ -1678,15 +1777,16 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
 
         const editableTable = document.lastEditableTable;
         try {
-          const rowsMatched = await document.runExclusive(() =>
-            document.file.updateCell(
+          const rowsMatched = await document.runExclusive(() => {
+            if (document.safeMode || document.lastEditableTable !== editableTable) throw new QueryPolicyError('The edit state changed. Re-run the query before editing.');
+            return document.file.updateCell(
               editableTable,
               message.column,
               message.newValue,
               message.rowValues,
               (statusMessage) => webview.postMessage({ command: 'editStatus', message: statusMessage })
-            )
-          );
+            );
+          });
           if (rowsMatched === 0) {
             webview.postMessage({
               command: 'cellUpdateError',
@@ -1694,6 +1794,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
               message: 'No matching row found — the data may have changed. Re-run the query and try again.',
             });
           } else {
+            document.invalidateTablesCache();
             webview.postMessage({
               command: 'cellUpdated',
               column: message.column,
@@ -1703,7 +1804,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             });
           }
         } catch (err) {
-          webview.postMessage({ command: 'cellUpdateError', column: message.column, message: (err as Error).message });
+          webview.postMessage({ command: 'cellUpdateError', column: message.column, message: queryDiagnostic(err).message });
         }
       }
     });

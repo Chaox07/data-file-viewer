@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { resolve } from 'node:path';
 import { QueryWorker } from '../src/queryWorker';
+import { stat } from 'node:fs/promises';
+import { setTimeout as pause } from 'node:timers/promises';
 
 const probe = resolve('test/fixtures/queryWorkerProbe.cjs');
 
@@ -42,4 +44,44 @@ test('queue is bounded and disposal rejects work without leaving a live worker',
   worker.dispose();
   await Promise.all(pending);
   await assert.rejects(worker.call('echo', [1]), /closed/);
+});
+
+test('Cancel cannot deliver a late success, and workers do not inherit arbitrary secrets', async () => {
+  process.env.DFV_SYNTHETIC_SECRET = 'SYNTHETIC_ONLY';
+  const worker = new QueryWorker(probe);
+  try {
+    assert.equal(await worker.call('hasSecret', []), false);
+    const running = worker.call('delayedEcho', ['stale result']);
+    worker.cancel();
+    await assert.rejects(running, /cancelled/);
+    assert.equal(await worker.call('echo', ['fresh']), 'fresh');
+  } finally { worker.dispose(); delete process.env.DFV_SYNTHETIC_SECRET; }
+});
+
+test('private worker scratch is removed after close and crash', async () => {
+  for (const crash of [false, true]) {
+    const worker = new QueryWorker(probe);
+    try {
+      const root = await worker.call<string>('cwd', []);
+      if (process.platform !== 'win32') assert.equal((await stat(root)).mode & 0o777, 0o700);
+      if (crash) await assert.rejects(worker.call('exit', []), /stopped/);
+      else await worker.close();
+      for (let i = 0; i < 100 && await stat(root).then(() => true, () => false); i++) await pause(10);
+      await assert.rejects(stat(root), { code: 'ENOENT' });
+    } finally { worker.dispose(); }
+  }
+});
+
+test('worker pool evicts idle readers and refuses a fifth busy reader', async () => {
+  const workers = Array.from({ length: 5 }, () => new QueryWorker(probe));
+  try {
+    for (const worker of workers) assert.equal(await worker.call('echo', [1]), 1);
+    assert.equal(workers.filter(worker => worker.running).length, 4);
+    for (const worker of workers) await worker.close();
+    const blocked = workers.slice(0, 4).map(worker => assert.rejects(worker.call('stall', []), /cancelled/));
+    await assert.rejects(workers[4].call('echo', [1]), /Four query runtimes/);
+    for (const worker of workers) worker.cancel();
+    await Promise.all(blocked);
+    assert.equal(await workers[4].call('echo', [2]), 2);
+  } finally { workers.forEach(worker => worker.dispose()); }
 });

@@ -10,7 +10,6 @@ export const QUERY_LIMITS = Object.freeze({
   filterChars: 4000,
   queuedRequests: 8,
   deadlineMs: 30_000,
-  cancelDeadlineMs: 2_000,
 });
 
 export class QueryPolicyError extends Error {
@@ -45,6 +44,18 @@ export async function restrictQueryEngine(connection: DuckDBConnection, paths: r
 
 /** Refuse large values explicitly; do not present clipped text as complete data. */
 export function validateResultSize(value: unknown): void {
+  const stack: unknown[] = [value];
+  let stringBytes = 0;
+  while (stack.length) {
+    const item = stack.pop();
+    if (typeof item === 'string') {
+      const bytes = Buffer.byteLength(item, 'utf8');
+      if (bytes > QUERY_LIMITS.cellBytes) throw new QueryPolicyError('A result value exceeds 4 MiB. Select fewer columns or explicitly shorten that value in SQL.');
+      stringBytes += bytes;
+      if (stringBytes > QUERY_LIMITS.resultBytes) throw new QueryPolicyError('Query result exceeds 32 MiB. Select fewer columns or rows.');
+    }
+    if (item && typeof item === 'object') for (const child of Object.values(item)) stack.push(child);
+  }
   const json = JSON.stringify(value);
   if (Buffer.byteLength(json ?? '', 'utf8') > QUERY_LIMITS.resultBytes) {
     throw new QueryPolicyError('Query result exceeds 32 MiB. Select fewer columns or rows.');
@@ -60,11 +71,40 @@ export interface QueryRelation {
   viewSql?: string;
 }
 
+/** Remove only a read-only inspection wrapper for AST authorization. Execution
+ * always receives the original SQL, including comments, literals and LIMIT.
+ */
+function inspectionSql(sql: string): string {
+  let start = 0;
+  for (;;) {
+    while (/\s/.test(sql[start] ?? '') && start < sql.length) start++;
+    if (sql.slice(start, start + 2) === '--') {
+      const end = sql.indexOf('\n', start + 2); start = end < 0 ? sql.length : end + 1; continue;
+    }
+    if (sql.slice(start, start + 2) === '/*') {
+      let depth = 1; start += 2;
+      while (start < sql.length && depth) {
+        if (sql.slice(start, start + 2) === '/*') { depth++; start += 2; }
+        else if (sql.slice(start, start + 2) === '*/') { depth--; start += 2; }
+        else start++;
+      }
+      continue;
+    }
+    break;
+  }
+  const text = sql.slice(start);
+  const wrapper = /^(explain(?:\s+analyze)?|describe|summarize)\b\s*/i.exec(text);
+  if (!wrapper) return sql;
+  const inner = text.slice(wrapper[0].length);
+  if (/^explain/i.test(wrapper[1])) return inner;
+  return /^(select|with|from)\b/i.test(inner) ? inner : `SELECT * FROM ${inner}`;
+}
+
 /** getTableNames expands existing views and loses worksheet names. Serialization
  * preserves syntactic references without interpreting quoted text as a reference.
  */
 export async function referencedQueryTables(connection: DuckDBConnection, sql: string): Promise<Set<string>> {
-  const reader = await connection.runAndReadAll('select system.main.json_serialize_sql(?::varchar)', [sql]);
+  const reader = await connection.runAndReadAll('select system.main.json_serialize_sql(?::varchar)', [inspectionSql(sql)]);
   const ast = JSON.parse(String(reader.getRows()[0][0]));
   const names = new Set<string>();
   const stack: unknown[] = [ast];
@@ -129,7 +169,7 @@ export class ReadSqlPolicy {
     const inspected = new Set<string>();
     const inspect = async (text: string, viewDepth = 0): Promise<void> => {
       if (viewDepth > 32) throw new QueryPolicyError('Stored view nesting exceeds the query limit.');
-      const serialized = await this.connection.runAndReadAll('select system.main.json_serialize_sql(?::varchar)', [text]);
+      const serialized = await this.connection.runAndReadAll('select system.main.json_serialize_sql(?::varchar)', [inspectionSql(text)]);
       const ast = JSON.parse(String(serialized.getRows()[0][0]));
       if (ast.error || !Array.isArray(ast.statements) || ast.statements.length !== 1) {
         throw new QueryPolicyError('Enter one SELECT query. SQL writes and configuration commands are unavailable; use the existing cell editor for changes.');

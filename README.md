@@ -483,13 +483,48 @@ above a configurable row count (`dataFileViewer.diffRowThreshold` in
 Settings, default 50,000) this automatic highlighting is skipped for
 performance and replaced with a manual "Diff anyway" button.
 
-While Safe Mode is on, a query is only allowed to run if the whole thing is
-read-only — not just its first word. That means `select 1; drop table x` is
+SQL queries always remain read-only, including when Safe Mode is off for cell
+editing. The whole statement is checked, not just its first word. `select 1; drop table x` is
 blocked for containing a second statement, and `with x as (…) delete from t`
 is blocked for the `delete`, even though both open with a safe keyword.
 Comments, text values and quoted column names are ignored when deciding, so
 an ordinary query over a column containing `;` or the word `update` still
 runs.
+
+### SQL table selection (in development)
+
+The **Query table** selector lists document relations and their SQL types.
+For Excel, raw worksheets expose letter columns (`A`, `B`, `C`); detected
+tables expose their headers and typed values. Selecting a table leaves your
+query unchanged. **Use in SQL** inserts a quoted query, and **Restore draft**
+returns to the previous text. The **SQL** button on a detected table carries
+its current filters, sorting and row limit into the editor. Press **Run** to
+execute it. Drafts stay in memory for the current view.
+
+A numeric year is not a date boundary. For a DATE column, use
+`WHERE "Date" >= DATE '1990-01-01'`. For ISO date text, use
+`WHERE CAST("Date" AS DATE) >= DATE '1990-01-01'`. Invalid date text remains an
+error; the viewer does not silently discard it or change source types.
+
+Queries run in a separate reader process with a 30-second deadline, bounded
+queues, 512 MB DuckDB memory limit and disabled disk spill. SQL is limited to
+256 KiB, individual result values to 4 MiB, and result payloads to 32 MiB.
+Cancel stops the reader; the next query rebuilds its caches. At most four
+reader processes are retained, with idle readers released when needed.
+
+The reader blocks SQL file/network access, extension loading, configuration
+changes, internal catalogs and user-defined macros. These restrictions also
+apply through stored views. Ordinary document SELECT queries, CTEs, joins,
+aggregates, EXPLAIN, DESCRIBE and SUMMARIZE are supported. Cell saves use a
+separate host-controlled path. Opening data requires Workspace Trust.
+
+Workbook archives are checked before native parsing: 256 MiB compressed,
+512 MiB inflated, 256 MiB per part, 10,000 entries and 10 million declared
+cells per sheet. Unsafe archive paths and XML entity declarations are rejected.
+Worker temporary files use private directories removed after worker exit;
+an abrupt extension-host or OS crash can leave a private directory behind.
+The worker and engine limits are not an operating-system sandbox for native
+library vulnerabilities, and native parser memory can exceed the DuckDB limit.
 
 ### How many rows are there really?
 

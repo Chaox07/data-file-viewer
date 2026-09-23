@@ -1,17 +1,11 @@
 import { realpath, stat } from 'node:fs/promises';
-import { DuckDbFile, type DuckDbFileOpenOptions, type FileKind } from './duckdbConnection';
-import { queryDiagnostic } from './queryDiagnostics';
+import { DuckDbFile, baseTableOfSelect, type DuckDbFileOpenOptions, type FileKind } from './duckdbConnection';
+import { queryDiagnostic, queryNotices } from './queryDiagnostics';
 import { QueryPolicyError, validateResultSize } from './queryPolicy';
+import { READ_METHODS } from './queryProtocol';
+import { preflightWorkbook } from './xlsxBudget';
 
 /** No write methods are exposed by the read worker. */
-export const READ_METHODS = [
-  'listTables', 'listSidebarTables', 'listSiblingTables', 'getCombinableTableNames',
-  'buildCombinedQuery', 'getPollCadenceSeconds', 'getSeriesFrequency',
-  'buildDetectedTableQuery', 'runDetectedTableQuery', 'runQuery', 'runChartQuery',
-  'runSortedQuery', 'countMatchingRows', 'checkEditableSelect',
-  'getColumnTopValues', 'getColumnDescriptiveStats',
-] as const;
-
 let file: DuckDbFile | undefined;
 let approvedPath: string | undefined;
 let stamp: { size: number; mtimeMs: number } | undefined;
@@ -28,8 +22,10 @@ async function metadata() {
     hasPendingSheets: file.hasPendingSheets(),
     worksheets: tables.filter(t => file!.isWorksheet(t)),
     detectedTables: tables.flatMap(t => file!.getDetectedSheetTables(t)),
-    openWarnings: file.openWarnings,
-    warnings: file.takeLateWarnings(),
+    openWarnings: queryNotices(file.openWarnings),
+    numberLocale: file.numberLocale,
+    stamp,
+    warnings: queryNotices(file.takeLateWarnings()),
   };
 }
 
@@ -47,6 +43,7 @@ process.on('message', (message: unknown) => {
         approvedPath = await realpath(String(args[0]));
         const info = await stat(approvedPath);
         stamp = { size: info.size, mtimeMs: info.mtimeMs };
+        if (/\.xlsx$/i.test(approvedPath)) await preflightWorkbook(approvedPath);
         file = await DuckDbFile.open(approvedPath, args[1] as FileKind | undefined, {
           ...(args[2] as DuckDbFileOpenOptions), restrictedReads: true, forceReadOnly: true,
         });
@@ -59,13 +56,18 @@ process.on('message', (message: unknown) => {
           throw new QueryPolicyError('The source changed. Refresh the document before running another query.');
         }
         const operation = file[method as typeof READ_METHODS[number]] as (...values: any[]) => Promise<unknown>;
-        value = await operation.apply(file, args);
+        value = await operation.apply(file, method === 'checkEditableSelect' ? [args[0], true] : args);
       }
       const result = { value, metadata: await metadata() };
       validateResultSize(result);
       process.send?.({ id, value: result });
     } catch (error) {
-      process.send?.({ id, error: queryDiagnostic(error).message });
+      const rawWorksheet = method === 'runQuery' && typeof args[0] === 'string' && !!file?.isWorksheet(baseTableOfSelect(args[0]) ?? '');
+      const diagnostic = queryDiagnostic(error, rawWorksheet).message;
+      if (file) {
+        try { process.send?.({ id, value: { value: undefined, metadata: await metadata(), error: diagnostic } }); }
+        catch { process.send?.({ id, error: diagnostic }); }
+      } else process.send?.({ id, error: diagnostic });
     }
   });
 });

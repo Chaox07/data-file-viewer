@@ -50,7 +50,7 @@ export function normalizeTable(table: CanonicalTable): CanonicalTable {
 }
 
 /** The first table the file reports, or throws the way the UI would. */
-export async function firstTable(file: DuckDbFile): Promise<string> {
+export async function firstTable(file: Pick<DuckDbFile, keyof DuckDbFile>): Promise<string> {
   const tables = await file.listTables();
   if (tables.length === 0) throw new Error('the file reports no tables');
   return tables[0];
@@ -74,7 +74,7 @@ export async function firstTable(file: DuckDbFile): Promise<string> {
  * a workbook to open one of them is what made opening slow), so the sheet is
  * queried here to trigger it before the list is re-read.
  */
-export async function subjectTable(file: DuckDbFile, named?: string): Promise<string> {
+export async function subjectTable(file: Pick<DuckDbFile, keyof DuckDbFile>, named?: string): Promise<string> {
   const sheet = named ?? (await firstTable(file));
   if (file.fileKind !== 'xlsx') return sheet;
   // Querying it is what makes the sheet find its tables; detection is deferred
@@ -97,7 +97,7 @@ export async function subjectTable(file: DuckDbFile, named?: string): Promise<st
  * query. `malformedFiles.test.ts` learned this the hard way; asserting on
  * "did open() throw" passes for the wrong reason.
  */
-export async function readTable(file: DuckDbFile, tableName?: string): Promise<CanonicalTable> {
+export async function readTable(file: Pick<DuckDbFile, keyof DuckDbFile>, tableName?: string): Promise<CanonicalTable> {
   // A case names the SHEET it is about; what it asserts on -- named columns,
   // typed values -- is the table detected inside that sheet. Resolving here
   // rather than in every case keeps `tableName` meaning "the thing this sheet
