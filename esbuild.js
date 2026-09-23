@@ -44,7 +44,11 @@ const chartViewConfig = {
 };
 
 async function main() {
-  const configs = [extensionConfig, webviewConfig, chartViewConfig];
+  const configs = [extensionConfig, webviewConfig, chartViewConfig, {
+    ...extensionConfig,
+    entryPoints: ['src/queryWorkerEntry.ts'],
+    outfile: 'dist/queryWorkerEntry.js',
+  }];
   if (watch) {
     const contexts = await Promise.all(configs.map((c) => esbuild.context(c)));
     await Promise.all(contexts.map((c) => c.watch()));

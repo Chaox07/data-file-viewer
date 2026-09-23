@@ -14,6 +14,7 @@
     "src/sqlSafety.ts",
     "src/sortOrder.ts",
     "src/duckdbConnection.ts",
+    "src/queryWorkerEntry.ts",
     "src/kdbParser.ts",
     "src/xlsxSheets.ts",
     "src/chartSpec.ts",

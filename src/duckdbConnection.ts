@@ -12,6 +12,7 @@ import {
 import { basename, dirname, extname, join } from 'node:path';
 import { chmod, copyFile, mkdtemp, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
+import { ReadSqlPolicy, restrictQueryEngine, validateSqlSize, validateResultSize, referencedQueryTables, type QueryRelation } from './queryPolicy';
 import { createWriteStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
@@ -138,6 +139,8 @@ export interface DescriptiveStats {
 export type FileKind = 'duckdb' | 'parquet' | 'sqlite' | 'csv' | 'dta' | 'arrow' | 'feather' | 'xlsx' | 'kdb';
 
 export interface DuckDbFileOpenOptions {
+  /** Internal read-worker mode. Never populated from a webview message. */
+  restrictedReads?: boolean;
   /** Request read-only up front (live-refresh reconnects) instead of trying read-write first. */
   forceReadOnly?: boolean;
   /** Absolute path to the other half of a hot/cold pair, if one was found — see duckdbEditorProvider.ts's sibling detection. */
@@ -1558,6 +1561,7 @@ export function baseTableOfSelect(sql: string | undefined): string | undefined {
 }
 
 export class DuckDbFile {
+  private readPolicy?: ReadSqlPolicy;
   private lastBackupPath: string | undefined;
   private backupAttached = false;
   /** Temp dir holding a Feather backup's stream conversion, if any. */
@@ -1726,7 +1730,7 @@ export class DuckDbFile {
     // reason for a live tick to want read-write, and going through the
     // fallback path could momentarily grab the write lock and stall the
     // actual writer process (the scraper/extractor) before falling back.
-    const forceReadOnly = options?.forceReadOnly === true;
+    const forceReadOnly = options?.forceReadOnly === true || options?.restrictedReads === true;
 
     let instance: DuckDBInstance;
     let readOnly = false;
@@ -2097,7 +2101,7 @@ export class DuckDbFile {
       siblingIsSqlite = attached?.isSqlite ?? false;
     }
 
-    return new DuckDbFile(
+    const file = new DuckDbFile(
       connection,
       path,
       kind,
@@ -2118,6 +2122,34 @@ export class DuckDbFile {
       nullText,
       sqlitePlan
     );
+    if (options?.restrictedReads) {
+      try {
+        await restrictQueryEngine(connection, [...new Set([
+          path, ...(options.siblingPath ? [options.siblingPath] : []),
+          ...[...viewSources.values()].map(source => source.sourcePath),
+        ])]);
+        file.readPolicy = new ReadSqlPolicy(connection, catalogName);
+      } catch (error) { file.dispose(); throw error; }
+    }
+    return file;
+  }
+
+  /** Metadata queries here are fixed host SQL, not user SQL. No row sampling. */
+  private async approvedQueryRelations(): Promise<QueryRelation[]> {
+    const reader = await this.connection.runAndReadAll(`
+      select t.table_catalog, t.table_schema, t.table_name, v.view_definition
+      from information_schema.tables t left join information_schema.views v
+        on t.table_catalog=v.table_catalog and t.table_schema=v.table_schema and t.table_name=v.table_name
+      where t.table_catalog=current_database()`);
+    return reader.getRows().map(row => ({
+      catalog: String(row[0]), schema: String(row[1]), name: String(row[2]),
+      viewSql: row[3] == null ? undefined : String(row[3]),
+      trustedView: this.viewSources.has(String(row[2])) || this.kind === 'sqlite',
+    }));
+  }
+
+  private async assertReadSql(sql: string): Promise<void> {
+    if (this.readPolicy) await this.readPolicy.validate(sql, await this.approvedQueryRelations());
   }
 
   private static async tryAttachSibling(
@@ -2701,14 +2733,12 @@ export class DuckDbFile {
    * identifier in the text. Exact, because that is the form every query this
    * viewer builds uses, and cheap, because the map is one entry per sheet.
    */
-  private pendingSheetFor(sql: string): string | undefined {
-    const base = baseTableOfSelect(sql);
-    if (base !== undefined && this.pendingSheets.has(base)) return base;
+  private pendingSheetsFor(references: ReadonlySet<string>): string[] {
+    const found: string[] = [];
     for (const name of this.pendingSheets.keys()) {
-      if (base !== undefined && base.startsWith(`${name} \u00b7 Table `)) return name;
-      if (sql.includes(quoteIdent(name))) return name;
+      if ([...references].some(reference => reference === name || reference.startsWith(`${name} \u00b7 Table `))) found.push(name);
     }
-    return undefined;
+    return found;
   }
 
   /**
@@ -2717,16 +2747,11 @@ export class DuckDbFile {
    * table path; exact quoted-name matching also covers joins and hostile Excel
    * names without attempting to parse them ourselves.
    */
-  private pendingDerivedTablesFor(sql: string): string[] {
+  private pendingDerivedTablesFor(references: ReadonlySet<string>): string[] {
     const found = new Set<string>();
-    const base = baseTableOfSelect(sql);
-    if (base !== undefined) {
-      const source = this.viewSources.get(base);
-      if (source?.derived && source.prepared !== true) found.add(base);
-    }
     for (const [name, source] of this.viewSources) {
       if (!source.derived || source.prepared === true) continue;
-      if (sql.includes(quoteIdent(name))) found.add(name);
+      if (references.has(name)) found.add(name);
     }
     return [...found];
   }
@@ -2752,9 +2777,14 @@ export class DuckDbFile {
   }
 
   private async prepareDerivedTablesFor(sql: string): Promise<void> {
-    for (const name of this.pendingDerivedTablesFor(sql)) {
-      await this.ensureDerivedPrepared(name);
+    if (this.kind === 'xlsx') {
+      const references = await referencedQueryTables(this.connection, sql);
+      for (const sheet of this.pendingSheetsFor(references)) await this.ensureSheetPrepared(sheet);
+      for (const name of this.pendingDerivedTablesFor(references)) {
+        await this.ensureDerivedPrepared(name);
+      }
     }
+    await this.assertReadSql(sql);
   }
 
   /**
@@ -2856,8 +2886,7 @@ export class DuckDbFile {
     // Whatever this query reads, make sure that sheet has been looked at. The
     // funnel every read passes through, which is what makes the deferral above
     // invisible to callers.
-    const pending = this.pendingSheetFor(sql);
-    if (pending !== undefined) await this.ensureSheetPrepared(pending);
+    validateSqlSize(sql);
     await this.prepareDerivedTablesFor(sql);
     try {
       return await this.runQueryOnce(sql, maxRows);
@@ -2965,6 +2994,7 @@ export class DuckDbFile {
       const truncated = capped && rows.length > maxRows;
       if (truncated) rows = rows.slice(0, maxRows);
       const columnStatsKind = reader.columnTypes().map((t) => classifyForStats(t.typeId));
+      if (this.readPolicy) validateResultSize({ columns, rows });
       return { columns, rows, columnStatsKind, truncated };
     } finally {
       if (snapshot) await this.connection.run('rollback');
@@ -3173,6 +3203,7 @@ export class DuckDbFile {
    */
   async countMatchingRows(sql: string): Promise<number | undefined> {
     try {
+      await this.prepareDerivedTablesFor(sql);
       const stripped = stripTrailingSemicolon(sql);
       const extracted = extractTrailingLimit(stripped);
       const inner = extracted ? extracted.withoutLimit : stripped;
@@ -3428,6 +3459,7 @@ export class DuckDbFile {
    * backup yet, or the query can't be run against it (e.g. a brand-new table).
    */
   async diffQueryAgainstBackup(sql: string, liveColumns: string[], liveRows: unknown[][]): Promise<QueryDiff | null> {
+    await this.assertReadSql(sql);
     if (!this.lastBackupPath) return null;
     let backupColumns: string[];
     let backupRows: unknown[][];
@@ -3511,6 +3543,7 @@ export class DuckDbFile {
    * opinion of whether a result is editable; this is always re-derived here.
    */
   async checkEditableSelect(sql: string): Promise<EditabilityInfo> {
+    await this.assertReadSql(sql);
     // kdb+ tables are read from the real on-disk file (see kdbParser.ts) into
     // an in-memory table purely so this viewer can query it -- there is no
     // write-back path to real kdb+ format, so editing is never offered.
