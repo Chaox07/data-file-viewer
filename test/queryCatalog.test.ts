@@ -18,7 +18,7 @@ test('catalog keeps same-named relations in different schemas distinct and IDs d
     const instance = await DuckDBInstance.create(path); const c = await instance.connect();
     await c.run('create schema other; create table main.data(i integer); create table other.data("Date" date)');
     c.closeSync(); instance.closeSync();
-    files.push(await DuckDbFile.open(path), await DuckDbFile.open(path));
+    files.push(await DuckDbFile.open(path, undefined, { forceReadOnly: true }), await DuckDbFile.open(path, undefined, { forceReadOnly: true }));
     const docs = files.map(file => new DuckDBDocument(vscode.Uri.file(path), file));
     const page = await docs[0].queryCatalogPage();
     assert.equal(page.targets.length, 2);

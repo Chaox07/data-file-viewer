@@ -87,6 +87,10 @@ const { xlsxFile } = require('../../out-test/test/stress/generators/_write');
     assert.equal(await page.evaluate(() => window.__injected), undefined);
     assert.deepEqual(outbound, []);
     assert.deepEqual(errors, []);
+    const resultCount = responses.filter(message => message.command === 'queryResult').length;
+    await handler(requests.find(message => message.command === 'runQuery'));
+    assert.equal(responses.filter(message => message.command === 'queryResult').length, resultCount);
+    assert.ok(responses.some(message => message.command === 'error' && message.message.includes('expired')));
     assert.deepEqual(await fs.readFile(source), original);
     console.log('SQL browser workflow passed: real provider/worker, target types, draft restoration, inline SQL, exact date filter, failed-query discovery, and safe metadata rendering.');
   } finally { document?.dispose(); await browser.close(); await fs.rm(dir, { recursive: true, force: true }); }

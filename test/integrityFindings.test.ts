@@ -938,12 +938,14 @@ test('EXT-04 axis: an attached .duckdb table stays excluded, as it always was', 
   // TABLE said so.
   const { DuckDBInstance } = await import('@duckdb/node-api');
   const path = join(dir, 'axis.duckdb');
-  const seed = await (await DuckDBInstance.create(path)).connect();
+  const instance = await DuckDBInstance.create(path);
+  const seed = await instance.connect();
   await seed.run(
     `create table t as select * from (values ('9007199254740993','a'),('007','b')) v(id, note)`
   );
   await seed.run('checkpoint');
   seed.closeSync();
+  instance.closeSync();
 
   const file = await DuckDbFile.open(path);
   try {

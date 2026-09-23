@@ -16,7 +16,7 @@ import { ReadSqlPolicy, QueryPolicyError, restrictQueryEngine, validateSqlSize, 
 import { validateTableFilters } from './queryMessages';
 import type { QueryCatalogRelation, QueryColumn } from './queryCatalog';
 import { WORKBOOK_LIMITS } from './xlsxBudget';
-import { createWriteStream } from 'node:fs';
+import { constants, createWriteStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
 import { KNOWN_FREQUENCIES, type SeriesFrequency } from './chartSpec';
@@ -1315,7 +1315,7 @@ function columnSignature(rows: unknown[][], colIdx: number, len: number): number
 
 function isLockConflict(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
-  return /lock/i.test(message);
+  return /lock|being used by another process|resource busy/i.test(message);
 }
 
 // INSTALL writes into DuckDB's extension directory on disk, so it only needs
@@ -1587,7 +1587,7 @@ export class DuckDbFile {
   private readonly detectedSheetTables = new Map<string, DetectedSheetTable[]>();
 
   private constructor(
-    private readonly connection: DuckDBConnection,
+    private connection: DuckDBConnection,
     private readonly path: string,
     private readonly kind: FileKind,
     private readonly catalogName: string,
@@ -3292,6 +3292,7 @@ export class DuckDbFile {
 
   /** Flushes pending writes to disk, then copies the file. Returns the backup path. */
   async createBackup(): Promise<string> {
+    if (this.readPolicy) throw new QueryPolicyError('Backups must use the trusted save operation.');
     if (this.kind === 'kdb') {
       throw new Error("Safe Mode isn't applicable to a read-only kdb+ table.");
     }
@@ -3309,8 +3310,25 @@ export class DuckDbFile {
     const ext = extname(this.path);
     const base = basename(this.path, ext);
     const dir = dirname(this.path);
-    const backupPath = join(dir, `${base}.backup-${formatTimestamp(new Date())}${ext}`);
-    await copyFile(this.path, backupPath);
+    const backupPath = join(dir, `${base}.backup-${formatTimestamp(new Date())}-${randomBytes(4).toString('hex')}${ext}`);
+    // Windows prohibits copying a DuckDB file while its native owner is open.
+    // The document queue serializes this operation; checkpoint before releasing
+    // the handle and restore the connection even if copying fails.
+    if (process.platform === 'win32' && this.kind === 'duckdb') {
+      this.connection.closeSync();
+      this.instance?.closeSync();
+      try { await copyFile(this.path, backupPath, constants.COPYFILE_EXCL); }
+      finally {
+        this.instance = await DuckDBInstance.create(this.path, this.readOnly ? { access_mode: 'READ_ONLY' } : undefined);
+        this.connection = await this.instance.connect();
+        if (this.siblingPath) {
+          const attached = await DuckDbFile.tryAttachSibling(this.connection, this.siblingPath);
+          this.siblingCatalogName = attached?.alias;
+          this.siblingIsSqlite = attached?.isSqlite ?? false;
+        }
+        if (this.backupAttached) await this.attachBackupCatalog();
+      }
+    } else await copyFile(this.path, backupPath, constants.COPYFILE_EXCL);
 
     // copyFile creates the destination under the process's umask, not the
     // source's own mode bits — mirror them so a backup of a file someone

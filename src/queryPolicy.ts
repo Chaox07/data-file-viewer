@@ -152,6 +152,7 @@ function viewBody(sql: string): string {
  */
 export class ReadSqlPolicy {
   private functions?: Set<string>;
+  private tableFunctions = new Set<string>();
 
   constructor(private readonly connection: DuckDBConnection, private readonly catalog: string) {}
 
@@ -165,6 +166,12 @@ export class ReadSqlPolicy {
          and not bool_or(coalesce(has_side_effects,false))`
       );
       this.functions = new Set(reader.getRows().map(row => String(row[0]).toLowerCase()));
+      const tableReader = await this.connection.runAndReadAll(
+        `select function_name from system.main.duckdb_functions()
+         where function_name in ('range','generate_series','unnest')
+         group by function_name having bool_and(internal)`
+      );
+      this.tableFunctions = new Set(tableReader.getRows().map(row => String(row[0]).toLowerCase()));
     }
     const inspected = new Set<string>();
     const inspect = async (text: string, viewDepth = 0): Promise<void> => {
@@ -182,13 +189,13 @@ export class ReadSqlPolicy {
         const ctes = new Set(inheritedCtes);
         if (n.cte_map?.map) for (const entry of n.cte_map.map) ctes.add(String(entry.key).toLowerCase());
         if (n.type === 'TABLE_FUNCTION') {
-          if (!['range', 'generate_series', 'unnest'].includes(String(n.function?.function_name).toLowerCase())) {
+          if (!this.tableFunctions.has(String(n.function?.function_name).toLowerCase())) {
             throw new QueryPolicyError('Query the opened document tables. External readers and system table functions are unavailable.');
           }
         }
         if (n.class === 'FUNCTION') {
           const name = String(n.function_name).toLowerCase();
-          const safeTableFunction = ['range', 'generate_series', 'unnest'].includes(name);
+          const safeTableFunction = this.tableFunctions.has(name);
           if ((!this.functions!.has(name) && !safeTableFunction) ||
               /^(duckdb_|pragma_|read_|sqlite_|query$|query_table$|current_setting$|getenv$|which_secret$|json_execute|write_|nextval$|setseed$)/.test(name) ||
               n.catalog || (n.schema && n.schema !== 'main')) {

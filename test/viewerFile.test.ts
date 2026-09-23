@@ -39,6 +39,11 @@ for (const format of ['csv', 'duckdb', 'xlsx', 'sqlite', 'parquet', 'arrows', 'f
     assert.equal((await file.checkEditableSelect(sql)).editable, true);
     const backup = await file.createBackup();
     assert.deepEqual(await readFile(backup), original);
+    if (format === 'duckdb') {
+      const repeated = await file.createBackup();
+      assert.notEqual(repeated, backup, 'rapid backup requests must not overwrite the previous snapshot');
+      assert.deepEqual(await readFile(repeated), original);
+    }
     const row = Object.fromEntries(before.columns.map((name, index) => [name, before.rows[0][index]]));
     assert.equal(await file.updateCell(table, 'value', 99, row), 1);
     const after = await file.runQuery(sql);

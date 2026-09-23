@@ -313,7 +313,7 @@ registerCase({
 registerCase({
   name: 'concurrency_two_opens_of_one_file',
   family: 'concurrency',
-  expect: { note: 'a second open of a locked .duckdb falls back to read-only and reads the same rows' },
+  expect: { note: 'a second open reads the same rows, or explicitly refuses an exclusive Windows writer lock while keeping the first connection usable' },
   build: async (ctx) => ({ path: await w.duckdbFile(join(ctx.dir, 'two.duckdb'), [SPEC]) }),
   check: async (file, ctx, built) => {
     const first = await readTable(file, 'data');
@@ -328,6 +328,11 @@ registerCase({
         );
       }
     } catch (err) {
+      if (process.platform === 'win32' && err instanceof Error && /already open elsewhere/.test(err.message)) {
+        const retained = await readTable(file, 'data');
+        if (JSON.stringify(retained.rows) !== JSON.stringify(first.rows)) ctx.fail('silent-misread', 'the first connection changed after a refused second open');
+        return;
+      }
       ctx.fail(
         'crash',
         `a second open of an already-open file failed outright: ${

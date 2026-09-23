@@ -48,6 +48,7 @@ before(async () => {
   await connection.run(`insert into t values ${rows.join(', ')}`);
   await connection.run(`insert into t values (99, null, null, null, null, null)`);
   connection.closeSync();
+  instance.closeSync();
 });
 
 after(async () => {

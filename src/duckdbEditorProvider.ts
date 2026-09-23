@@ -1089,6 +1089,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
 
     type IncomingMessage = IncomingPayload & { requestId?: number };
     const hostWebview = webview;
+    let lastRequestId = 0;
     const messageSub = webview.onDidReceiveMessage(async (message: IncomingMessage) => {
       const queryCommands = ['runQuery', 'runCombinedQuery', 'sortQuery'];
       let owner = document.activeQueryRequest;
@@ -1106,6 +1107,13 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
       if (!message || typeof message !== 'object' || Array.isArray(message) || typeof message.command !== 'string' || document.disposed) return;
       try { validateQueryMessage(message); }
       catch (error) { webview.postMessage({ command: 'error', message: queryDiagnostic(error).message }); return; }
+      if (message.requestId !== undefined) {
+        if (message.requestId <= lastRequestId) {
+          webview.postMessage({ command: 'error', message: 'This request has expired. Repeat the action from the current view.' });
+          return;
+        }
+        lastRequestId = message.requestId;
+      }
       if (queryCommands.includes(message.command)) owner = ++document.activeQueryRequest;
       if (vscode.workspace.isTrusted === false) {
         webview.postMessage({ command: 'error', message: 'Trust this workspace before opening datasets or running queries.' });

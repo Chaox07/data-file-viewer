@@ -27,6 +27,9 @@ export interface QueryDiagnostic {
 export function queryDiagnostic(error: unknown, rawWorksheet = false): QueryDiagnostic {
   if (error instanceof QueryPolicyError) return { category: 'blocked', message: error.message };
   const raw = error instanceof Error ? error.message : '';
+  if (/already open elsewhere|being used by another process|resource busy|Could not set lock/i.test(raw)) return {
+    category: 'blocked', message: 'The file is locked by another connection. Close that connection and reopen this view.',
+  };
   const lineMatch = /\bLINE (\d+):/.exec(raw);
   const line = lineMatch && Number(lineMatch[1]) <= 100_000 ? Number(lineMatch[1]) : undefined;
   if (/interrupt|cancelled/i.test(raw)) return { category: 'cancelled', message: 'Query cancelled.' };

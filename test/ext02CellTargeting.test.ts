@@ -255,10 +255,12 @@ test('EXT-02: identical rows of an attached DuckDB table are refused like a CSV'
   // write-back, one autocommitted UPDATE -- so E14's CSV fix did not reach them.
   const { DuckDBInstance } = await import('@duckdb/node-api');
   const path = join(dir, 'identical.duckdb');
-  const seed = await (await DuckDBInstance.create(path)).connect();
+  const instance = await DuckDBInstance.create(path);
+  const seed = await instance.connect();
   await seed.run(`create table t as select * from (values ('widget', 2), ('widget', 2), ('bolt', 7)) v(name, qty)`);
   await seed.run('checkpoint');
   seed.closeSync();
+  instance.closeSync();
 
   const file = await DuckDbFile.open(path);
   try {

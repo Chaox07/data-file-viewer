@@ -104,6 +104,7 @@ before(async () => {
   const dbConnection = await dbInstance.connect();
   await dbConnection.run(`create table t as select i as id from range(1, 11) s(i)`);
   dbConnection.closeSync();
+  dbInstance.closeSync();
 
   // A wholly different format wearing the .arrows name.
   await connection.run(`copy t to '${q('parquet-in-disguise.arrows')}' (format parquet)`);

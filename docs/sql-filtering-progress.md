@@ -99,7 +99,7 @@ immediately, because ingestion helpers may catch interrupts. Requests are
 bounded; cancellation/disposal rejects pending promises and worker generations
 prevent old replies from satisfying new requests. Read RPC exposes no save method.
 
-Current full regression run: 740 tests, 708 passed, 0 failed, 28 skipped, 4 TODO.
+Current full regression run: 741 tests, 709 passed, 0 failed, 28 skipped, 4 TODO.
 Typecheck and diff whitespace checks pass. This is intermediate evidence, not
 completion of the plan's acceptance matrix.
 
@@ -131,3 +131,16 @@ installed extension remains 0.0.13. No release claim is made by this checkpoint.
 
 All remaining SEC, REL, INT, PERF, DOS and PKG families from the unified plan
 remain required. No family is complete merely because a baseline probe passes.
+
+Expanded Windows CI exposed native fixture-handle leaks and a production DuckDB
+backup copy failure under Windows' exclusive file locks. Fixtures now close
+their owning instances; the Windows backup path checkpoints, closes its native
+owner, copies to a unique destination and restores the connection. A second
+raw writer open may explicitly refuse an exclusive Windows lock; its test also
+checks that the first connection remains usable and unchanged. Windows CI must
+verify these changes before release. Matrix jobs no longer cancel the other
+platform when one fails.
+
+Adversarial follow-up also rejects replayed request IDs, checks UTF-16 XML entity
+declarations, bounds failure metadata and prevents user-defined macros from
+inheriting grants for built-in range functions. Local browser checks remain green.

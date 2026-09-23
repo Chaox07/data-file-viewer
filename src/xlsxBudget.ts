@@ -50,7 +50,7 @@ export async function preflightWorkbook(path: string, tighterLimits: Partial<Rec
         }
         if (/\.(xml|rels)$/i.test(name)) {
           const text = tail + Buffer.from(data).toString('latin1');
-          if (/<!\s*(DOCTYPE|ENTITY)\b/i.test(text)) {
+          if (/<!\s*(DOCTYPE|ENTITY)\b/i.test(text.replace(/\0/g, ''))) {
             file.terminate(); fail('Workbook XML entity declarations are unsupported.'); return;
           }
           tail = text.slice(-64);

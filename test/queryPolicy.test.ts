@@ -72,3 +72,14 @@ test('engine policy locks capabilities, bounds memory and disables spill', async
     assert.deepEqual(settings, [['enable_external_access','false'], ['max_temp_directory_size','0 bytes'], ['threads','2']]);
   } finally { c.closeSync(); instance.closeSync(); }
 });
+
+test('user macros cannot inherit the grants for built-in range functions', async () => {
+  const instance = await DuckDBInstance.create(':memory:');
+  const c = await instance.connect();
+  try {
+    await c.run("create macro range() as current_setting('home_directory')");
+    const catalog = String((await c.runAndReadAll('select current_database()')).getRows()[0][0]);
+    await restrictQueryEngine(c, []);
+    await assert.rejects(new ReadSqlPolicy(c, catalog).validate('select range()', []), /unavailable/);
+  } finally { c.closeSync(); instance.closeSync(); }
+});

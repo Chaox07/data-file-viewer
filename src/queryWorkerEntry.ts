@@ -65,7 +65,11 @@ process.on('message', (message: unknown) => {
       const rawWorksheet = method === 'runQuery' && typeof args[0] === 'string' && !!file?.isWorksheet(baseTableOfSelect(args[0]) ?? '');
       const diagnostic = queryDiagnostic(error, rawWorksheet).message;
       if (file) {
-        try { process.send?.({ id, value: { value: undefined, metadata: await metadata(), error: diagnostic } }); }
+        try {
+          const result = { value: undefined, metadata: await metadata(), error: diagnostic };
+          validateResultSize(result);
+          process.send?.({ id, value: result });
+        }
         catch { process.send?.({ id, error: diagnostic }); }
       } else process.send?.({ id, error: diagnostic });
     }

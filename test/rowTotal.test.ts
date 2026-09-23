@@ -24,6 +24,7 @@ before(async () => {
   // 146 rows, matching the real macro_*.xlsx sheet that prompted this.
   await connection.run(`create table t as select i as id, i % 7 as bucket from range(1, 147) s(i)`);
   connection.closeSync();
+  instance.closeSync();
 });
 
 after(async () => {

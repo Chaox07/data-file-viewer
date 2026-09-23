@@ -62,6 +62,7 @@ before(async () => {
   await connection.run(`insert into mostly values ('n/a', 1.0), ('', 2.0)`);
 
   connection.closeSync();
+  instance.closeSync();
 });
 
 after(async () => {

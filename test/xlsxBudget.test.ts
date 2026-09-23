@@ -21,6 +21,8 @@ test('workbook preflight rejects unsafe paths, entities and actual inflation wit
       await write({ 'xl/workbook.xml': strToU8(xml) });
       await assert.rejects(preflightWorkbook(path), /entity declarations/);
     }
+    await write({ 'xl/workbook.xml': Buffer.from('\ufeff<!DOCTYPE x SYSTEM "file:///synthetic"><x/>', 'utf16le') });
+    await assert.rejects(preflightWorkbook(path), /entity declarations/);
     await write({ 'xl/a.xml': strToU8('x'.repeat(8192)), 'xl/b.xml': strToU8('y'.repeat(8192)) });
     await assert.rejects(preflightWorkbook(path, { inflatedBytes: 12000 }), /decompression/);
     await assert.rejects(preflightWorkbook(path, { partBytes: 4000 }), /part-size|decompression/);
