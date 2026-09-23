@@ -202,6 +202,7 @@
     "typecheck": "tsc --noEmit",
     "test": "tsc -p tsconfig.test.json && node --test \"out-test/test/*.test.js\"",
     "test:browser": "tsc -p tsconfig.test.json && node test/browser/sqlWorkflow.cjs && node test/browser/chartDetail.cjs",
+    "test:host": "tsc -p tsconfig.test.json && node test/host/sqlWorkflow.cjs",
     "stress": "tsc -p tsconfig.test.json && node out-test/test/stress/run_stress.js",
     "stress:foreign": "python3 test/stress/foreign/build_corpus.py",
     "package": "npm run build && npx vsce package"
