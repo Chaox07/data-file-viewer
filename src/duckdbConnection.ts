@@ -11,12 +11,12 @@ import {
 } from '@duckdb/node-api';
 import { basename, dirname, extname, join } from 'node:path';
 import { chmod, copyFile, mkdtemp, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { randomBytes } from 'node:crypto';
-import { ReadSqlPolicy, QueryPolicyError, restrictQueryEngine, validateSqlSize, validateResultSize, referencedQueryTables, type QueryRelation } from './queryPolicy';
+import { createHash, randomBytes } from 'node:crypto';
+import { ReadSqlPolicy, QueryPolicyError, readerThreads, restrictQueryEngine, validateSqlSize, validateResultSize, referencedQueryTables, type QueryRelation } from './queryPolicy';
 import { validateTableFilters } from './queryMessages';
-import type { QueryCatalogRelation, QueryColumn } from './queryCatalog';
+import type { QueryCatalogRelation, QueryColumn, SheetBounds } from './queryCatalog';
 import { WORKBOOK_LIMITS } from './xlsxBudget';
-import { constants, createWriteStream } from 'node:fs';
+import { constants, createReadStream, createWriteStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { parseKdbFile, type KdbColumn, type KdbTable } from './kdbParser';
 import { KNOWN_FREQUENCIES, type SeriesFrequency } from './chartSpec';
@@ -146,6 +146,22 @@ export interface DuckDbFileOpenOptions {
   restrictedReads?: boolean;
   /** Internal: an existing backup created by this document's trusted save path. */
   backupPath?: string;
+  /**
+   * Internal: this instance is a one-shot writer that is disposed right after
+   * its write (ViewerFile's trusted save path). Its in-memory tables are then
+   * never read again, so an xlsx edit skips re-reading the edited sheet's
+   * tables from the workbook -- measured at 1.3 s on a 21 MB workbook, spent
+   * on state nobody looks at. The reader reopens from the file regardless.
+   */
+  discardAfterWrite?: boolean;
+  /** Internal: SHA-256 of the workbook bytes the read worker opened (see locateXlsxEdit). */
+  openedSha256?: string;
+  /**
+   * Internal: text-column decisions an earlier reader recorded, held in the
+   * host's memory for the tab's life. Used only when `sha256` equals
+   * `openedSha256`, and each one only for a table of the same shape.
+   */
+  textDecisions?: TextDecisionCache;
   /** Request read-only up front (live-refresh reconnects) instead of trying read-write first. */
   forceReadOnly?: boolean;
   /** Absolute path to the other half of a hot/cold pair, if one was found — see duckdbEditorProvider.ts's sibling detection. */
@@ -328,18 +344,24 @@ function xlsxTableExpr(
  * (`efektif_kur` declares 3 columns for 2 columns of data; `chain_gdp` declares
  * 12 for 10). Keeping those would report a 200-row sheet as 16,809 rows.
  */
-function trimTrailingBlanks(rows: readonly Cell[][]): { rows: number; cols: number } {
+function trimTrailingBlanks(rows: readonly Cell[][]): { rows: number; cols: number; firstRow: number; firstCol: number } {
   let lastRow = -1;
   let lastCol = -1;
+  // The first used cell too, which the same pass gets for free: together they
+  // are the sheet's used range, outlined when the raw worksheet is selected.
+  let firstRow = -1;
+  let firstCol = Number.POSITIVE_INFINITY;
   for (let r = 0; r < rows.length; r++) {
     const row = rows[r];
     for (let c = 0; c < row.length; c++) {
       if (isBlank(row[c])) continue;
+      if (firstRow < 0) firstRow = r;
+      if (c < firstCol) firstCol = c;
       if (r > lastRow) lastRow = r;
       if (c > lastCol) lastCol = c;
     }
   }
-  return { rows: lastRow + 1, cols: lastCol + 1 };
+  return { rows: lastRow + 1, cols: lastCol + 1, firstRow, firstCol: firstRow < 0 ? -1 : firstCol };
 }
 
 const NUMERIC_SQL_TYPE = /^(?:u?(?:tiny|small|big|huge)?int|integer|decimal|numeric|double|float|real)/i;
@@ -481,6 +503,9 @@ function viewBodySql(source: ViewSource, filePath: string, tolerateErrors: boole
  * 1.68 million.
  */
 const MAX_CACHED_CELLS = 10_000_000;
+
+/** Above this, a read worker's CSV stays a view (see the restricted open path). */
+const CSV_CACHE_MAX_BYTES = 128 * 1024 * 1024;
 
 function declaredCellCount(dim: {
   firstRow: number;
@@ -636,8 +661,84 @@ async function csvColumnsADoubleWouldChange(
   }
 }
 
+/**
+ * A whole table as rows of JS values, for table detection.
+ *
+ * The verbatim sheet is all text, and turning 1.7 M cells into JS strings one
+ * DuckDB value at a time cost 575 ms on YieldCurve's Raw_Data. Encoding each
+ * row as a JSON array in DuckDB and parsing it with V8's JSON parser gives the
+ * identical rows (strings and nulls) in ~105 ms. Any non-text column, where
+ * JSON would change the value's JS type, takes the ordinary path.
+ */
+async function readGrid(connection: DuckDBConnection, name: string): Promise<{ grid: Cell[][]; columnNames: string[] }> {
+  const table = quoteIdent(name);
+  const head = await connection.runAndReadAll(`select * from ${table} limit 0`);
+  const columnNames = head.columnNames();
+  if (columnNames.length > 0 && head.columnTypes().every((t) => t.typeId === DuckDBTypeId.VARCHAR)) {
+    const reader = await connection.runAndReadAll(`select to_json([${columnNames.map(quoteIdent).join(', ')}]) from ${table}`);
+    return { grid: reader.getRows().map((row) => JSON.parse(String(row[0])) as Cell[]), columnNames };
+  }
+  const reader = await connection.runAndReadAll(`select * from ${table}`);
+  return { grid: reader.getRows() as Cell[][], columnNames: reader.columnNames() };
+}
+
 /** How many rows to sample when deciding what a text column holds. */
 const TEXT_COLUMN_SAMPLE_ROWS = 2000;
+
+/**
+ * Runs single-row read queries side by side, each on its own connection to
+ * the same instance, and returns each one's row in order. `undefined` when
+ * the side connections cannot see what the caller's connection sees (another
+ * current catalog, an uncommitted table), so the caller runs its query alone.
+ */
+type SideQueries = (queries: readonly string[], probeTable: string) => Promise<unknown[][] | undefined>;
+
+/**
+ * DuckDB parallelises one query by row group (122,880 rows), so the whole-
+ * column probe over a 16,803-row sheet ran on one core however many were
+ * allowed: 2.4 s for ~400 aggregates on YieldCurve's Raw_Data. The aggregates
+ * are independent, so they are split into column groups and run at once.
+ * Every connection shares the instance, and with it the same locked
+ * configuration, memory limit and file allowlist.
+ */
+function sideQueries(instance: DuckDBInstance, active: Set<DuckDBConnection>, main: DuckDBConnection): SideQueries {
+  return async (queries, probeTable) => {
+    const where = async (c: DuckDBConnection) =>
+      JSON.stringify((await c.runAndReadAll('select current_database(), current_schema()')).getRows());
+    const connections: DuckDBConnection[] = [];
+    try {
+      const expected = await where(main);
+      for (let i = 0; i < queries.length; i++) {
+        const c = await instance.connect();
+        connections.push(c);
+        active.add(c);
+        if (await where(c) !== expected) return undefined;
+        try { await c.run(`select 1 from ${probeTable} limit 0`); } catch { return undefined; }
+      }
+      const settled = await Promise.allSettled(queries.map((q, i) => connections[i].runAndReadAll(q)));
+      const failed = settled.find((s): s is PromiseRejectedResult => s.status === 'rejected');
+      if (failed) throw failed.reason;
+      return settled.map(s => (s as PromiseFulfilledResult<Awaited<ReturnType<DuckDBConnection['runAndReadAll']>>>).value.getRows()[0] as unknown[]);
+    } finally {
+      for (const c of connections) { active.delete(c); c.closeSync(); }
+    }
+  };
+}
+
+/** How many side connections a probe may use; tests set 1 to compare against the single query. */
+export const PROBE_SPLIT = { maxGroups: readerThreads() };
+
+/** Up to four contiguous slices of about equal size; one slice when there is too little to split. */
+export function probeGroups<T>(items: readonly T[], maxGroups = PROBE_SPLIT.maxGroups, minPerGroup = 16): T[][] {
+  const groups = Math.max(1, Math.min(maxGroups, Math.floor(items.length / minPerGroup)));
+  const out: T[][] = [];
+  for (let g = 0, start = 0; g < groups; g++) {
+    const end = start + Math.ceil((items.length - start) / (groups - g));
+    out.push(items.slice(start, end));
+    start = end;
+  }
+  return out;
+}
 
 /**
  * Formats whose files state their own column types (E21).
@@ -662,6 +763,59 @@ const DECLARES_COLUMN_TYPES: ReadonlySet<FileKind> = new Set<FileKind>([
   'duckdb',
   'sqlite',
 ]);
+
+/**
+ * What interpretTextColumns decided for one table, without any cell values:
+ * enough for a reader restarted on the same bytes (Cancel, a refresh with no
+ * change, the reopen after a backup or a refused edit) to apply the same
+ * reading without sampling and probing the whole table again -- 0.6 s on
+ * YieldCurve's Raw_Data. Held in the host's memory only, for the life of the
+ * tab (ViewerFile), and applied only to a table of exactly the same shape.
+ */
+export interface TextDecisionCache { sha256: string; tables: Record<string, unknown> }
+
+/** The decisions a reader has recorded, tagged with the bytes they are about; see TextDecision. */
+export function textDecisionsOf(file: DuckDbFile): TextDecisionCache | undefined {
+  const sha256 = file['openedSha256'];
+  if (!sha256 || file['workbookBytesChanged'] || file['textDecisions'].size === 0) return undefined;
+  return { sha256, tables: Object.fromEntries(file['textDecisions']) };
+}
+
+export interface TextDecision {
+  label: string;
+  /** How the table was read, and what it looked like, when this was decided. */
+  body: string;
+  columns: string[];
+  types: string[];
+  tokens: string[];
+  converted: { column: string; locale: NumberLocale; target: PromotionTarget }[];
+  blanked: string[];
+  notices: string[];
+}
+
+const LOCALES: readonly string[] = ['en', 'eu'];
+const TARGETS: readonly string[] = ['bigint', 'hugeint', 'double'];
+
+/** A decision recorded for this exact table, checked field by field; anything else is ignored. */
+function reusableDecision(
+  decision: unknown,
+  shape: Pick<TextDecision, 'label' | 'body' | 'columns' | 'types' | 'tokens'>
+): TextDecision | undefined {
+  if (!decision || typeof decision !== 'object') return undefined;
+  const d = decision as TextDecision;
+  const sameList = (a: unknown, b: readonly string[]) =>
+    Array.isArray(a) && a.length === b.length && a.every((v, i) => v === b[i]);
+  if (d.label !== shape.label || d.body !== shape.body || !sameList(d.columns, shape.columns) ||
+      !sameList(d.types, shape.types) || !sameList(d.tokens, shape.tokens)) return undefined;
+  const text = new Set(shape.columns.filter((_, i) => shape.types[i] === String(DuckDBTypeId.VARCHAR)));
+  const seen = new Set<string>();
+  const fresh = (column: unknown) => typeof column === 'string' && text.has(column) && !seen.has(column) && !!seen.add(column);
+  if (!Array.isArray(d.converted) || !d.converted.every((c) =>
+    c && fresh(c.column) && LOCALES.includes(c.locale) && TARGETS.includes(c.target))) return undefined;
+  if (!Array.isArray(d.blanked) || !d.blanked.every(fresh)) return undefined;
+  if (!Array.isArray(d.notices) || !d.notices.every((n) => typeof n === 'string')) return undefined;
+  return d;
+}
 
 /**
  * Read a view's text columns as numbers where they demonstrably are numbers
@@ -697,24 +851,48 @@ async function interpretTextColumns(
   label: string,
   source: ViewSource,
   tokens: readonly string[],
-  kind: FileKind
+  kind: FileKind,
+  options: {
+    side?: SideQueries;
+    /** A decision recorded by an earlier reader of the same bytes; see TextDecision. */
+    reuse?: unknown;
+    /** Receives this run's decision, when it reached one. */
+    record?: (decision: TextDecision) => void;
+  } = {}
 ): Promise<string[]> {
   if (tokens.length === 0) return [];
   if (DECLARES_COLUMN_TYPES.has(kind)) return [];
   const view = quoteIdent(viewName);
+  const { side } = options;
 
   let names: string[];
   let textColumns: string[];
+  let shape: Pick<TextDecision, 'label' | 'body' | 'columns' | 'types' | 'tokens'>;
   try {
     const head = await connection.runAndReadAll(`select * from ${view} limit 0`);
     names = head.columnNames();
     const typeIds = head.columnTypes().map((t) => t.typeId);
     textColumns = names.filter((_, i) => typeIds[i] === DuckDBTypeId.VARCHAR);
+    shape = {
+      label, body: viewBodySql(source, source.sourcePath, false),
+      columns: names, types: typeIds.map(String), tokens: [...tokens],
+    };
   } catch {
     // A view we cannot describe is a view we leave exactly as it is.
     return [];
   }
-  if (textColumns.length === 0) return [];
+  const decided = (converted: TextDecision['converted'], blanked: string[], notices: string[]): string[] => {
+    options.record?.({ ...shape, converted, blanked, notices });
+    return notices;
+  };
+  if (textColumns.length === 0) return decided([], [], []);
+
+  const reused = reusableDecision(options.reuse, shape);
+  if (reused) {
+    if (reused.converted.length === 0 && reused.blanked.length === 0) return decided([], [], reused.notices);
+    if (!(await applyTextProjection(connection, viewName, source, names, reused.converted, reused.blanked, tokens))) return [];
+    return decided(reused.converted, reused.blanked, reused.notices);
+  }
 
   // Sample first: this picks each column's decimal convention and throws out
   // the plainly textual columns before the whole-column work below.
@@ -760,7 +938,7 @@ async function interpretTextColumns(
       refused.push({ column, residue: verdict.residue });
     }
   }
-  if (candidates.length === 0 && blanked.length === 0) return refused.map(refusalNotice);
+  if (candidates.length === 0 && blanked.length === 0) return decided([], [], refused.map(refusalNotice));
 
   // Now the check that makes this safe rather than merely likely, over the
   // WHOLE column rather than the sample. try_cast cannot tell "was a marker"
@@ -790,8 +968,18 @@ async function interpretTextColumns(
     ...blanked.map((column) => nonMarkerCountExpr(column, tokens)),
   ];
   try {
-    const reader = await connection.runAndReadAll(`select ${probes.join(', ')} from ${view}`);
-    counts = (reader.getRows()[0] as unknown[]).map(Number);
+    // Split into column groups run side by side; the counts come back in the
+    // original order, so every decision below is the one a single query makes.
+    const groups = probeGroups(probes);
+    const rows = groups.length > 1 && side
+      ? await side(groups.map((group) => `select ${group.join(', ')} from ${view}`), view)
+      : undefined;
+    if (rows) counts = rows.flat().map(Number);
+    else {
+      const reader = await connection.runAndReadAll(`select ${probes.join(', ')} from ${view}`);
+      counts = (reader.getRows()[0] as unknown[]).map(Number);
+    }
+    if (counts.length !== probes.length) return [];
   } catch {
     return [];
   }
@@ -830,37 +1018,10 @@ async function interpretTextColumns(
   });
 
   if (converted.length === 0 && blankedConfirmed.length === 0) {
-    return [...refused.map(refusalNotice), ...unpreservedNotice(unpreserved)];
+    return decided([], [], [...refused.map(refusalNotice), ...unpreservedNotice(unpreserved)]);
   }
 
-  const byName = new Map(converted.map((c) => [c.column, c]));
-  const blankSet = new Set(blankedConfirmed);
-  const projection = names.map((name) => {
-    const c = byName.get(name);
-    if (c) return `${markerNullExpr(name, c.locale, c.target, tokens)} as ${quoteIdent(name)}`;
-    // A column of nothing but markers: they still become NULL, because that is
-    // what they mean, but no type is invented for a column that never showed
-    // one. It stays VARCHAR, and every value in it is now empty.
-    if (blankSet.has(name)) return `${markerBlankExpr(name, tokens)} as ${quoteIdent(name)}`;
-    return quoteIdent(name);
-  });
-  try {
-    source.projection = projection;
-    if (source.cached) {
-      // Already in memory: project off the table rather than off the file, so
-      // the interpretation costs a scan of what is already there instead of
-      // another read of the whole package.
-      await replaceWithTable(connection, viewName, `select ${projection.join(', ')} from ${view}`, true);
-    } else {
-      await connection.run(
-        `create or replace view ${view} as ${viewBodySql(source, source.sourcePath, false)}`
-      );
-    }
-  } catch {
-    // Leave the object as it was rather than half-applying an interpretation.
-    source.projection = undefined;
-    return [];
-  }
+  if (!(await applyTextProjection(connection, viewName, source, names, converted, blankedConfirmed, tokens))) return [];
 
   const notices: string[] = [];
   const totalMarkers = converted.reduce((n, c) => n + c.markers, 0);
@@ -886,7 +1047,52 @@ async function interpretTextColumns(
   }
   notices.push(...refused.map(refusalNotice));
   notices.push(...unpreservedNotice(unpreserved));
-  return notices;
+  return decided(converted.map(({ column, locale, target }) => ({ column, locale, target })), blankedConfirmed, notices);
+}
+
+/**
+ * Replace the object with its interpreted reading. False, with the object
+ * left as it was, when that fails -- never half-applied.
+ */
+async function applyTextProjection(
+  connection: DuckDBConnection,
+  viewName: string,
+  source: ViewSource,
+  names: readonly string[],
+  converted: readonly { column: string; locale: NumberLocale; target: PromotionTarget }[],
+  blanked: readonly string[],
+  tokens: readonly string[]
+): Promise<boolean> {
+  const view = quoteIdent(viewName);
+  const byName = new Map(converted.map((c) => [c.column, c]));
+  const blankSet = new Set(blanked);
+  const projection = names.map((name) => {
+    const c = byName.get(name);
+    if (c) return `${markerNullExpr(name, c.locale, c.target, tokens)} as ${quoteIdent(name)}`;
+    // A column of nothing but markers: they still become NULL, because that is
+    // what they mean, but no type is invented for a column that never showed
+    // one. It stays VARCHAR, and every value in it is now empty.
+    if (blankSet.has(name)) return `${markerBlankExpr(name, tokens)} as ${quoteIdent(name)}`;
+    return quoteIdent(name);
+  });
+  try {
+    source.projection = projection;
+    if (source.cached) {
+      // Already in memory: project off the table rather than off the file, so
+      // the interpretation costs a scan of what is already there instead of
+      // another read of the whole package.
+      await replaceWithTable(connection, viewName, `select ${projection.join(', ')} from ${view}`, true);
+    } else {
+      await connection.run(
+        `create or replace view ${view} as ${viewBodySql(source, source.sourcePath, false)}`
+      );
+    }
+    return true;
+  } catch {
+    // Leave the object as it was rather than half-applying an interpretation.
+    source.projection = undefined;
+    return false;
+  }
 }
 
 /**
@@ -1567,7 +1773,17 @@ export function baseTableOfSelect(sql: string | undefined): string | undefined {
 
 export class DuckDbFile {
   private readPolicy?: ReadSqlPolicy;
+  private discardAfterWrite = false;
+  private openedSha256?: string;
+  private workbookBytesChanged = false;
+  /** Sheets whose preparation failed outright, with the reason. */
+  private readonly unreadableSheets = new Map<string, unknown>();
   private instance?: DuckDBInstance;
+  /** Decisions recorded here, and ones handed in by an earlier reader of the same bytes. */
+  private readonly textDecisions = new Map<string, TextDecision>();
+  private reusableDecisions?: Record<string, unknown>;
+  /** Side connections a text-column probe is running on; interrupted with the main one. */
+  private probeConnections = new Set<DuckDBConnection>();
   private readonly combinedQueries = new Set<string>();
   private lastBackupPath: string | undefined;
   private backupAttached = false;
@@ -1585,6 +1801,8 @@ export class DuckDbFile {
   private readonly lateWarnings: string[] = [];
   /** Sheet -> tables found in its untouched grid, populated on first preview. */
   private readonly detectedSheetTables = new Map<string, DetectedSheetTable[]>();
+  /** Sheet -> first-to-last used cell of its grid, in DetectedSheetTable's coordinates. */
+  private readonly sheetUsedRanges = new Map<string, SheetBounds>();
 
   private constructor(
     private connection: DuckDBConnection,
@@ -1745,12 +1963,17 @@ export class DuckDbFile {
     // fallback path could momentarily grab the write lock and stall the
     // actual writer process (the scraper/extractor) before falling back.
     const forceReadOnly = options?.forceReadOnly === true || options?.restrictedReads === true;
+    // Eager CSV caching and format preparation happen before the final
+    // capability lock. Bound their resources from instance creation as well.
+    const readerOptions: Record<string, string> = options?.restrictedReads
+      ? { memory_limit: '512MB', threads: String(readerThreads()), max_temp_directory_size: '0B' }
+      : {};
 
     let instance: DuckDBInstance;
     let readOnly = false;
     if (!useMemory && forceReadOnly) {
       try {
-        instance = await DuckDBInstance.create(path, { access_mode: 'READ_ONLY' });
+        instance = await DuckDBInstance.create(path, { ...readerOptions, access_mode: 'READ_ONLY' });
         readOnly = true;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -1761,7 +1984,7 @@ export class DuckDbFile {
         // Neither a .parquet nor a .db/.sqlite (SQLite) file is itself a
         // DuckDB database — open an in-memory instance and expose the file's
         // data through it instead (view / ATTACH, below).
-        instance = await DuckDBInstance.create(useMemory ? ':memory:' : path);
+        instance = await DuckDBInstance.create(useMemory ? ':memory:' : path, readerOptions);
       } catch (err) {
         // A lock conflict on the direct (non-memory) path means another
         // process already has this exact file open — most commonly, this
@@ -1771,7 +1994,7 @@ export class DuckDbFile {
         // outright — better to show the data than nothing.
         if (!useMemory && isLockConflict(err)) {
           try {
-            instance = await DuckDBInstance.create(path, { access_mode: 'READ_ONLY' });
+            instance = await DuckDBInstance.create(path, { ...readerOptions, access_mode: 'READ_ONLY' });
             readOnly = true;
           } catch (roErr) {
             throw new Error(
@@ -2064,12 +2287,34 @@ export class DuckDbFile {
     // the sidebar complete), and every READ waits until the sheet is actually
     // asked for. See ensureSheetPrepared, which runQuery calls.
     const nullText = options?.nullText ?? EXCEL_ERROR_TOKENS;
+    const probeConnections = new Set<DuckDBConnection>();
+    // A read worker's CSV is held as a table instead of re-parsed by every
+    // query, count, sort, stat and chart (200k rows: 58-100 ms each -> a few
+    // ms). The worker is replaced whenever the file changes, so this is never
+    // staler than the view. Same name, columns, types and row order; a file
+    // that does not fit simply stays a view.
+    //
+    // Done BEFORE the text-column interpretation, so its sample and whole-
+    // column counts read memory instead of re-sniffing and re-parsing the file
+    // (-80 ms on 200k rows), and its result is projected in memory. The sample
+    // is the same: a `repeatable` reservoir is drawn single-threaded in row
+    // order, and the table holds the file's rows in the file's order.
+    if (options?.restrictedReads && isCsv && (await stat(path)).size <= CSV_CACHE_MAX_BYTES) {
+      const source = viewSources.get(mainObjectRawName);
+      if (source && !source.cached) {
+        try {
+          await replaceWithTable(connection, mainObjectRawName, `select * from ${quoteIdent(mainObjectRawName)}`, false);
+          source.cached = true;
+        } catch { /* stays a view */ }
+      }
+    }
     if (!isXlsx) {
       for (const [view, source] of viewSources) {
         if (source.derived) continue;
         openWarnings.push(
           ...(await interpretTextColumns(
-            connection, view, viewLabels.get(view) ?? view, source, nullText, kind
+            connection, view, viewLabels.get(view) ?? view, source, nullText, kind,
+            { side: sideQueries(instance, probeConnections, connection) }
           ))
         );
       }
@@ -2140,6 +2385,13 @@ export class DuckDbFile {
       sqlitePlan
     );
     file.instance = instance;
+    file.probeConnections = probeConnections;
+    file.discardAfterWrite = options?.discardAfterWrite === true;
+    file.openedSha256 = options?.openedSha256;
+    if (options?.openedSha256 && options.textDecisions?.sha256 === options.openedSha256 &&
+        options.textDecisions.tables && typeof options.textDecisions.tables === 'object') {
+      file.reusableDecisions = options.textDecisions.tables;
+    }
     if (options?.restrictedReads) {
       try {
         if (options.backupPath) {
@@ -2176,6 +2428,7 @@ export class DuckDbFile {
   }
 
   private async assertReadSql(sql: string): Promise<void> {
+    if (this.workbookBytesChanged) throw new QueryPolicyError('The workbook changed after opening. Refresh before querying or editing.');
     if (this.readPolicy) await this.readPolicy.validate(sql, await this.approvedQueryRelations(this.combinedQueries.has(sql)));
   }
 
@@ -2285,7 +2538,11 @@ export class DuckDbFile {
     return reader.getRows().map(row => {
       const [catalog, schema, name] = row.map(String);
       const detected = [...this.detectedSheetTables.values()].flat().find(table => table.name === name);
+      const bounds: SheetBounds | undefined = detected
+        ? { top: detected.top, bottom: detected.bottom, left: detected.left, right: detected.right }
+        : this.sheetUsedRanges.get(name);
       return {
+        bounds,
         catalog, schema, name, sqlName: [catalog, schema, name].map(quoteIdent).join('.'),
         worksheet: detected?.sheet ?? (this.isWorksheet(name) ? name : undefined),
         rawWorksheet: this.isWorksheet(name), prepared: !this.pendingSheets.has(name),
@@ -2655,6 +2912,7 @@ export class DuckDbFile {
   private async ensureSheetPrepared(name: string): Promise<void> {
     const pending = this.pendingSheets.get(name);
     if (!pending) return;
+    await this.verifyWorkbookBytes();
     // Removed FIRST: a failure below must not leave the sheet queued to be
     // retried on every query it serves.
     this.pendingSheets.delete(name);
@@ -2662,19 +2920,24 @@ export class DuckDbFile {
     const source = this.viewSources.get(name);
     if (!source) return;
 
+    // Set once the grid has actually been read; binding the view is lazy.
+    let materialised = false;
     try {
       await cacheSheetAsTable(this.connection, name, source);
 
       // The grid, exactly as the sheet's own object shows it. Read back from
       // the materialised table where there is one, so detection costs no
       // further file reads.
-      const reader = await this.connection.runAndReadAll(`select * from ${quoteIdent(name)}`);
-      const grid = reader.getRows() as Cell[][];
-      const columnNames = reader.columnNames();
+      const { grid, columnNames } = await readGrid(this.connection, name);
+      await this.verifyWorkbookBytes();
+      materialised = true;
 
       // The declared rectangle over-declares routinely; a sheet should not
       // report 16,809 rows because its <dimension> says so.
       const used = trimTrailingBlanks(grid);
+      if (used.rows > 0) {
+        this.sheetUsedRanges.set(name, { top: used.firstRow, bottom: used.rows, left: used.firstCol, right: used.cols });
+      }
       if (
         source.cached &&
         used.rows > 0 &&
@@ -2778,8 +3041,11 @@ export class DuckDbFile {
           // A table we cannot address must not cost the sheet it sits on.
         }
       }
-    } catch {
-      // The sheet itself is open and readable; only the extras are missing.
+    } catch (error) {
+      // Usually the sheet is readable and only the extras are missing. If it
+      // never materialised, remember why: a later query naming one of its
+      // detected tables should hear the real reason, not "unknown table".
+      if (!materialised) this.unreadableSheets.set(name, error);
     }
   }
 
@@ -2835,21 +3101,50 @@ export class DuckDbFile {
   private async ensureDerivedPrepared(name: string): Promise<void> {
     const source = this.viewSources.get(name);
     if (!source?.derived || source.prepared === true) return;
+    await this.verifyWorkbookBytes();
 
     // DuckDbFile operations are serialized by the document provider, so there
     // is no concurrent first-use race here. Mark it only after both best-effort
     // stages have run; neither helper throws for an unreadable optional view.
     await cacheSheetAsTable(this.connection, name, source);
     this.lateWarnings.push(
-      ...(await interpretTextColumns(this.connection, name, `"${name}"`, source, this.nullText, this.kind))
+      ...(await interpretTextColumns(this.connection, name, `"${name}"`, source, this.nullText, this.kind, {
+        side: this.instance ? sideQueries(this.instance, this.probeConnections, this.connection) : undefined,
+        reuse: this.reusableDecisions?.[name],
+        record: (decision) => { if (this.openedSha256) this.textDecisions.set(name, decision); },
+      }))
     );
+    await this.verifyWorkbookBytes();
     source.prepared = true;
+  }
+
+  /** A size/mtime match alone cannot tag newly cached rows with the opening
+   * hash. Check around cold preparation; warm cached queries pay no extra I/O.
+   * A mismatch poisons this reader until refresh, including any partial cache. */
+  private async verifyWorkbookBytes(): Promise<void> {
+    if (!this.openedSha256) return;
+    if (!this.workbookBytesChanged) {
+      try {
+        const hash = createHash('sha256');
+        let bytes = 0;
+        for await (const chunk of createReadStream(this.path)) {
+          bytes += chunk.length;
+          if (bytes > WORKBOOK_LIMITS.compressedBytes) throw new Error('Workbook size changed.');
+          hash.update(chunk);
+        }
+        this.workbookBytesChanged = hash.digest('hex') !== this.openedSha256;
+      } catch { this.workbookBytesChanged = true; }
+    }
+    if (this.workbookBytesChanged) throw new QueryPolicyError('The workbook changed after opening. Refresh before querying or editing.');
   }
 
   private async prepareDerivedTablesFor(sql: string): Promise<void> {
     if (this.kind === 'xlsx') {
       const references = await referencedQueryTables(this.connection, sql);
       for (const sheet of this.pendingSheetsFor(references)) await this.ensureSheetPrepared(sheet);
+      for (const [sheet, error] of this.unreadableSheets) {
+        if ([...references].some(reference => reference.startsWith(`${sheet} \u00b7 Table `))) throw error;
+      }
       for (const name of this.pendingDerivedTablesFor(references)) {
         await this.ensureDerivedPrepared(name);
       }
@@ -3986,6 +4281,81 @@ export class DuckDbFile {
   }
 
   /**
+   * Where an edit of one displayed row lands in the workbook, without writing.
+   *
+   * Split out of updateXlsxCell so the read worker -- which holds exactly the
+   * typed table the user was looking at -- can answer it, and the trusted
+   * writer then only patches (ViewerFile.updateCell). Same matching, same
+   * refusals, same arithmetic as the in-process edit below.
+   * `undefined` means no row matches, which an edit reports as 0 rows changed.
+   */
+  private async locateXlsxCell(
+    table: string,
+    column: string,
+    rowValues: Record<string, unknown>
+  ): Promise<{ sheetName: string; patch: { sheetPath: string; columnNames: string[]; rowOrdinal: number; columnName: string } } | undefined> {
+    const origin = this.viewSources.get(table)?.tableOrigin;
+    const sheetName = origin?.sheet ?? table;
+    const sheetPath = this.xlsxSheetPaths.get(sheetName);
+    if (!sheetPath) {
+      throw new Error(`"${table}" is not a sheet of this workbook, so it cannot be edited.`);
+    }
+
+    const whereCols = Object.keys(rowValues);
+    const whereClause = whereCols
+      .map((c, i) => `${quoteIdent(c)} is not distinct from $${i + 1}`)
+      .join(' and ');
+    const values = whereCols.map((c) => rowValues[c]) as DuckDBValue[];
+
+    const reader = await this.connection.runAndReadAll(
+      `select rn from (
+         select row_number() over () as rn, * from ${quoteIdent(table)}
+       ) as _rows${whereClause ? ` where ${whereClause}` : ''}`,
+      values
+    );
+    const matches = reader.getRows();
+    if (matches.length === 0) return undefined;
+    if (matches.length > 1) {
+      throw new Error(
+        `${matches.length} rows in "${table}" are identical across every column, so there ` +
+          `is no way to tell which one you edited. The workbook was not changed.`
+      );
+    }
+    return {
+      sheetName,
+      patch: {
+        sheetPath,
+        columnNames: whereCols,
+        rowOrdinal: origin
+          ? origin.startRow + (origin.hasHeader ? 1 : 0) + Number(matches[0][0]) - 1
+          : Number(matches[0][0]),
+        columnName: origin
+          ? columnLettersOf(origin.firstCol + whereCols.indexOf(column))
+          : column,
+      },
+    };
+  }
+
+  /**
+   * Read-worker half of an xlsx edit: the target, plus the SHA-256 of the
+   * workbook bytes this reader opened. The writer patches only if the file it
+   * reads still has that hash, so the located row is known to be the row of
+   * the bytes being patched. No SQL is taken from the caller.
+   */
+  async locateXlsxEdit(
+    table: string,
+    column: string,
+    rowValues: Record<string, unknown>
+  ): Promise<{ target?: { sheetPath: string; columnNames: string[]; rowOrdinal: number; columnName: string }; sha256?: string }> {
+    if (this.kind !== 'xlsx') throw new Error('Only workbook edits are located this way.');
+    // A reopened reader has not prepared anything yet; the query funnel does
+    // exactly the preparation a query naming this table would.
+    await this.prepareDerivedTablesFor(`select * from ${quoteIdent(table)}`);
+    const located = await this.locateXlsxCell(table, column, rowValues);
+    return { target: located?.patch, sha256: this.openedSha256 };
+  }
+
+  /**
    * One cell of one sheet, rewritten inside the workbook package.
    *
    * The row is identified the way every other edit here identifies one -- full-
@@ -4006,67 +4376,13 @@ export class DuckDbFile {
     rowValues: Record<string, unknown>,
     onStatus?: (message: string) => void
   ): Promise<number> {
-    // A detected table is a rectangle of a known sheet at a known offset, so an
-    // edit through it is translated onto that sheet rather than refused.
-    //
-    // The refusal it replaces was right about its own design and wrong as a
-    // rule: when a block was addressed only by a range, the writer had to find
-    // its row by matching header text down the sheet, and two blocks carrying
-    // the same header were indistinguishable. Now the sheet is read verbatim
-    // from A1, so the table's own origin plus the row's ordinal within it give
-    // an exact worksheet cell -- no searching, and no ambiguity to have.
-    const origin = this.viewSources.get(table)?.tableOrigin;
-    const sheetName = origin?.sheet ?? table;
-    const sheetPath = this.xlsxSheetPaths.get(sheetName);
-    if (!sheetPath) {
-      throw new Error(`"${table}" is not a sheet of this workbook, so it cannot be edited.`);
-    }
-
-    const whereCols = Object.keys(rowValues);
-    const whereClause = whereCols
-      .map((c, i) => `${quoteIdent(c)} is not distinct from $${i + 1}`)
-      .join(' and ');
-    const values = whereCols.map((c) => rowValues[c]) as DuckDBValue[];
-
-    // row_number() over () follows the scan, and read_xlsx scans the sheet in
-    // sheet order -- which is what makes "the Nth row DuckDB returned" mean
-    // "the Nth data row in the XML". Not trusted on its own; verified below.
-    const reader = await this.connection.runAndReadAll(
-      `select rn from (
-         select row_number() over () as rn, * from ${quoteIdent(table)}
-       ) as _rows${whereClause ? ` where ${whereClause}` : ''}`,
-      values
-    );
-    const matches = reader.getRows();
-    if (matches.length === 0) return 0;
-    if (matches.length > 1) {
-      // The same limitation the SQL path carries (identical rows update
-      // together) -- but a file rewrite cannot be half-applied, so here it is
-      // refused rather than applied to all of them.
-      throw new Error(
-        `${matches.length} rows in "${table}" are identical across every column, so there ` +
-          `is no way to tell which one you edited. The workbook was not changed.`
-      );
-    }
-
+    const target = await this.locateXlsxCell(table, column, rowValues);
+    if (!target) return 0;
+    const { sheetName } = target;
     onStatus?.('Saving…');
     await patchXlsxCell({
       filePath: this.path,
-      sheetPath,
-      columnNames: whereCols,
-      // Both coordinates are the worksheet's own.
-      //
-      // For the sheet itself the ordinal already IS the Excel row, because the
-      // read is anchored at A1 with no header promoted. For a detected table,
-      // its first data row sits at `startRow` (plus one when its first row is a
-      // header), and its column N is `firstCol + N` -- arithmetic, because the
-      // table's rectangle is known exactly.
-      rowOrdinal: origin
-        ? origin.startRow + (origin.hasHeader ? 1 : 0) + Number(matches[0][0]) - 1
-        : Number(matches[0][0]),
-      columnName: origin
-        ? columnLettersOf(origin.firstCol + whereCols.indexOf(column))
-        : column,
+      ...target.patch,
       expectedCurrent: rowValues[column],
       newValue,
       verbatim: true,
@@ -4080,6 +4396,7 @@ export class DuckDbFile {
     // BOTH have to be reloaded: the sheet, and every table read out of it.
     // Missing the tables was visible as an edit that landed in the file and
     // then did not appear in the grid it was typed into.
+    if (this.discardAfterWrite) return 1;
     const stale = [sheetName];
     for (const [candidate, viewSource] of this.viewSources) {
       if (viewSource.tableOrigin?.sheet === sheetName) stale.push(candidate);
@@ -4260,6 +4577,7 @@ export class DuckDbFile {
    */
   interruptCurrentQuery(): void {
     this.connection.interrupt();
+    for (const side of this.probeConnections) side.interrupt();
   }
 
   dispose(): void {

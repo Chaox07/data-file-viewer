@@ -31,3 +31,29 @@ test('type guidance distinguishes text comparisons and raw worksheet columns', (
   assert.match(queryDiagnostic(new Error('Binder Error: Cannot compare values of type DATE and type INTEGER_LITERAL')).message, /numeric year is not a date literal/);
   assert.match(queryDiagnostic(new Error('Binder Error: Referenced column not found'), true).message, /detected table/);
 });
+
+test('an unreadable worksheet explains itself, including through a detected-table name', async () => {
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { DuckDbFile } = await import('../src/duckdbConnection');
+  const { xlsxFile } = await import('./stress/generators/_write');
+  const dir = await mkdtemp(join(tmpdir(), 'dfv-unreadable-'));
+  let file: Awaited<ReturnType<typeof DuckDbFile.open>> | undefined;
+  try {
+    // Excel caps a cell at 32,767 characters; DuckDB refuses one this large as damaged.
+    const path = await xlsxFile(join(dir, 'b.xlsx'), [
+      { name: 'Bad', rows: [['id', 'v'], [1, 'a'], [], ['big'], ['x'.repeat(100_000)]] },
+      { name: 'Good', rows: [['id', 'v'], [1, 'a']] },
+    ]);
+    file = await DuckDbFile.open(path, undefined, { restrictedReads: true });
+    for (const sql of ['select * from "Bad"', 'select * from "Bad · Table 1"']) {
+      const error: unknown = await file.runQuery(sql).then(() => undefined, (e: unknown) => e);
+      assert.ok(error, sql);
+      const d = queryDiagnostic(error);
+      assert.equal(d.category, 'resource', `${sql}: ${String(error)}`);
+      assert.match(d.message, /32,767/);
+    }
+    assert.equal((await file.runQuery('select count(*) from "Good · Table 1"')).rows[0][0] + '', '1');
+  } finally { file?.dispose(); await rm(dir, { recursive: true, force: true }); }
+});

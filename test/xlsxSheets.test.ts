@@ -3,9 +3,10 @@ import { test } from 'node:test';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { zipSync, strToU8 } from 'fflate';
+import { zipSync, strToU8, Zip, ZipDeflate } from 'fflate';
 
-import { listSheets } from '../src/xlsxSheets';
+import { listSheets, readSheetDimensionsChecked } from '../src/xlsxSheets';
+import { indexZip, sequentialLayout } from '../src/zipPatch';
 
 /** Build a minimal .xlsx package with the given workbook/rels XML. */
 function makeXlsx(parts: Record<string, string>): string {
@@ -132,4 +133,51 @@ test('a sheet whose r:id resolves to nothing still lists, with an empty path', a
   const got = await listSheets(path);
   assert.deepEqual(got, [{ name: 'Orphan', path: '' }]);
   rmSync(path, { force: true });
+});
+
+test('the direct dimension read answers exactly as the archive stream does, damaged and unusual packages included', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'xlsxdims-'));
+  try {
+    const rows = (n: number, cols = 'ABC') => Array.from({ length: n }, (_, r) =>
+      `<row r="${r + 2}">${[...cols].map(c => `<c r="${c}${r + 2}"><v>${r}</v></c>`).join('')}</row>`).join('');
+    const sheet = (dimension: string, body: string, padding = '') =>
+      `<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">${padding}${dimension}<sheetData>${body}</sheetData></worksheet>`;
+    const big = sheet('<dimension ref="A2:C40001"/>', rows(40000));
+    const variants: Record<string, Buffer> = {};
+    const zip = (parts: Record<string, string>, level = 6) =>
+      Buffer.from(zipSync(Object.fromEntries(Object.entries(parts).map(([k, v]) => [k, strToU8(v)])), { level: level as 6 }));
+    variants.declared = zip({ 'xl/worksheets/sheet1.xml': big, 'xl/worksheets/sheet2.xml': sheet('<x:dimension ref="B3:D9"/>', rows(3)) });
+    variants.stored = zip({ 'xl/worksheets/sheet1.xml': big, 'xl/worksheets/sheet2.xml': sheet('<dimension ref="A1"/>', '') }, 0);
+    variants.undeclared = zip({ 'xl/worksheets/sheet1.xml': big, 'xl/worksheets/sheet2.xml': sheet('', rows(5, 'BD')) });
+    variants.unparseable = zip({ 'xl/worksheets/sheet1.xml': big, 'xl/worksheets/sheet2.xml': sheet('<dimension ref="nonsense"/>', rows(5)) });
+    variants.lateDeclaration = zip({ 'xl/worksheets/sheet1.xml': big, 'xl/worksheets/sheet2.xml': sheet('<dimension ref="A1:Z9"/>', rows(5), `<sheetPr codeName="${'p'.repeat(300 * 1024)}"/>`) });
+    variants.missingSheet = zip({ 'xl/worksheets/sheet1.xml': big });
+    for (const cut of [0.1, 0.5, 0.9, 0.999]) variants[`truncated${cut}`] = variants.declared.subarray(0, Math.floor(variants.declared.length * cut));
+    for (const at of [0, 40, 200, 5000]) { const b = Buffer.from(variants.declared); b[at] ^= 0xff; variants[`flip${at}`] = b; }
+    const flippedData = Buffer.from(variants.declared); flippedData[Math.floor(flippedData.length / 2)] ^= 0xff; variants.flipData = flippedData;
+    const trailing = Buffer.concat([variants.declared, Buffer.from('garbage')]); variants.trailing = trailing;
+    const streamed: Uint8Array[] = [];
+    const z = new Zip((err, data) => { if (err) throw err; streamed.push(data); });
+    for (const [name, body] of [['xl/worksheets/sheet1.xml', big], ['xl/worksheets/sheet2.xml', sheet('<dimension ref="B3:D9"/>', rows(3))]]) {
+      const member = new ZipDeflate(name, { level: 6 }); z.add(member); member.push(strToU8(body), true);
+    }
+    z.end();
+    variants.dataDescriptors = Buffer.concat(streamed);
+    for (const [name, bytes] of Object.entries(variants)) {
+      const path = join(dir, `${name}.xlsx`);
+      writeFileSync(path, bytes);
+      const wanted = ['xl/worksheets/sheet1.xml', 'xl/worksheets/sheet2.xml'];
+      const fast = await readSheetDimensionsChecked(path, wanted);
+      const slow = await readSheetDimensionsChecked(path, wanted, false);
+      assert.deepEqual({ d: [...fast.dimensions], e: fast.damaged }, { d: [...slow.dimensions], e: slow.damaged }, name);
+    }
+    // The fast path's precondition holds for ordinary packages and not for streamed ones.
+    const layout = (name: string) => { const i = indexZip(variants[name]); return !!i && sequentialLayout(i); };
+    assert.deepEqual(['declared', 'stored', 'dataDescriptors', 'trailing', 'flip0'].map(layout), [true, true, false, true, false]);
+    const declared = await readSheetDimensionsChecked(join(dir, 'declared.xlsx'), ['xl/worksheets/sheet1.xml', 'xl/worksheets/sheet2.xml']);
+    assert.deepEqual([...declared.dimensions], [
+      ['xl/worksheets/sheet1.xml', { firstRow: 2, lastRow: 40001, firstCol: 'A', lastCol: 'C' }],
+      ['xl/worksheets/sheet2.xml', { firstRow: 3, lastRow: 9, firstCol: 'B', lastCol: 'D' }],
+    ]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

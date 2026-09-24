@@ -1,5 +1,5 @@
 import { realpath, stat } from 'node:fs/promises';
-import { DuckDbFile, baseTableOfSelect, type DuckDbFileOpenOptions, type FileKind } from './duckdbConnection';
+import { DuckDbFile, baseTableOfSelect, textDecisionsOf, type DuckDbFileOpenOptions, type FileKind } from './duckdbConnection';
 import { queryDiagnostic, queryNotices } from './queryDiagnostics';
 import { QueryPolicyError, validateResultSize } from './queryPolicy';
 import { READ_METHODS } from './queryProtocol';
@@ -26,6 +26,7 @@ async function metadata() {
     numberLocale: file.numberLocale,
     stamp,
     warnings: queryNotices(file.takeLateWarnings()),
+    textDecisions: textDecisionsOf(file),
   };
 }
 
@@ -43,9 +44,13 @@ process.on('message', (message: unknown) => {
         approvedPath = await realpath(String(args[0]));
         const info = await stat(approvedPath);
         stamp = { size: info.size, mtimeMs: info.mtimeMs };
-        if (/\.xlsx$/i.test(approvedPath)) await preflightWorkbook(approvedPath);
+        let openedSha256: string | undefined;
+        if (/\.xlsx$/i.test(approvedPath)) {
+          // The hash of the very bytes the preflight judged; see locateXlsxEdit.
+          openedSha256 = await preflightWorkbook(approvedPath);
+        }
         file = await DuckDbFile.open(approvedPath, args[1] as FileKind | undefined, {
-          ...(args[2] as DuckDbFileOpenOptions), restrictedReads: true, forceReadOnly: true,
+          ...(args[2] as DuckDbFileOpenOptions), restrictedReads: true, forceReadOnly: true, openedSha256,
         });
       } else {
         if (!file || !approvedPath || !stamp) throw new QueryPolicyError('Open the document before running a query.');

@@ -21,3 +21,7 @@ test/**
 out-test/**
 tsconfig.test.json
 .tmp/**
+
+# Older builds left in the folder and repository notes are not runtime files.
+*.vsix
+docs/**

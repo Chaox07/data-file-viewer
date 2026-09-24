@@ -40,6 +40,8 @@ export interface QueryResultFields {
   timeColumnWarning?: string;
   /** DuckDB already ordered these rows — see computeDisplayOrder, which must not re-sort them. */
   serverSorted?: boolean;
+  /** Present only for a verbatim worksheet preview: the worksheet it shows. */
+  sheetPreview?: string;
   /** Present only for a verbatim worksheet preview. */
   sheetTables?: DetectedSheetTable[];
 }
@@ -197,6 +199,7 @@ function resultFrom(message: QueryResultFields, over: Partial<LastResult> = {}):
     truncated: message.truncated,
     editable: message.editable,
     editableTable: message.editableTable,
+    sheetPreview: message.sheetPreview,
     sheetTables: message.sheetTables,
     ...over,
   };

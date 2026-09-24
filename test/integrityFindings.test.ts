@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { unzipSync, zipSync, strFromU8, strToU8 } from 'fflate';
 import { patchCell } from '../src/xlsxWrite';
 import { DuckDbFile } from '../src/duckdbConnection';
+import { foreignDir } from './stress/paths';
 
 /**
  * The reproduced findings of the 2026-09-09 data-integrity review.
@@ -260,9 +261,7 @@ test('E21: a Stata .dta column declared a string is read back as text', async (t
   // no Python, so a missing fixture SKIPS with the build command rather than
   // failing. `npm test` stays green either way.
   const { access } = await import('node:fs/promises');
-  const path = join(
-    __dirname, '..', '..', '..', 'test', 'stress', '_work', 'foreign', 'pandas-declared-text.dta'
-  );
+  const path = join(foreignDir, 'pandas-declared-text.dta');
   try {
     await access(path);
   } catch {

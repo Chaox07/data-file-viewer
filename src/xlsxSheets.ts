@@ -35,8 +35,9 @@
  */
 
 import { createReadStream } from 'fs';
-import { open } from 'fs/promises';
+import { open, readFile, stat } from 'fs/promises';
 import { Unzip, UnzipInflate } from 'fflate';
+import { indexZip, memberHead, sequentialLayout } from './zipPatch';
 
 /** Attribute lookup by name, tolerant of order, quoting style and namespace prefix. */
 function attr(tag: string, name: string): string | undefined {
@@ -360,11 +361,16 @@ export async function readSheetDimensions(
  */
 export async function readSheetDimensionsChecked(
   filePath: string,
-  sheetPaths: readonly string[]
+  sheetPaths: readonly string[],
+  /** Tests only: false forces the streaming path, to compare the two. */
+  direct = true
 ): Promise<{ dimensions: Map<string, SheetDimension>; damaged?: string }> {
   const wanted = new Set(sheetPaths.filter((p) => p));
   const found = new Map<string, SheetDimension>();
   if (wanted.size === 0) return { dimensions: found };
+
+  const declared = direct ? await declaredDimensionsDirect(filePath, wanted) : undefined;
+  if (declared) return { dimensions: declared };
 
   // Two things are being read here, and they have different appetites.
   //
@@ -413,6 +419,45 @@ export async function readSheetDimensionsChecked(
   });
 
   return { dimensions: found, damaged: result.error };
+}
+
+/**
+ * The fast path for the common case: every wanted sheet declares its
+ * `<dimension>` in the head of its part. The heads are read straight from the
+ * central directory (native zlib, a prefix of each part) instead of streaming
+ * the archive up to each sheet -- on a 21 MB workbook whose big sheet comes
+ * first, the stream pushed ~20 MB through fflate to reach the second sheet.
+ *
+ * It answers only when it is certain to give what the stream would: the
+ * archive is laid out as a streaming reader sees it (zipPatch.sequentialLayout),
+ * and every wanted sheet has a parseable declaration inside the same
+ * DIMENSION_SEARCH_BYTES head window. Anything else -- a missing declaration, a
+ * damaged or unusual archive -- returns undefined and the stream runs as before,
+ * with its own damage reporting.
+ */
+const DIRECT_READ_MAX_BYTES = 128 * 1024 * 1024;
+
+async function declaredDimensionsDirect(
+  filePath: string,
+  wanted: ReadonlySet<string>
+): Promise<Map<string, SheetDimension> | undefined> {
+  let index;
+  try {
+    // Held whole only briefly, and never for a huge package (see the header note).
+    if ((await stat(filePath)).size > DIRECT_READ_MAX_BYTES) return undefined;
+    index = indexZip(await readFile(filePath));
+  } catch { return undefined; }
+  if (!index || !sequentialLayout(index)) return undefined;
+  const found = new Map<string, SheetDimension>();
+  for (const name of wanted) {
+    const head = memberHead(index, name, DIMENSION_SEARCH_BYTES);
+    if (!head) return undefined;
+    const declared = /<(?:[A-Za-z0-9_.-]+:)?dimension[^>]*\sref="([^"]+)"/.exec(head.toString('latin1'));
+    const parsed = declared ? parseRef(declared[1]) : undefined;
+    if (!parsed) return undefined;
+    found.set(name, parsed);
+  }
+  return found;
 }
 
 /** One sheet's rectangle. Prefer `readSheetDimensions` -- this streams the archive again. */

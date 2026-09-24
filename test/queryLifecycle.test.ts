@@ -49,3 +49,16 @@ test('closing a document drains an active save before disposing and refuses queu
   assert.equal(disposed, 1);
   assert.equal(released, 1);
 });
+
+test('queue counts distinct jobs even when they share a supersession predicate', async () => {
+  const held = latch();
+  const doc = new DuckDBDocument(vscodeStub.Uri.file('/synthetic.csv') as any, {
+    interruptCurrentQuery() {}, dispose() {},
+  } as unknown as DocumentFile);
+  const current = () => false;
+  try {
+    const outcomes = Array.from({ length: 9 }, () => doc.runExclusive(() => held.promise, current).then(() => 'ran', () => 'refused'));
+    held.release();
+    assert.deepEqual(await Promise.all(outcomes), [...Array(8).fill('ran'), 'refused']);
+  } finally { held.release(); doc.dispose(); }
+});

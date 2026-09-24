@@ -1,6 +1,7 @@
+import { createHash } from 'node:crypto';
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -259,4 +260,149 @@ test('a sheet whose header is not row 1 opens at its own first column, with no p
     await file.dispose();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('the text-column probe split across side connections decides exactly as one query does', async () => {
+  const { PROBE_SPLIT, probeGroups } = await import('../src/duckdbConnection');
+  assert.deepEqual(probeGroups([1, 2, 3], 4, 16), [[1, 2, 3]], 'too little to split');
+  assert.deepEqual(probeGroups(Array.from({ length: 66 }, (_, i) => i), 4, 16).map(g => g.length), [17, 17, 16, 16]);
+  assert.deepEqual(probeGroups(Array.from({ length: 66 }, (_, i) => i), 4, 16).flat(), Array.from({ length: 66 }, (_, i) => i));
+
+  const dir = scratchDir();
+  try {
+    // 30 columns of every kind the probe decides between, 3,000 rows so the
+    // sample (2,000) does not see everything.
+    const kinds = [
+      (r: number) => (r % 97 === 0 ? '#N/A' : String(r * 1.25)),              // numeric with markers
+      (r: number) => (r % 50 === 0 ? '#DIV/0!' : String(r)),                  // integral with markers
+      (r: number) => (r === 2900 ? 'see note' : r % 40 === 0 ? '#N/A' : String(r)), // note past the sample
+      (r: number) => (r % 3 === 0 ? '#N/A' : '#VALUE!'),                        // markers only
+      (r: number) => (r === 2999 ? '5' : '#N/A'),                               // markers only in the sample
+      (r: number) => (r % 30 === 0 ? '#N/A' : `00${r}`),                        // leading zeros
+      (r: number) => (r % 30 === 0 ? '#N/A' : `${r}00000000000000000000`),      // wider than bigint
+      (r: number) => `name ${r}`,                                               // text
+      (r: number) => (r % 25 === 0 ? '#REF!' : `${r},5`),                       // decimal comma
+      (r: number) => (r % 25 === 0 ? '#NUM!' : `1${'0'.repeat(40)}${r}`),       // wider than hugeint
+    ];
+    const header = Array.from({ length: 30 }, (_, c) => `c${c}`);
+    const rows = [header, ...Array.from({ length: 3000 }, (_, r) => header.map((_, c) => kinds[c % kinds.length](r + c)))];
+    const xlsx = await xlsxFile(join(dir, 'book.xlsx'), [{ name: 'data', rows }]);
+    const csv = join(dir, 'book.csv');
+    require('node:fs').writeFileSync(csv, rows.map(r => r.map(v => `"${v}"`).join(',')).join('\n') + '\n');
+
+    const observe = async (path: string, restrictedReads: boolean) => {
+      const file = await DuckDbFile.open(path, undefined, { restrictedReads, forceReadOnly: true });
+      try {
+        const out: Record<string, unknown> = { open: [...file.openWarnings] };
+        for (const table of await file.listTables()) {
+          await file.runQuery(`select * from "${table}" limit 0`);
+          for (const name of [table, ...file.getDetectedSheetTables(table).map(t => t.name)]) {
+            const result = await file.runQuery(`select * from "${name.replace(/"/g, '""')}"`);
+            out[name] = { columns: result.columns, types: result.columnStatsKind, rows: JSON.stringify(result.rows, (_k, v) => typeof v === 'bigint' ? `${v}n` : v) };
+          }
+        }
+        out.late = file.takeLateWarnings();
+        return out;
+      } finally { file.dispose(); }
+    };
+    const automatic = PROBE_SPLIT.maxGroups;
+    for (const path of [xlsx, csv]) {
+      for (const restricted of [false, true]) {
+        PROBE_SPLIT.maxGroups = Math.max(4, automatic);
+        const split = await observe(path, restricted);
+        PROBE_SPLIT.maxGroups = 1;
+        const single = await observe(path, restricted);
+        PROBE_SPLIT.maxGroups = automatic;
+        assert.deepEqual(split, single, `${path} restricted=${restricted}`);
+        assert.ok(JSON.stringify(single).includes('read as numbers'), 'the probe did convert columns');
+      }
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('text-column decisions reused by a restarted reader give exactly the cold result, and bad ones are ignored', async () => {
+  const { textDecisionsOf } = await import('../src/duckdbConnection');
+  const { DuckDBConnection } = await import('@duckdb/node-api');
+  const dir = scratchDir();
+  const seen: string[] = [];
+  const original = DuckDBConnection.prototype.runAndReadAll;
+  DuckDBConnection.prototype.runAndReadAll = function (this: InstanceType<typeof DuckDBConnection>, sql: string, ...rest: unknown[]) {
+    seen.push(sql);
+    return (original as (...a: unknown[]) => ReturnType<typeof original>).call(this, sql, ...rest);
+  } as typeof original;
+  try {
+    const rows = [['notes'], [], ['id', 'amount', 'marks', 'label', 'code'],
+      ...Array.from({ length: 300 }, (_, r) => [r, r % 7 === 0 ? '#N/A' : String(r * 1.5), '#N/A', `x${r}`, r % 9 === 0 ? '#REF!' : `00${r}`])];
+    const path = await xlsxFile(join(dir, 'book.xlsx'), [{ name: 'data', rows }]);
+    const openedSha256 = createHash('sha256').update(readFileSync(path)).digest('hex');
+    const observe = async (textDecisions?: unknown) => {
+      const file = await DuckDbFile.open(path, undefined, { restrictedReads: true, forceReadOnly: true, openedSha256, textDecisions: textDecisions as never });
+      try {
+        await file.runQuery('select * from "data" limit 0');
+        const table = file.getDetectedSheetTables('data')[0].name;
+        seen.length = 0;
+        const result = await file.runQuery(`select * from "${table}"`);
+        const sampled = seen.some(sql => /using sample reservoir/.test(sql));
+        return { table, sampled, decisions: textDecisionsOf(file),
+          observed: { columns: result.columns, kinds: result.columnStatsKind, rows: JSON.stringify(result.rows, (_k, v) => typeof v === 'bigint' ? `${v}n` : v), late: file.takeLateWarnings() } };
+      } finally { file.dispose(); }
+    };
+    const cold = await observe();
+    assert.equal(cold.sampled, true);
+    assert.ok(cold.decisions && cold.decisions.sha256 === openedSha256);
+    assert.ok(JSON.stringify(cold.observed.late).includes('read as numbers'), 'the table was interpreted');
+
+    const warm = await observe(cold.decisions);
+    assert.equal(warm.sampled, false, 'the restarted reader skipped the sample and probe');
+    assert.deepEqual(warm.observed, cold.observed);
+
+    const decision = cold.decisions!.tables[cold.table] as { converted: { column: string; target: string }[]; columns: string[] };
+    const tamper = (change: (d: any) => void) => {
+      const copy = structuredClone(cold.decisions!);
+      change(copy.tables[cold.table]);
+      return copy;
+    };
+    for (const [why, cache] of [
+      ['other bytes', { ...cold.decisions!, sha256: 'bytes-2' }],
+      ['unknown target', tamper(d => { d.converted[0].target = 'varchar); drop table x; --'; })],
+      ['unknown column', tamper(d => { d.converted[0].column = 'nope'; })],
+      ['other shape', tamper(d => { d.columns = [...d.columns].reverse(); })],
+      ['other markers', tamper(d => { d.tokens = ['#N/A']; })],
+      ['duplicate column', tamper(d => { d.blanked = [d.converted[0].column]; })],
+      ['not an object', { sha256: openedSha256, tables: { [cold.table]: 'x' } }],
+    ] as const) {
+      const result = await observe(cache);
+      assert.equal(result.sampled, true, `${why}: ignored, so the reader decided again`);
+      assert.deepEqual(result.observed, cold.observed, why);
+    }
+    assert.ok(decision.converted.length > 0);
+  } finally {
+    DuckDBConnection.prototype.runAndReadAll = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ViewerFile hands a restarted reader its decisions only for unchanged bytes, and forgets them on close', async () => {
+  const { ViewerFile } = await import('../src/viewerFile');
+  const dir = scratchDir();
+  try {
+    const rows = [['id', 'amount'], ...Array.from({ length: 200 }, (_, r) => [r, r % 5 === 0 ? '#N/A' : String(r / 4)])];
+    const path = await xlsxFile(join(dir, 'book.xlsx'), [{ name: 'data', rows }]);
+    const file = await ViewerFile.open(path);
+    try {
+      await file.runQuery('select * from "data" limit 0');
+      const table = file.getDetectedSheetTables('data')[0].name;
+      const first = await file.runQuery(`select * from "${table}"`);
+      const cache = () => (file as unknown as { textDecisions?: { tables: Record<string, unknown> } }).textDecisions;
+      assert.ok(cache()?.tables[table], 'the host holds the decision');
+      file.interruptCurrentQuery();
+      await file.runQuery('select * from "data" limit 0');
+      const again = await file.runQuery(`select * from "${table}"`);
+      assert.deepEqual(JSON.stringify(again, (_k, v) => typeof v === 'bigint' ? `${v}n` : v), JSON.stringify(first, (_k, v) => typeof v === 'bigint' ? `${v}n` : v));
+      await file.refreshInPlace();
+      assert.deepEqual((await file.runQuery(`select * from "${table}"`)).rows.length, first.rows.length);
+      file.dispose();
+      assert.equal(cache(), undefined, 'closing the tab drops the cache');
+    } finally { file.dispose(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

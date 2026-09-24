@@ -21,6 +21,8 @@
     "src/gridFormat.ts",
     "src/gridOrder.ts",
     "src/virtualWindow.ts",
+    "src/sheetHighlight.ts",
+    "src/queryTargetList.ts",
     "src/liveStatus.ts",
     "src/webviewState.ts",
     "src/xlsxWrite.ts",

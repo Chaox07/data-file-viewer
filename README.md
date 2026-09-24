@@ -9,6 +9,62 @@ DuckDB is the engine reading most of these formats under the hood; kdb+
 files are parsed directly in their own real format (see the kdb+ section
 below).
 
+### 0.0.19: Worksheet preview button removed
+
+Query table lists only the open sheet, so the button only reloaded the sheet
+already on screen. To return to a sheet after a SQL result, click it in the
+sidebar.
+
+The 0.0.19 regression review also hardens workbook archive validation, stale
+workbook edit detection, query queue accounting and CSV startup resource limits.
+See [0.0.19 review results](docs/review-0.0.19.md) for checks and remaining limitations.
+
+### 0.0.18: Query table follows the open sheet
+
+Query table now lists only the worksheet that is open: its whole sheet under
+"Worksheet" and its detected tables under "Tables". Choosing the whole sheet
+outlines its used range, from the first used cell to the last. Every other
+column is shaded, like the rows, so wide grids are easier to read across.
+
+### 0.0.17: Excel-style worksheet grid
+
+A worksheet preview now numbers its rows 1, 2, 3… down the left and centres the
+column letters across the top, as Excel does, so a range such as `B4:D9` can be
+found by eye. Choosing a table in Query table outlines it in yellow on the
+worksheet shown; nothing scrolls or re-runs. The column-type line under Query
+table is gone; SQL autocompletion still knows the types.
+
+### 0.0.16: faster opening
+
+A large workbook's data table now appears in about 3 s instead of about 5.4 s
+on a 21 MB file: the check that reads number columns holding Excel error
+markers runs on several cores at once, and the sheet reaches table detection
+faster. The query reader now uses half of the machine's cores, worked out
+automatically. A second file opens in 10–20 ms while another is open, because a
+reader process is kept ready. Refreshing, cancelling or making a backup no
+longer repeats that check on an unchanged workbook: its decisions are kept in
+memory until the tab closes, never on disk. CSV files open about 20% faster.
+Results are unchanged.
+
+### 0.0.15: faster edits and opens
+
+Editing one cell of a large workbook no longer re-derives the table in a
+second process or re-compresses the whole file: on a 21 MB workbook the edit
+went from about 10 s to about 1.3 s. Workbooks open faster (the safety scan
+uses native zlib), CSV queries, sorts and statistics read an in-memory copy
+instead of re-parsing the file, and SQLite files with many tables open about
+four times faster. Results are unchanged; after an edit, a reading notice is no
+longer shown twice.
+
+### 0.0.14: choose SQL tables, restricted queries
+
+A **Query table** selector lists the document's tables with their SQL types,
+and a detected Excel table can hand its current filters to the SQL editor.
+Queries now run in a separate, restricted reader process: SQL cannot read
+other files, reach the network, change settings or write, and a runaway query
+is stopped by a deadline. Type errors such as `"Date" >= 1990` on a date
+column now explain the fix. See *SQL table selection* below.
+
 ### 0.0.13: crosshair in dense charts
 
 Dense charts now show a crosshair for estimating positions against the axes,
@@ -491,7 +547,7 @@ Comments, text values and quoted column names are ignored when deciding, so
 an ordinary query over a column containing `;` or the word `update` still
 runs.
 
-### SQL table selection (in development)
+### SQL table selection
 
 The **Query table** selector lists document relations and their SQL types.
 For Excel, raw worksheets expose letter columns (`A`, `B`, `C`); detected
@@ -517,6 +573,16 @@ changes, internal catalogs and user-defined macros. These restrictions also
 apply through stored views. Ordinary document SELECT queries, CTEs, joins,
 aggregates, EXPLAIN, DESCRIBE and SUMMARIZE are supported. Cell saves use a
 separate host-controlled path. Opening data requires Workspace Trust.
+
+Functions are allowed only if every DuckDB function of that name is a plain
+scalar or aggregate. A few ordinary text functions share their name with a
+table function and are therefore unavailable; `repeat('x', 3)` is one — use
+`rpad('', 3, 'x')` instead. A burst of **Run** clicks keeps only the newest
+query; superseded ones are dropped rather than queued.
+
+A worksheet DuckDB cannot read at all — for example one holding a cell larger
+than Excel's 32,767-character limit — is reported as such, including when a
+query names one of its detected tables. Other sheets stay available.
 
 Workbook archives are checked before native parsing: 256 MiB compressed,
 512 MiB inflated, 256 MiB per part, 10,000 entries and 10 million declared
@@ -560,7 +626,22 @@ npm run build       # one-off build (esbuild -> dist/extension.js, dist/webview.
 npm run watch       # rebuild on file changes
 npm run typecheck   # tsc --noEmit
 npm test            # node --test
+npm run test:security   # SQL containment, message boundary, trust, edit integrity
+npm run test:browser    # real webview DOM in Chrome (Playwright)
+npm run test:host       # the packaged VSIX in an isolated VS Code host
+npm run test:resources  # deadlines, zip bombs, 200k rows, 500 tables (slow)
+# Speed work (slow; needs `conda run -n myproject python test/resources/build_profile_corpus.py` first):
+# test:resources also runs profile.test.ts (PROFILE lines per format and stage) and
+# equivalence.test.ts, which compares everything a user can observe against a
+# recorded baseline -- record one with DFV_EQUIV_RECORD=1 before changing code.
+npm run test:fuzz -- --seed 12345 --runs 20000   # reproducible fuzz campaign
+npm run test:package    # inspect the newest VSIX against allow/deny rules
 ```
+
+The security tests use throwaway files, local listeners and synthetic
+sentinels only. `test:resources` is kept out of `npm test` because it burns CPU
+and memory on purpose; it prints `PERF` lines worth recording when limits or
+the engine change.
 
 `npm test` covers the parts that are hard to check by hand: the live-refresh
 scheduler (driven by a fake clock, so a 30-second backoff is tested in
@@ -582,7 +663,7 @@ that window.
 
 ```sh
 npm run package     # builds, then runs vsce package -> data-file-viewer-x.x.x.vsix
-code --install-extension data-file-viewer-0.0.6.vsix
+code --install-extension data-file-viewer-0.0.14.vsix
 ```
 
 `@duckdb/node-api` ships platform-specific native binaries resolved at
@@ -607,6 +688,7 @@ A correct package contains `extension/dist/extension.js`, a
 
 ```sh
 unzip -l data-file-viewer-*.vsix | grep -c "extension/out-test/"   # must be 0
+npm run test:package   # the same checks and more, on the newest VSIX
 ```
 
 ## CI (GitHub Actions)

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DuckDBInstance } from '@duckdb/node-api';
-import { restrictQueryEngine, validateSqlSize, validateResultSize, QueryPolicyError, ReadSqlPolicy } from '../src/queryPolicy';
+import { readerThreads, restrictQueryEngine, validateSqlSize, validateResultSize, QueryPolicyError, ReadSqlPolicy } from '../src/queryPolicy';
 
 test('SQL payload budget uses bytes and rejects invalid values before native access', () => {
   for (const value of [null, [], {}, '', ' ', 'é'.repeat(131073)]) assert.throws(() => validateSqlSize(value), QueryPolicyError);
@@ -69,7 +69,9 @@ test('engine policy locks capabilities, bounds memory and disables spill', async
       await assert.rejects(c.run(sql));
     }
     const settings = (await c.runAndReadAll("select name,value from duckdb_settings() where name in ('threads','max_temp_directory_size','enable_external_access') order by name")).getRows();
-    assert.deepEqual(settings, [['enable_external_access','false'], ['max_temp_directory_size','0 bytes'], ['threads','2']]);
+    assert.deepEqual(settings, [['enable_external_access','false'], ['max_temp_directory_size','0 bytes'], ['threads', String(readerThreads())]]);
+    const cores = require('node:os').cpus().length;
+    assert.equal(readerThreads(), Math.max(1, Math.floor((require('node:os').availableParallelism?.() ?? cores) / 2)));
   } finally { c.closeSync(); instance.closeSync(); }
 });
 
@@ -81,5 +83,30 @@ test('user macros cannot inherit the grants for built-in range functions', async
     const catalog = String((await c.runAndReadAll('select current_database()')).getRows()[0][0]);
     await restrictQueryEngine(c, []);
     await assert.rejects(new ReadSqlPolicy(c, catalog).validate('select range()', []), /unavailable/);
+  } finally { c.closeSync(); instance.closeSync(); }
+});
+
+test('the one-scan function allowlists equal the two separate scans they replaced', async () => {
+  const instance = await DuckDBInstance.create(':memory:');
+  const c = await instance.connect();
+  try {
+    await c.run('load excel');
+    await c.run("create macro unnest(x) as x");
+    await c.run("create macro lower_macro(x) as lower(x)");
+    const names = async (sql: string) => new Set((await c.runAndReadAll(sql)).getRows().map(row => String(row[0]).toLowerCase()));
+    const functions = await names(`select function_name from system.main.duckdb_functions()
+      group by function_name having bool_and(internal)
+      and bool_and(function_type in ('scalar','aggregate','macro'))
+      and not bool_or(coalesce(has_side_effects,false))`);
+    const tableFunctions = await names(`select function_name from system.main.duckdb_functions()
+      where function_name in ('range','generate_series','unnest')
+      group by function_name having bool_and(internal)`);
+    const catalog = String((await c.runAndReadAll('select current_database()')).getRows()[0][0]);
+    const policy = new ReadSqlPolicy(c, catalog);
+    await policy.validate('select 1', []);
+    const loaded = policy as unknown as { functions: Set<string>; tableFunctions: Set<string> };
+    assert.deepEqual([...loaded.functions].sort(), [...functions].sort());
+    assert.deepEqual([...loaded.tableFunctions].sort(), [...tableFunctions].sort());
+    assert.ok(!loaded.tableFunctions.has('unnest') && !loaded.functions.has('lower_macro'), 'user macros are not granted');
   } finally { c.closeSync(); instance.closeSync(); }
 });
