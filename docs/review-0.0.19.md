@@ -62,3 +62,19 @@ published commit. The local results above are macOS results.
 The four existing known/TODO cases concern blank CSV files (two cases), quoted
 empty CSV strings becoming null, and text edits in numeric XLSX columns reading
 back as null. They remain unresolved; the passing totals do not imply otherwise.
+
+## Publication checks
+
+GitHub's Windows run additionally exposed a capped native stream retaining its
+connection after document disposal, and concurrent Excel extension installation
+colliding with a loaded DLL. Capped streams are now interrupted and finished;
+existing extensions are loaded before attempting installation, with recovery
+when another process wins the install race. Two extension-loading regressions
+cover the latter behavior. The host test also waits for a browser context during
+startup and stops its own VS Code process before closing CDP, keeping its hard
+deadline active throughout teardown.
+
+The obsolete `/private/tmp/dfv-build` clone was archived at
+`archive/20260924-pre-review-build` (`b8893bf`). All 134 source files were SHA-256
+verified against a fresh GitHub clone before both temporary clones were removed.
+The current workspace remains `/Users/macc/Desktop/Kod/data-file-viewer`.

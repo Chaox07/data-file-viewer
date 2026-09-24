@@ -17,6 +17,8 @@ sidebar.
 
 The 0.0.19 regression review also hardens workbook archive validation, stale
 workbook edit detection, query queue accounting and CSV startup resource limits.
+Windows fixes release capped-query file locks and avoid reinstalling loaded
+DuckDB extensions during concurrent opens.
 See [0.0.19 review results](docs/review-0.0.19.md) for checks and remaining limitations.
 
 ### 0.0.18: Query table follows the open sheet

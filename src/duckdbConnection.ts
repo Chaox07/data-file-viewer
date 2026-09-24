@@ -1524,29 +1524,19 @@ function isLockConflict(err: unknown): boolean {
   return /lock|being used by another process|resource busy/i.test(message);
 }
 
-// INSTALL writes into DuckDB's extension directory on disk, so it only needs
-// to happen once per process — but LOAD is per-connection state and must run
-// every time. Splitting the two matters on the live path, where a connection
-// used to be rebuilt from scratch on every tick.
-const installedExtensions = new Set<string>();
-
-/**
- * INSTALL once per process, LOAD every time.
- *
- * `from` names a non-core repository (`community`). INSTALL touches the
- * extension directory and, on a cold machine, the network; LOAD is the only
- * part that is per-connection state. Every extension goes through here, so the
- * live path -- which rebuilds a connection on every tick -- pays the install
- * once rather than once a tick.
- */
+/** Load an existing extension first. Concurrent readers on Windows must not
+ * reinstall a DLL another reader already loaded. If a cold install loses a
+ * race to another process, a successful LOAD still proves it is available. */
 async function ensureExtension(
   connection: DuckDBConnection,
   name: string,
   from?: string
 ): Promise<void> {
-  if (!installedExtensions.has(name)) {
+  try { await connection.run(`load ${name}`); return; } catch { /* not installed yet */ }
+  try {
     await connection.run(from ? `install ${name} from ${from}` : `install ${name}`);
-    installedExtensions.add(name);
+  } catch (installError) {
+    try { await connection.run(`load ${name}`); return; } catch { throw installError; }
   }
   await connection.run(`load ${name}`);
 }

@@ -57,7 +57,7 @@ const { xlsxFile } = require('../../out-test/test/stress/generators/_write');
     assert.ok(browser, 'VS Code debugging endpoint');
     let page, frame;
     for (let i = 0; i < 160 && !frame; i++) {
-      page = browser.contexts()[0].pages().at(-1);
+      page = browser.contexts()[0]?.pages().at(-1);
       if (page) for (const candidate of page.frames()) if (await candidate.locator('.sheet-table-sql').count() === 2) frame = candidate;
       if (!frame) await new Promise(resolve => setTimeout(resolve, 250));
     }
@@ -88,9 +88,11 @@ const { xlsxFile } = require('../../out-test/test/stress/generators/_write');
     assert.deepEqual(await fs.readFile(source), original);
     console.log('Installed-host SQL workflow passed: worksheet outline, row numbers, draft, handoff, restore, exact date boundary, 100 rows and unchanged source.');
   } finally {
-    clearTimeout(deadline);
-    await browser?.close().catch(() => undefined);
+    // Stop our VS Code process before closing its CDP connection. Keep the
+    // hard deadline active through teardown, including a failed host launch.
     stop();
+    await browser?.close().catch(() => undefined);
     await fs.rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+    clearTimeout(deadline);
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });

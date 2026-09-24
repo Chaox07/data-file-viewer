@@ -4,7 +4,6 @@ import { mkdtemp, readFile, rm, writeFile, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DuckDBInstance } from '@duckdb/node-api';
-import { DuckDbFile } from '../src/duckdbConnection';
 import { ViewerFile } from '../src/viewerFile';
 import { sqliteFile, xlsxFile } from './stress/generators/_write';
 import { unzipSync, zipSync, strFromU8, strToU8 } from 'fflate';
@@ -35,10 +34,6 @@ test('workbook edit cannot use row coordinates cached from different bytes with 
     const stamp = new Date('2020-01-01T00:00:00Z');
     const replace = async (bytes: Buffer) => { await writeFile(path, bytes); await utimes(path, stamp, stamp); };
     await replace(original);
-    // Validate the synthetic archive directly so platform fixture errors are
-    // distinguishable from the production worker's deliberately generic errors.
-    const probe = await DuckDbFile.open(path);
-    probe.dispose();
     file = await ViewerFile.open(path);
     await replace(replacement);
     let rejected = false;
