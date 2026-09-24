@@ -12,9 +12,22 @@ const { xlsxFile } = require('../../out-test/test/stress/generators/_write');
 (async () => {
   const executable = process.env.DFV_VSCODE_EXECUTABLE || '/Applications/Visual Studio Code.app/Contents/MacOS/Code';
   const vsix = process.env.DFV_VSIX || path.resolve(`data-file-viewer-${require('../../package.json').version}.vsix`);
-  const cli = process.platform === 'darwin'
+  let cli = process.platform === 'darwin'
     ? path.resolve(executable, '../../Resources/app/out/cli.js')
     : path.join(path.dirname(executable), 'resources/app/out/cli.js');
+  // Recent Windows archives keep resources beneath a version directory;
+  // Code.exe remains at the archive root. Support both packaged layouts.
+  if (process.platform === 'win32' && !await fs.stat(cli).then(s => s.isFile(), () => false)) {
+    const installRoot = path.dirname(executable);
+    const candidates = [];
+    for (const entry of await fs.readdir(installRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const candidate = path.join(installRoot, entry.name, 'resources/app/out/cli.js');
+      if (await fs.stat(candidate).then(s => s.isFile(), () => false)) candidates.push(candidate);
+    }
+    assert.equal(candidates.length, 1, 'one Windows VS Code CLI entry point');
+    cli = candidates[0];
+  }
   const root = await fs.mkdtemp(path.join(process.platform === 'darwin' ? '/tmp' : os.tmpdir(), 'dfvh-'));
   let browser, child;
   const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE;
@@ -22,7 +35,7 @@ const { xlsxFile } = require('../../out-test/test/stress/generators/_write');
     if (!child?.pid) return;
     if (process.platform === 'win32') {
       try { execFileSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore' }); } catch {}
-    } else { try { process.kill(-child.pid, 'SIGTERM'); } catch {} }
+    } else { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }
   };
   const deadline = setTimeout(() => { stop(); console.error('Installed-host test exceeded its deadline.'); process.exit(1); }, 120000);
   try {
