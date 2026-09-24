@@ -20,6 +20,8 @@ workbook edit detection, query queue accounting and CSV startup resource limits.
 Windows fixes release capped-query file locks and avoid reinstalling loaded
 DuckDB extensions during concurrent opens.
 See [0.0.19 review results](docs/review-0.0.19.md) for checks and remaining limitations.
+Validation includes Linux tests and packaged VS Code checks on macOS and Windows.
+The full local suite passes 798 tests; four pre-existing known cases remain documented.
 
 ### 0.0.18: Query table follows the open sheet
 

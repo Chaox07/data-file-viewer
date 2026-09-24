@@ -55,8 +55,8 @@ workbook measured: open 247 ms, first worksheet use 1,651 ms, first table query
 measurements, not a controlled before/after benchmark or a cross-machine guarantee.
 
 After local review, publication was authorized on 2026-09-24. The reviewed
-changes and README are being committed together; the superseded build clone is
-archived before deletion. GitHub Actions provides platform validation for the
+changes and README were committed; the superseded build clone was archived
+before deletion. GitHub Actions provides platform validation for the
 published commit. The local results above are macOS results.
 
 The four existing known/TODO cases concern blank CSV files (two cases), quoted
@@ -78,3 +78,13 @@ The obsolete `/private/tmp/dfv-build` clone was archived at
 `archive/20260924-pre-review-build` (`b8893bf`). All 134 source files were SHA-256
 verified against a fresh GitHub clone before both temporary clones were removed.
 The current workspace remains `/Users/macc/Desktop/Kod/data-file-viewer`.
+
+Final local validation after the publication fixes: 802 tests, 798 passed,
+zero failures/skips, four existing TODO cases; security 44 passed; resource
+checks eight passed with zero unexpected differences across 14 files. Browser,
+package and isolated macOS host checks also passed.
+
+[GitHub validation run 35999638670](https://github.com/Chaox07/data-file-viewer/actions/runs/35999638670)
+passed Linux tests and both macOS/Windows builds, including browser tests and
+packaged VS Code host checks. The checked application code is `9f8943b`; the
+following publication commit updates documentation only.
