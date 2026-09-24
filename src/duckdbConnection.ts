@@ -3360,6 +3360,13 @@ export class DuckDbFile {
       const truncated = capped && rows.length > maxRows;
       if (truncated) rows = rows.slice(0, maxRows);
       const columnStatsKind = reader.columnTypes().map((t) => classifyForStats(t.typeId));
+      // A capped native stream still owns its connection until a final fetch.
+      // Cancel and finish it without reading the remaining dataset, otherwise
+      // disposing the document can leave the database locked on Windows.
+      if (capped && !reader.done) {
+        this.connection.interrupt();
+        try { await reader.readAll(); } catch { /* expected interruption */ }
+      }
       if (this.readPolicy) validateResultSize({ columns, rows });
       return { columns, rows, columnStatsKind, truncated };
     } finally {
