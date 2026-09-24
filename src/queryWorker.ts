@@ -3,11 +3,47 @@ import { join } from 'node:path';
 import { mkdtempSync, chmodSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { QUERY_LIMITS, QueryPolicyError } from './queryPolicy';
+import { QUERY_LIMITS, QueryPolicyError, readerThreads } from './queryPolicy';
 
 interface Reply { id: number; value?: unknown; error?: string }
 export class QueryWorkerOperationError extends QueryPolicyError {
   constructor(message: string, readonly metadata: unknown) { super(message); }
+}
+
+interface Process { child: ChildProcess; tempRoot: string }
+interface Spare extends Process { workerPath: string; release: () => void }
+
+/** Remove a private scratch directory once its process (if any) has exited. */
+function removeTempRoot(child: ChildProcess | undefined, tempRoot: string): void {
+  const cleanup = () => { void rm(tempRoot, { recursive: true, force: true }).catch(() => undefined); };
+  if (child && child.exitCode === null && child.signalCode === null) child.once('exit', cleanup);
+  else cleanup();
+}
+
+/** A reader process: filtered environment, private scratch directory, IPC only. */
+function spawnReader(workerPath: string): Process {
+  // Do not copy arbitrary environment variables (which can contain tokens).
+  const env: NodeJS.ProcessEnv = { ELECTRON_RUN_AS_NODE: '1' };
+  for (const key of ['PATH', 'HOME', 'USERPROFILE', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR', 'LANG']) {
+    if (process.env[key]) env[key] = process.env[key];
+  }
+  // Each side query of a text-column probe runs on its own libuv thread
+  // (see sideQueries); size the pool to the reader's share of the machine.
+  env.UV_THREADPOOL_SIZE = String(Math.max(4, readerThreads() + 1));
+  const tempRoot = mkdtempSync(join(tmpdir(), 'dfv-query-'));
+  try {
+    chmodSync(tempRoot, 0o700);
+    env.TMPDIR = env.TEMP = env.TMP = tempRoot;
+    const child = fork(workerPath, [], {
+      env, execArgv: ['--max-old-space-size=512'], serialization: 'advanced',
+      cwd: tempRoot,
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    });
+    return { child, tempRoot };
+  } catch {
+    removeTempRoot(undefined, tempRoot);
+    throw new QueryPolicyError('Query worker could not start.');
+  }
 }
 
 /** Parent-owned request identity and hard deadlines. This process boundary is
@@ -15,6 +51,16 @@ export class QueryWorkerOperationError extends QueryPolicyError {
  */
 export class QueryWorker {
   private static readonly workers = new Set<QueryWorker>();
+  /**
+   * One reader process started ahead of need, so the next open (a new tab,
+   * the reopen after an edit, a refresh, the restart after Cancel) does not
+   * wait ~50 ms for fork and module load. It has opened nothing: it is the
+   * same process a fresh fork would give, only earlier. It is not counted
+   * toward the four-reader cap, never keeps the host alive, and is killed
+   * when the last document closes.
+   */
+  private static spare?: Spare;
+  private static live = 0;
   private child?: ChildProcess;
   private sequence = 0;
   private generation = 0;
@@ -26,9 +72,56 @@ export class QueryWorker {
     timer: ReturnType<typeof setTimeout>;
   }>();
 
-  constructor(private readonly workerPath = join(__dirname, 'queryWorkerEntry.js')) {}
+  constructor(private readonly workerPath = join(__dirname, 'queryWorkerEntry.js')) { QueryWorker.live++; }
 
   get running(): boolean { return this.child !== undefined; }
+
+  /** Hand over the spare if it is alive and runs the same entry point. */
+  private static claimSpare(workerPath: string): Process | undefined {
+    const spare = QueryWorker.spare;
+    if (!spare || spare.workerPath !== workerPath) return undefined;
+    QueryWorker.spare = undefined;
+    spare.release();
+    const { child } = spare;
+    if (child.exitCode !== null || child.signalCode !== null || !child.connected) {
+      child.kill('SIGKILL');
+      removeTempRoot(child, spare.tempRoot);
+      return undefined;
+    }
+    child.ref();
+    (child.channel as { ref?: () => void } | undefined)?.ref?.();
+    return spare;
+  }
+
+  /** Start the next spare after this one's work settles, if documents are still open. */
+  private static replenish(workerPath: string): void {
+    if (QueryWorker.spare || QueryWorker.live === 0) return;
+    let spare: Process;
+    try { spare = spawnReader(workerPath); } catch { return; }
+    const { child, tempRoot } = spare;
+    const lost = () => {
+      if (QueryWorker.spare?.child !== child) return;
+      QueryWorker.spare = undefined;
+      child.kill('SIGKILL');
+      removeTempRoot(child, tempRoot);
+    };
+    child.once('exit', lost);
+    child.once('error', lost);
+    // An idle spare must never keep the extension host (or a test run) alive.
+    child.unref();
+    (child.channel as { unref?: () => void } | undefined)?.unref?.();
+    QueryWorker.spare = { child, tempRoot, workerPath, release: () => { child.off('exit', lost); child.off('error', lost); } };
+  }
+
+  /** Kill the spare; called when the last document closes and on deactivate. */
+  static releaseSpare(): void {
+    const spare = QueryWorker.spare;
+    if (!spare) return;
+    QueryWorker.spare = undefined;
+    spare.release();
+    spare.child.kill('SIGKILL');
+    removeTempRoot(spare.child, spare.tempRoot);
+  }
 
   private start(): ChildProcess {
     if (this.disposed) throw new QueryPolicyError('This query view is closed.');
@@ -39,25 +132,8 @@ export class QueryWorker {
       else throw new QueryPolicyError('Four query runtimes are busy. Wait for a query to finish.');
     }
     const generation = ++this.generation;
-    // Do not copy arbitrary environment variables (which can contain tokens).
-    const env: NodeJS.ProcessEnv = { ELECTRON_RUN_AS_NODE: '1' };
-    for (const key of ['PATH', 'HOME', 'USERPROFILE', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR', 'LANG']) {
-      if (process.env[key]) env[key] = process.env[key];
-    }
-    this.tempRoot = mkdtempSync(join(tmpdir(), 'dfv-query-'));
-    chmodSync(this.tempRoot, 0o700);
-    env.TMPDIR = env.TEMP = env.TMP = this.tempRoot;
-    let child: ChildProcess;
-    try {
-      child = fork(this.workerPath, [], {
-        env, execArgv: ['--max-old-space-size=512'], serialization: 'advanced',
-        cwd: this.tempRoot,
-        stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
-      });
-    } catch {
-      this.stop('Query worker could not start.');
-      throw new QueryPolicyError('Query worker could not start.');
-    }
+    const { child, tempRoot } = QueryWorker.claimSpare(this.workerPath) ?? spawnReader(this.workerPath);
+    this.tempRoot = tempRoot;
     this.child = child;
     QueryWorker.workers.add(this);
     child.on('message', (reply: Reply) => {
@@ -66,6 +142,7 @@ export class QueryWorker {
       if (!request) return;
       this.pending.delete(reply.id);
       clearTimeout(request.timer);
+      if (this.pending.size === 0) setImmediate(() => QueryWorker.replenish(this.workerPath));
       if (typeof reply.error === 'string') request.reject(new QueryPolicyError(reply.error));
       else {
         const envelope = reply.value as { error?: string; metadata?: unknown } | undefined;
@@ -110,11 +187,7 @@ export class QueryWorker {
     QueryWorker.workers.delete(this);
     this.generation++;
     child?.kill('SIGKILL');
-    if (tempRoot) {
-      const cleanup = () => { void rm(tempRoot, { recursive: true, force: true }).catch(() => undefined); };
-      if (child && child.exitCode === null && child.signalCode === null) child.once('exit', cleanup);
-      else cleanup();
-    }
+    if (tempRoot) removeTempRoot(child, tempRoot);
     for (const request of this.pending.values()) {
       clearTimeout(request.timer);
       request.reject(new QueryPolicyError(reason));
@@ -122,7 +195,11 @@ export class QueryWorker {
     this.pending.clear();
   }
 
-  dispose(): void { this.disposed = true; this.stop('This query view is closed.'); }
+  dispose(): void {
+    if (!this.disposed && --QueryWorker.live === 0) QueryWorker.releaseSpare();
+    this.disposed = true;
+    this.stop('This query view is closed.');
+  }
 
   /** Wait for the OS to release native file handles before a trusted save opens. */
   async close(): Promise<void> {

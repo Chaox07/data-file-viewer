@@ -3,6 +3,7 @@ import test from 'node:test';
 import { resolve } from 'node:path';
 import { QueryWorker } from '../src/queryWorker';
 import { stat } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import { setTimeout as pause } from 'node:timers/promises';
 
 const probe = resolve('test/fixtures/queryWorkerProbe.cjs');
@@ -84,4 +85,46 @@ test('worker pool evicts idle readers and refuses a fifth busy reader', async ()
     await Promise.all(blocked);
     assert.equal(await workers[4].call('echo', [2]), 2);
   } finally { workers.forEach(worker => worker.dispose()); }
+});
+
+const spareOf = () => (QueryWorker as unknown as { spare?: { child: { pid?: number }; tempRoot: string } }).spare;
+const pidOf = (worker: QueryWorker) => (worker as unknown as { child?: { pid?: number } }).child?.pid;
+const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+async function until(check: () => boolean) { for (let i = 0; i < 200 && !check(); i++) await pause(10); return check(); }
+
+test('spare reader: started after a reply, claimed by the next start, not counted as busy, gone after the last disposal', async () => {
+  const first = new QueryWorker(probe);
+  const second = new QueryWorker(probe);
+  let sparePid: number | undefined, spareRoot: string | undefined;
+  try {
+    assert.equal(await first.call('echo', [1]), 1);
+    assert.ok(await until(() => spareOf() !== undefined), 'a spare is started once the reply settles');
+    sparePid = spareOf()!.child.pid!;
+    spareRoot = spareOf()!.tempRoot;
+    assert.equal(second.running, false, 'the spare is not handed to anyone until needed');
+    assert.equal(await second.call('echo', [2]), 2);
+    assert.equal(pidOf(second), sparePid, 'the next start claimed the spare process');
+    assert.equal(await second.call<string>('cwd', []), realpathSync(spareRoot), 'with its own private scratch directory');
+    assert.ok(await until(() => spareOf() !== undefined && spareOf()!.child.pid !== sparePid), 'and a new spare replaces it');
+    sparePid = spareOf()!.child.pid!;
+    spareRoot = spareOf()!.tempRoot;
+  } finally { first.dispose(); second.dispose(); }
+  assert.equal(spareOf(), undefined, 'the last disposal releases the spare');
+  assert.ok(await until(() => !alive(sparePid!)), 'the spare process is killed');
+  for (let i = 0; i < 100 && await stat(spareRoot!).then(() => true, () => false); i++) await pause(10);
+  await assert.rejects(stat(spareRoot!), { code: 'ENOENT' });
+});
+
+test('spare reader: a spare that died while idle is replaced by a fresh fork, not handed out', async () => {
+  const first = new QueryWorker(probe);
+  const second = new QueryWorker(probe);
+  try {
+    await first.call('echo', [1]);
+    assert.ok(await until(() => spareOf() !== undefined));
+    const pid = spareOf()!.child.pid!;
+    process.kill(pid, 'SIGKILL');
+    assert.ok(await until(() => spareOf() === undefined), 'a dead spare leaves the slot');
+    assert.equal(await second.call('echo', [3]), 3);
+    assert.notEqual(pidOf(second), pid);
+  } finally { first.dispose(); second.dispose(); }
 });

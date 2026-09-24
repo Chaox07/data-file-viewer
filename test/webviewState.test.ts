@@ -138,6 +138,16 @@ test('an unchanged live tick updates the clock but does not re-render', () => {
   assert.deepEqual(kinds(effects), ['updateLiveStatusText'], 'an unchanged tick redrew the grid for nothing');
 });
 
+test('the previewed worksheet name survives a query result and a live tick', () => {
+  const preview = fields({ sheetPreview: 'Raw_Data', sheetTables: [] });
+  const fresh = reduce(initialState(), { command: 'queryResult', ...preview });
+  assert.equal(fresh.state.lastResult!.sheetPreview, 'Raw_Data');
+  const ticked = reduce(fresh.state, { command: 'liveTick', lastUpdatedMs: 1, unchanged: false, result: preview });
+  assert.equal(ticked.state.lastResult!.sheetPreview, 'Raw_Data');
+  const plain = reduce(ticked.state, { command: 'queryResult', ...fields() });
+  assert.equal(plain.state.lastResult!.sheetPreview, undefined, 'a hand-written result is not a worksheet preview');
+});
+
 test('an inline sheet-table result updates only that region, not the worksheet result', () => {
   const seeded = apply(initialState(), {
     command: 'queryResult',

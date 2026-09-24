@@ -3,7 +3,7 @@
   "displayName": "Data File Viewer",
   "description": "Open and explore .duckdb, .parquet, .csv, .dta (Stata), .arrow/.arrows/.feather (Arrow IPC), .xlsx (Excel), .db/.sqlite (SQLite), and kdb+ data files right inside VS Code, without needing a separate database program. A sidebar lists every table in the file — click one to see its rows in a grid, or write your own SQL query to look at exactly the data you want. Click a column header to sort by it, or open the stats panel to see quick numbers for that column — minimum, maximum, average, and percentiles — worked out across the whole dataset, not just the rows on screen. For editable formats (.duckdb, .parquet, .csv, .dta, .arrow/.arrows/.feather, .xlsx, .db/.sqlite), double-click a cell to change its value and save it straight back to the file; turn on Safe Mode first to keep an automatic backup and see exactly which rows changed before you commit to the edit. kdb+ tables are read directly in their real, original format — no conversion step — though they are view-only for now, since there is no way yet to write changes back into that format. Excel workbooks show each sheet exactly as the file holds it — every row and column, titles and footnotes where the workbook puts them — while every detected table gets independent filter, sort, statistics and plot controls directly on its own header cells. An edit rewrites just that one cell inside the workbook file, leaving the other sheets, the formulas and the cell formatting exactly as they were.",
   "publisher": "kemal-local",
-  "version": "0.0.13",
+  "version": "0.0.19",
   "private": true,
   "license": "MIT",
   "repository": {
@@ -203,6 +203,10 @@
     "test": "tsc -p tsconfig.test.json && node --test \"out-test/test/*.test.js\"",
     "test:browser": "tsc -p tsconfig.test.json && node test/browser/sqlWorkflow.cjs && node test/browser/chartDetail.cjs",
     "test:host": "tsc -p tsconfig.test.json && node test/host/sqlWorkflow.cjs",
+    "test:security": "tsc -p tsconfig.test.json && node --test out-test/test/securityMatrix.test.js out-test/test/queryBoundary.test.js out-test/test/hostProtocol.test.js out-test/test/queryPolicy.test.js out-test/test/queryRuntimeBaseline.test.js out-test/test/restrictedQueries.test.js out-test/test/queryMessages.test.js out-test/test/queryDiagnostics.test.js out-test/test/scannerDifferential.test.js out-test/test/editIntegrity.test.js",
+    "test:fuzz": "tsc -p tsconfig.test.json && node test/fuzz.cjs",
+    "test:resources": "tsc -p tsconfig.test.json && node --test --test-timeout=600000 \"out-test/test/resources/*.test.js\"",
+    "test:package": "node test/package.cjs",
     "stress": "tsc -p tsconfig.test.json && node out-test/test/stress/run_stress.js",
     "stress:foreign": "python3 test/stress/foreign/build_corpus.py",
     "package": "npm run build && npx vsce package"

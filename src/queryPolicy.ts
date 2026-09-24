@@ -1,3 +1,4 @@
+import * as os from 'node:os';
 import type { DuckDBConnection } from '@duckdb/node-api';
 
 /** Host-owned limits; these are not grants that webview messages can change. */
@@ -26,6 +27,18 @@ export function validateSqlSize(sql: unknown): asserts sql is string {
  * Canonical paths must be derived by the host, never by SQL or a webview message.
  * This is an engine capability restriction, not a sandbox for native-code exploits.
  */
+/**
+ * Half the cores of the machine this runs on, never fewer than one. A
+ * runaway query is still stopped by the parent's deadline; until then it can
+ * take at most half the machine, so the editor and everything else stay
+ * responsive. Computed per machine, not fixed: 5 on a 10-core Mac, 1 on a
+ * 2-core runner.
+ */
+export function readerThreads(): number {
+  const cores = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
+  return Math.max(1, Math.floor(cores / 2));
+}
+
 export async function restrictQueryEngine(connection: DuckDBConnection, paths: readonly string[]): Promise<void> {
   const literals = paths.map(p => `'${p.replace(/'/g, "''")}'`).join(',');
   for (const sql of [
@@ -35,7 +48,7 @@ export async function restrictQueryEngine(connection: DuckDBConnection, paths: r
     'set allow_persistent_secrets = false',
     'set enable_external_access = false',
     "set memory_limit = '512MB'",
-    'set threads = 2',
+    `set threads = ${readerThreads()}`,
     "set max_temp_directory_size = '0B'",
     'set enable_logging = false',
     'set lock_configuration = true',
@@ -159,19 +172,19 @@ export class ReadSqlPolicy {
   async validate(sql: string, relations: readonly QueryRelation[]): Promise<void> {
     validateSqlSize(sql);
     if (!this.functions) {
+      // Both allowlists from one catalog scan (the scan is the cost, ~10 ms each).
       const reader = await this.connection.runAndReadAll(
-        `select function_name from system.main.duckdb_functions()
-         group by function_name having bool_and(internal)
-         and bool_and(function_type in ('scalar','aggregate','macro'))
-         and not bool_or(coalesce(has_side_effects,false))`
+        `select function_name,
+           bool_and(internal)
+             and bool_and(function_type in ('scalar','aggregate','macro'))
+             and not bool_or(coalesce(has_side_effects,false)) as scalar_safe,
+           function_name in ('range','generate_series','unnest') and bool_and(internal) as table_safe
+         from system.main.duckdb_functions()
+         group by function_name`
       );
-      this.functions = new Set(reader.getRows().map(row => String(row[0]).toLowerCase()));
-      const tableReader = await this.connection.runAndReadAll(
-        `select function_name from system.main.duckdb_functions()
-         where function_name in ('range','generate_series','unnest')
-         group by function_name having bool_and(internal)`
-      );
-      this.tableFunctions = new Set(tableReader.getRows().map(row => String(row[0]).toLowerCase()));
+      const rows = reader.getRows();
+      this.functions = new Set(rows.filter(row => row[1] === true).map(row => String(row[0]).toLowerCase()));
+      this.tableFunctions = new Set(rows.filter(row => row[2] === true).map(row => String(row[0]).toLowerCase()));
     }
     const inspected = new Set<string>();
     const inspect = async (text: string, viewDepth = 0): Promise<void> => {

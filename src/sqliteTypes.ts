@@ -143,6 +143,29 @@ async function undeclaredColumns(
 }
 
 /**
+ * undeclaredColumns' pragma for every table in one SQLite query, in each
+ * table's column order; `undefined` if SQLite refuses the joined form.
+ */
+async function declaredTypesByTable(
+  connection: DuckDBConnection,
+  sourceCatalog: string
+): Promise<Map<string, [string, string][]> | undefined> {
+  const sql = `select m.name as table_name, p.name as column_name, p.type as declared_type from sqlite_master m, pragma_table_info(m.name) p ` +
+    `where m.type in ('table', 'view') order by m.name, p.cid`;
+  try {
+    const out = new Map<string, [string, string][]>();
+    for (const r of await rows(connection, `select * from sqlite_query(${quoteLiteral(sourceCatalog)}, ${quoteLiteral(sql)})`)) {
+      const table = String(r[0]);
+      if (!out.has(table)) out.set(table, []);
+      out.get(table)!.push([String(r[1]), String(r[2] ?? '')]);
+    }
+    return out;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Proves the decoding against the real values before it is used, because
  * `typeof()` answers for storage classes and not for what DuckDB can do with
  * the bytes -- text SQLite accepted can still be invalid UTF-8, and digits
@@ -253,15 +276,32 @@ export async function planSqliteTables(
      and table_schema = 'main' order by table_name`
   )).map((r) => String(r[0]));
   const plan = new Map<string, SqliteTablePlan>();
+  // Two catalog reads for the whole file instead of two per table: a 200-table
+  // database spent ~0.9 s opening on these alone. A table missing from either
+  // batch (a name the two catalogs spell differently) takes the per-table query
+  // it always did, so the plan cannot differ.
+  const schemas = new Map<string, unknown[][]>();
+  for (const r of await rows(connection,
+    `select table_name, column_name, data_type from information_schema.columns
+     where table_catalog = ${quoteLiteral(sourceCatalog)} and table_schema = 'main'
+     order by table_name, ordinal_position`)) {
+    const name = String(r[0]);
+    if (!schemas.has(name)) schemas.set(name, []);
+    schemas.get(name)!.push([r[1], r[2]]);
+  }
+  const declared = await declaredTypesByTable(connection, sourceCatalog);
   for (const table of tables) {
     const sourceRef = `${quoteIdent(sourceCatalog)}.main.${quoteIdent(table)}`;
-    const schema = await rows(connection,
+    const schema = schemas.get(table) ?? await rows(connection,
       `select column_name, data_type from information_schema.columns
        where table_catalog = ${quoteLiteral(sourceCatalog)} and table_schema = 'main'
        and table_name = ${quoteLiteral(table)} order by ordinal_position`);
     const columns = schema.map((r) => String(r[0]));
     const columnTypes = schema.map((r) => String(r[1]));
-    const undeclared = await undeclaredColumns(connection, sourceCatalog, table);
+    const pragma = declared?.get(table);
+    const undeclared = pragma
+      ? pragma.filter(([, type]) => type.trim() === '').map(([name]) => name)
+      : await undeclaredColumns(connection, sourceCatalog, table);
     const before = previous?.get(table);
     if (before && undeclared.length === 0 && before.undeclared.length === 0 &&
         JSON.stringify(schema) === JSON.stringify(before.columns.map((c, i) => [c, before.columnTypes[i]]))) {

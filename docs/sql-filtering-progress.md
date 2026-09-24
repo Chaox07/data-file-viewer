@@ -1,19 +1,161 @@
 # SQL filtering implementation evidence
 
 Implementation authorized 2026-09-23. Scope is the unified
-[implementation plan](sql-filtering-plan.md). Work in progress; this is not a
-release or a claim that the installed extension has these protections.
+[implementation plan](sql-filtering-plan.md). Local acceptance checkpoint of
+2026-09-23: 0.0.14 is built and installed on the development machine from an
+uncommitted working tree. It is not a GitHub release; Windows and CI evidence
+are still missing (see *Unexecuted*).
 
 ## Phase status
 
 | Phase | Status |
 | --- | --- |
-| 1. Baseline and execution design | Baseline captured; design implemented. Performance acceptance remains open. |
-| 2. Restricted execution and cancellation | Provider integrated with killable restricted reader and separate trusted saves; security acceptance in progress. |
-| 3. Catalog and SQL handoff | Implemented: document-owned targets, actual types, lazy sheet preparation and inline SQL. |
-| 4. User workflow and diagnostics | Browser workflow passes; diagnostic and notice privacy checks pass. Installed-host checks remain open. |
-| 5. Acceptance | In progress; full matrix is not yet closed. |
-| 6. Release and installation | Not started. |
+| 1. Baseline and execution design | Done. Performance baselines recorded below. |
+| 2. Restricted execution and cancellation | Done on macOS. Containment, deadlines and cleanup verified (SEC-01–13, DOS-01). |
+| 3. Catalog and SQL handoff | Done. |
+| 4. User workflow and diagnostics | Done. Browser and isolated installed-host workflows pass. |
+| 5. Acceptance | Done on macOS arm64. All families executed locally; Windows rows are unexecuted. |
+| 6. Release and installation | Local part done: README, 0.0.14, VSIX inspected and installed. Not pushed; no CI or release assets. |
+
+## Acceptance checkpoint (2026-09-23, macOS arm64)
+
+`npm test`: 768 tests, 764 passed, 0 failed, 0 skipped, 4 TODO.
+`test:security` 42/42, `test:resources` 6/6, `test:browser` and `test:host`
+pass, `test:package` passes on `data-file-viewer-0.0.14.vsix` (1,488 files,
+42.5 MB). Fuzz: seed 20260923 (default) and a 30,000-run campaign with seed
+777001, both clean.
+
+| Family | Tests | Result |
+| --- | --- | --- |
+| SEC-01–04 outside files | `securityMatrix`: 9 reader functions × absolute/relative/symlink/prefix/glob/`file://` paths, nested/CTE/lateral/lambda/union forms, persisted views and macros; all 8 read paths | No canary in any result or error. Disabling `restrictedReads` makes all 8 tests fail. |
+| SEC-05–07 network | Local listener; http/https/redirect/credential URLs; stored remote view during open, catalog and preview | 0 connection attempts |
+| SEC-08–10 writes | 45 write/DDL/COPY/ATTACH/SET/INSTALL/multi-statement/comment/dollar-quote forms | Document hash and directory listing unchanged |
+| SEC-11–13 catalogs | Two documents, schemas with the same name, attached `backup_cmp`, hidden SQLite source catalog | Only this document's relations are reachable |
+| SEC-14–17 messages | Seeded fuzz of `validateQueryMessage`, cycles, BigInt, depth bombs in read fields, replayed and older request IDs | Always a typed refusal or a well-formed message |
+| SEC-18–20 hostile names | Quotes, SQL punctuation, markup and Unicode in sheet/header/value names, through filter, sort and SQL handoff | Exact matches; `contains` is literal, not LIKE |
+| SEC-21–23 sinks | Sentinel in path, literals, identifiers and failing SQL through run, stats and chart | Not in webview messages, notifications or output channel |
+| SEC-24–26 trust | Trust revoked after open | All operations refused at execution time; no write; works again after trust returns |
+| REL-01–12 | Date/text/year/mixed/NULL/precision matrix; SQL handoff round trips | Explicit errors; no silent conversion |
+| REL-13–20 | Stale owners, cross-document target IDs, catalog generations, source replaced on disk, cancel, 10-Run burst | See defect D1 |
+| INT-01–04 | Edit from a filtered result, user `rowid` column, stale workbook bounds, failed publication | Checked by an independent DuckDB reader |
+| PERF-01–04, DOS-01–04 | `test/resources/` | Below |
+| PKG-01–04 | `test/package.cjs` | Passes on macOS; Windows not run |
+
+Scanner/parser comparison: 0 Safe Mode scanner misses in 30,600 seeded runs.
+Every miss would still have to be refused by the reader, as the test requires.
+
+### Measurements (this machine, `npm run test:resources`)
+
+| Case | Result |
+| --- | --- |
+| 200,000-row CSV | cold open 165 ms, first query 54 ms, warm filter p50 39 ms / p95 40 ms, sort+stats+chart 205 ms, worker RSS 146 MiB |
+| 50 sheets / 500 tables + 32,000-char cell | cold open 122 ms, 1,000 target switches p50 2.9 ms / p95 3.2 ms, unreferenced sheets stay unprepared, RSS 117 → 173 MiB then flat at 174 MiB over 50 refresh cycles |
+| Runaway SQL (2.5 s test deadline) | CPU-bound and recursive stopped at 2.5 s; cartesian stopped by the memory budget in 90 ms; worker process and scratch directory gone |
+| Zip bomb (300 MB inflated), `A1:XFD1048576` dimension, entity expansion, truncated part | refused in ≤ 100 ms |
+| 4 documents × 12 concurrent requests | 16 refused by the per-worker bound; every document answers afterwards |
+| Supplied files (temporary copies) | DuckDB open 59 ms, xlsx open 643 ms; corrected queries 8 ms each |
+
+### Supplied-file acceptance
+
+On temporary copies of the two reported files: both original predicates fail
+with explanatory messages. The corrected queries return 100 rows, and the
+workbook's inline filter hands the same 100 rows to SQL. `Raw_Data · Table 2`
+is listed at B11 with DATE-typed `Date` and 16,803 rows, separately from
+Table 1. Stats and chart come from that exact result. Original SHA-256 hashes
+were unchanged; the copies were deleted.
+
+### Defects found and fixed at this checkpoint
+
+- **D1 (REL-17):** a burst of Run clicks filled the 8-slot queue with work a
+  newer Run had already superseded, so the newest query was refused. Superseded
+  query jobs no longer count against the limit and are skipped when reached,
+  with a hard ceiling of 64. Regression: `hostProtocol` REL-17–20, which fails
+  on the previous code.
+- **D2 (diagnostics):** a worksheet DuckDB cannot read (for example, a cell
+  over Excel's 32,767-character limit) gave a generic error. A query naming
+  one of its detected tables said "select a table from this document's query
+  catalog". Both now give the real reason. Regression: `queryDiagnostics`.
+- **Test harness:** E21 looked for the Tier B corpus one directory above the
+  repository, so it had always skipped. It now uses `stress/paths`.
+- **Packaging:** `.vscodeignore` now excludes `*.vsix` and `docs/**`.
+
+### Triaged, not fixed
+
+- `repeat()` and other scalar functions sharing a name with a table function
+  are refused (usability; `rpad` is the documented workaround).
+- The 4 TODO known bugs (blank CSV invents rows ×2, `""` reads as NULL, text
+  typed into a numeric workbook column reads back empty although written
+  correctly) predate this feature, are not confidentiality or corruption
+  issues, and are outside the plan's scope.
+- Errors crossing the worker boundary keep their message, but their category
+  becomes `blocked`.
+
+### Unexecuted (require a push)
+
+Windows CI (native handle-leak fixes, exclusive-lock backup path), the
+macOS/Windows CI matrix, release assets and installed-host verification on
+Windows. These are release blockers under section 6 until run.
+
+## Speed checkpoint (2026-09-24, 0.0.15)
+
+Profiled every format by stage (`test/resources/profile.test.ts`), then changed one
+thing at a time against an equivalence snapshot of 14 files
+(`test/resources/equivalence.test.ts`). Full detail, and the list of what to
+scrutinize, is in [review-handoff.md](review-handoff.md).
+
+| File | Stage | Before ms | After ms |
+| --- | --- | ---: | ---: |
+| YieldCurve.xlsx (21 MB) | open / edit one cell | 686 / 9,961 | 389 / 1,330 |
+| strings.xlsx (40k rows) | edit | 1,139 | 233 |
+| CSV 200k | warm query / sort / stats / Run round trip | 58 / 96 / 58 / 142 | 2 / 14 / 11 / 9 |
+| SQLite 200 tables | open / edit | 812 / 1,924 | 184 / 581 |
+
+Changes:
+- the throwaway writer skips its post-edit re-read
+- workbook patches copy untouched ZIP members and use native zlib
+- workbook edits are located by the reader and patched by the host, guarded by a SHA-256
+  of the bytes the reader opened
+- the preflight uses native streaming inflate
+- CSV is cached as a table in the read worker
+- SQLite catalog reads are batched
+
+The only observable difference: a reading notice is no longer shown twice after a
+workbook edit. Still slow: the first query after a workbook edit (~5 s, the
+text-column probe re-runs).
+
+## Opening checkpoint (2026-09-24, 0.0.16)
+
+Same method, against a fresh baseline that was byte-identical to the 0.0.15 one;
+the finished set reproduces it with 0 differences on 14 files. Detail and what to
+scrutinize: Part C of [review-handoff.md](review-handoff.md).
+
+| File | Stage | 0.0.15 ms | 0.0.16 ms |
+| --- | --- | ---: | ---: |
+| YieldCurve.xlsx (21 MB) | open → first data-table view | 5,404 | 3,139 |
+| | first query after an edit | 4,969 | 2,899 |
+| | reader restarted on unchanged bytes, table again | 3,130 | 2,430 |
+| CSV 200k | open | 403 | 327 |
+| Parquet / DuckDB / Stata / Arrow / SQLite | second file opened while one is open | 75 / 76 / 80 / 80 / 192 | 11 / 10 / 18 / 22 / 136 |
+
+Changes:
+- one spare reader process is kept ready while a document is open
+- one catalog scan builds the function allowlist
+- reader threads are half the machine's cores (was 2)
+- workbook `<dimension>` heads are read through the central directory with native zlib
+- the text-column check runs as parallel column groups on side connections of the same
+  instance
+- its decisions are cached in the host's memory for the tab, for identical bytes only
+- the sheet grid reaches detection as JSON rows
+- a worker's CSV is cached before the check
+
+Dropped after measuring:
+- install-only-if-load-fails (under 0.5 ms)
+- batched SQLite views (5%)
+- a marker-test change (no gain)
+- a Rust Excel reader (cell text not identical)
+
+Tests: 781 (777 pass, 4 TODO), security 43/43, browser, fuzz seed 20260924, resources,
+package, host.
 
 ## Baseline
 

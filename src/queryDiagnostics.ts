@@ -49,6 +49,9 @@ export function queryDiagnostic(error: unknown, rawWorksheet = false): QueryDiag
     category: 'conversion', line, message: 'A value could not be converted to the requested SQL type. Check the column types and conversion; no invalid rows were silently discarded.',
   };
   if (/Parser Error|Syntax Error/i.test(raw)) return { category: 'syntax', line, message: 'SQL syntax error. Check the query near the indicated line.' };
+  if (/Cell data too large|is the file corrupted/i.test(raw)) return {
+    category: 'resource', message: 'This worksheet cannot be read: a cell is larger than Excel’s 32,767-character limit, or the sheet is damaged. Other sheets remain available.',
+  };
   if (/Out of Memory|memory limit|maximum.*size|Resource/i.test(raw)) return { category: 'resource', message: 'Query exceeded a resource limit. Select fewer rows or columns, or simplify the query.' };
   if (/Permission Error|external access|disabled by configuration/i.test(raw)) return { category: 'blocked', message: 'The query requires a resource outside this document’s permitted access.' };
   return { category: 'unknown', message: 'The query could not be completed. Check its table, column names and SQL types.' };

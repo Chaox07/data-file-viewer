@@ -46,8 +46,10 @@
  * for the cell's -- which in that codebase nulled 182,000 cells in one sheet.
  */
 
+import { createHash } from 'node:crypto';
 import { readFile, writeFile, rename, rm } from 'node:fs/promises';
 import { unzipSync, zipSync, strFromU8, strToU8 } from 'fflate';
+import { indexZip, readMember, rewriteZip } from './zipPatch';
 
 /** A1 column letters -> 0-based index. "A" -> 0, "Z" -> 25, "AA" -> 26. */
 export function columnIndexOf(letters: string): number {
@@ -362,6 +364,12 @@ export interface PatchCellRequest {
    * Turns the write from a search into arithmetic -- see patchCell.
    */
   verbatim?: boolean;
+  /**
+   * SHA-256 of the bytes the row was located in (ViewerFile's read worker).
+   * When given, the file read here must still hash to it, or nothing is
+   * written: the located row is then known to be a row of these bytes.
+   */
+  expectedSha256?: string;
   /** What the grid showed in this cell. The write is refused if the file disagrees. */
   expectedCurrent: unknown;
   newValue: unknown;
@@ -431,7 +439,22 @@ export async function patchCell(request: PatchCellRequest): Promise<void> {
   const { filePath, sheetPath, columnName, columnNames, rowOrdinal, expectedCurrent, newValue } =
     request;
 
-  const files = unzipSync(new Uint8Array(await readFile(filePath)));
+  // Only the parts this function reads are inflated when the archive is in
+  // zipPatch's scope; otherwise every member, as before.
+  const original = await readFile(filePath);
+  if (request.expectedSha256 !== undefined &&
+      createHash('sha256').update(original).digest('hex') !== request.expectedSha256) {
+    throw new Error('The workbook changed after it was read, so the cell was not changed. Refresh before editing.');
+  }
+  const index = indexZip(original);
+  const files: Record<string, Uint8Array> = index
+    ? Object.fromEntries(
+        [sheetPath, 'xl/sharedStrings.xml', 'xl/styles.xml', 'xl/workbook.xml'].flatMap((name) => {
+          const member = readMember(index, name);
+          return member ? [[name, member] as const] : [];
+        })
+      )
+    : unzipSync(new Uint8Array(original));
   const part = files[sheetPath];
   if (!part) throw new Error(`The workbook has no worksheet part at ${sheetPath}.`);
 
@@ -578,16 +601,15 @@ export async function patchCell(request: PatchCellRequest): Promise<void> {
   const updatedSheet = sheetXml.slice(0, target.start) + patched + sheetXml.slice(target.end);
   files[sheetPath] = strToU8(updatedSheet);
 
-  // Rezipped whole, because a zip's central directory has to be rebuilt when
-  // any member's compressed size changes.
-  //
-  // NOTE: this DOES re-encode every member. `unzipSync` above inflates them all
-  // and `zipSync` re-deflates them all, so editing one cell of a 100 MB
-  // workbook recompresses 100 MB. (A comment here used to claim the opposite;
-  // it was wrong, and the claim is worth contradicting explicitly so it is not
-  // reintroduced. Fixing it properly means carrying the original compressed
-  // bytes through with fflate's ZipPassThrough.)
-  const bytes = Buffer.from(zipSync(files));
+  // The central directory has to be rebuilt when any member's compressed size
+  // changes. With zipPatch, only the edited sheet is re-encoded and every other
+  // member's compressed bytes are copied through (21 MB workbook: 2.7 s -> see
+  // docs/review-handoff.md). An archive outside zipPatch's scope (ZIP64,
+  // encryption, other methods) keeps the old path, which inflates and
+  // re-deflates every member; the member contents are identical either way.
+  const bytes = index
+    ? rewriteZip(index, new Map([[sheetPath, files[sheetPath]]]))
+    : Buffer.from(zipSync(files));
 
   // Written beside the file and moved into place, never over it.
   //

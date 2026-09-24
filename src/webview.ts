@@ -10,6 +10,9 @@ import { fmtCount, formatStat, formatValue } from './gridFormat';
 import { DisplayOrderCache } from './gridOrder';
 import { liveStatusText } from './liveStatus';
 import { computeVirtualWindow } from './virtualWindow';
+import { tableEdges } from './sheetHighlight';
+import { groupQueryTargets } from './queryTargetList';
+import type { SheetBounds } from './queryCatalog';
 import {
   type ColumnStatsFields,
   type Effect,
@@ -91,9 +94,7 @@ root.innerHTML = `
         <button id="query-use" disabled>Use in SQL</button>
         <button id="query-more" hidden>More tables</button>
         <button id="query-restore" hidden>Restore draft</button>
-        <button id="query-worksheet" hidden>Worksheet preview</button>
       </div>
-      <div id="query-schema" class="query-schema" aria-live="polite"></div>
       <div id="editor" class="editor"></div>
       <div id="results" class="results"></div>
     </div>
@@ -118,13 +119,13 @@ const queryTargetEl = document.getElementById('query-target') as HTMLSelectEleme
 const queryUseEl = document.getElementById('query-use') as HTMLButtonElement;
 const queryMoreEl = document.getElementById('query-more') as HTMLButtonElement;
 const queryRestoreEl = document.getElementById('query-restore') as HTMLButtonElement;
-const queryWorksheetEl = document.getElementById('query-worksheet') as HTMLButtonElement;
-const querySchemaEl = document.getElementById('query-schema') as HTMLDivElement;
 let nextCatalogCursor: number | undefined;
 const queryTargets = new Map<string, QueryTarget>();
 const queryColumns = new Map<string, QueryColumn[]>();
 const drafts: string[] = [];
 let selectedQueryTarget: QueryTarget | undefined;
+/** The worksheet last opened as a preview; kept while a hand-written query's result is on screen. */
+let openSheet: string | undefined;
 
 let running = false;
 
@@ -188,18 +189,14 @@ function setEditorText(text: string): void {
 function refreshQueryTargets(): void {
   const selected = selectedQueryTarget?.id ?? '';
   queryTargetEl.replaceChildren(new Option('Choose a table…', ''));
-  const groups = new Map<string, HTMLOptGroupElement>();
-  for (const target of queryTargets.values()) {
-    const groupName = target.worksheet ?? `${target.catalog}.${target.schema}`;
-    let group = groups.get(groupName);
-    if (!group) { group = document.createElement('optgroup'); group.label = groupName; groups.set(groupName, group); queryTargetEl.append(group); }
-    const label = target.rawWorksheet ? `${target.name} — Raw worksheet (A, B, C…)${target.prepared ? '' : ' — not prepared'}`
-      : `${target.name}${target.range ? ` — ${target.range}` : ''}`;
-    group.append(new Option(label, target.id));
+  for (const { label, options } of groupQueryTargets(queryTargets.values(), openSheet)) {
+    const group = document.createElement('optgroup');
+    group.label = label;
+    for (const option of options) group.append(new Option(option.label, option.id));
+    queryTargetEl.append(group);
   }
   queryTargetEl.value = selected;
   queryUseEl.disabled = !selectedQueryTarget;
-  queryWorksheetEl.hidden = !selectedQueryTarget?.worksheet;
   queryMoreEl.hidden = nextCatalogCursor === undefined;
 }
 
@@ -215,8 +212,8 @@ function refreshSqlCompletion(): void {
 
 queryTargetEl.addEventListener('change', () => {
   selectedQueryTarget = queryTargets.get(queryTargetEl.value);
-  querySchemaEl.textContent = selectedQueryTarget ? 'Loading column types…' : '';
   refreshQueryTargets();
+  refreshTableHighlight();
   if (selectedQueryTarget) vscode.postMessage({ command: 'queryTarget', targetId: selectedQueryTarget.id, generation: queryGeneration });
 });
 queryUseEl.addEventListener('click', () => {
@@ -229,9 +226,6 @@ queryRestoreEl.addEventListener('click', () => {
   const draft = drafts.pop();
   if (draft !== undefined) setEditorText(draft);
   queryRestoreEl.hidden = drafts.length === 0;
-});
-queryWorksheetEl.addEventListener('click', () => {
-  if (selectedQueryTarget?.worksheet) previewTable(selectedQueryTarget.worksheet);
 });
 
 function runQuery(sqlText: string): void {
@@ -1097,6 +1091,48 @@ function appendInlineHeaderControls(
   td.appendChild(controls);
 }
 
+/** A worksheet preview, where grid row i is Excel row i + 1 and the columns are Excel letters. */
+function isWorksheetPreview(): boolean {
+  return state.lastResult?.sheetTables !== undefined;
+}
+
+/**
+ * What the Query table choice outlines on the worksheet shown: a detected
+ * table's cells, or the raw worksheet's used range. Nothing when the choice
+ * belongs to another sheet or no worksheet preview is on screen.
+ */
+function highlightedTable(): SheetBounds | undefined {
+  const target = selectedQueryTarget;
+  const result = state.lastResult;
+  if (!target || result?.sheetTables === undefined) return undefined;
+  if (target.worksheet !== undefined && target.worksheet === result.sheetPreview && target.bounds) return target.bounds;
+  // The catalog page carrying bounds can arrive just after the rows; the
+  // detected tables in the result already know their own cells.
+  return result.sheetTables.find((table) => table.name === target.name);
+}
+
+const HIGHLIGHT_COLOR = '#e5c07b';
+
+// Inset shadows rather than borders: under border-collapse a border would
+// widen the cell and shift the grid every time the selection changes.
+function applyTableHighlight(td: HTMLTableCellElement, i: number, j: number, table: SheetBounds | undefined = highlightedTable()): void {
+  const edges = table ? tableEdges(table, i, j) : undefined;
+  const shadows: string[] = [];
+  if (edges?.top) shadows.push(`inset 0 1px 0 ${HIGHLIGHT_COLOR}`);
+  if (edges?.right) shadows.push(`inset -1px 0 0 ${HIGHLIGHT_COLOR}`);
+  if (edges?.bottom) shadows.push(`inset 0 -1px 0 ${HIGHLIGHT_COLOR}`);
+  if (edges?.left) shadows.push(`inset 1px 0 0 ${HIGHLIGHT_COLOR}`);
+  td.style.boxShadow = shadows.join(', ');
+}
+
+/** Redraws the outline on the rows already in the DOM, without re-rendering the grid. */
+function refreshTableHighlight(): void {
+  const table = highlightedTable();
+  resultsEl.querySelectorAll<HTMLTableCellElement>('td[data-r]').forEach((td) => {
+    applyTableHighlight(td, Number(td.dataset.r), Number(td.dataset.c), table);
+  });
+}
+
 function buildRowElement(i: number, displayIdx: number): HTMLTableRowElement {
   const { rows, cellChanged, rowIsNew, columnStatsKind } = state.lastResult!;
   const row = rows[i];
@@ -1104,6 +1140,15 @@ function buildRowElement(i: number, displayIdx: number): HTMLTableRowElement {
   tr.className = displayIdx % 2 === 0 ? 'even' : 'odd';
   const isNewRow = rowIsNew?.[i] === true;
   if (isNewRow) tr.classList.add('row-new');
+  const highlighted = highlightedTable();
+  if (isWorksheetPreview()) {
+    // No data-r/data-c, so the delegated double-click leaves it alone. A
+    // preview is never re-sorted, so i is the worksheet row.
+    const rowNum = document.createElement('td');
+    rowNum.className = 'row-num';
+    rowNum.textContent = String(i + 1);
+    tr.appendChild(rowNum);
+  }
   row.forEach((originalValue, j) => {
     const td = document.createElement('td');
     const { value, filteredOut } = inlineCellValue(i, j, originalValue);
@@ -1117,6 +1162,8 @@ function buildRowElement(i: number, displayIdx: number): HTMLTableRowElement {
     // allocations per frame.
     td.dataset.r = String(i);
     td.dataset.c = String(j);
+    if (j % 2 === 1) td.classList.add('col-odd');
+    if (highlighted) applyTableHighlight(td, i, j, highlighted);
     for (const table of state.lastResult?.sheetTables ?? []) {
       const headerRow = table.headerRow ?? table.top;
       if (i === headerRow && j >= table.left && j < table.right) {
@@ -1154,13 +1201,14 @@ function renderVirtualWindow(): void {
     rowCount: order.length,
   });
   tbody.innerHTML = '';
-  appendSpacerRow(tbody, topSpacerPx, state.lastResult.columns.length);
+  const colCount = state.lastResult.columns.length + (isWorksheetPreview() ? 1 : 0);
+  appendSpacerRow(tbody, topSpacerPx, colCount);
   const frag = document.createDocumentFragment();
   for (let displayIdx = start; displayIdx < end; displayIdx++) {
     frag.appendChild(buildRowElement(order[displayIdx], displayIdx));
   }
   tbody.appendChild(frag);
-  appendSpacerRow(tbody, bottomSpacerPx, state.lastResult.columns.length);
+  appendSpacerRow(tbody, bottomSpacerPx, colCount);
 }
 
 // Delegated cell-inspector trigger. Attached to #results, which survives every
@@ -1229,7 +1277,7 @@ function renderResults(preserveScroll = false): void {
   // identical to the one already on screen. Rebuilding it anyway threw away
   // the sort/stats buttons several times a second — and with them the anchor
   // element an open stats popover positions against.
-  const headerKey = JSON.stringify([columns, renamedColumns ?? null, state.sortState ?? null, columnStatsKind]);
+  const headerKey = JSON.stringify([columns, renamedColumns ?? null, state.sortState ?? null, columnStatsKind, isWorksheetPreview()]);
   const existingTable = resultsEl.querySelector('table');
   const reuseHeader = preserveScroll && existingTable !== null && headerKey === renderedHeaderKey;
 
@@ -1248,6 +1296,11 @@ function renderResults(preserveScroll = false): void {
 
   const thead = document.createElement('thead');
   const headRow = document.createElement('tr');
+  if (isWorksheetPreview()) {
+    const corner = document.createElement('th');
+    corner.className = 'sheet-corner';
+    headRow.appendChild(corner);
+  }
   columns.forEach((col, colIdx) => {
     const th = document.createElement('th');
     // display:flex has to live on this inner wrapper, not on <th> itself --
@@ -1269,6 +1322,7 @@ function renderResults(preserveScroll = false): void {
     // every detected region from its coordinates; the real table controls
     // live on each promoted header below instead.
     if (state.lastResult?.sheetTables !== undefined) {
+      th.classList.add('sheet-letter');
       th.appendChild(inner);
       headRow.appendChild(th);
       return;
@@ -1569,14 +1623,16 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
     if (message.generation < queryGeneration) return;
     if (message.generation !== queryGeneration) {
       queryTargets.clear(); queryColumns.clear(); selectedQueryTarget = undefined;
-      querySchemaEl.textContent = 'The source changed. Select a query table again.';
+      statusEl.textContent = 'The source changed. Select a query table again.';
     }
     queryGeneration = message.generation;
     if (message.cursor === 0) queryTargets.clear();
     for (const target of message.targets) queryTargets.set(target.id, target);
-    if (selectedQueryTarget && !queryTargets.has(selectedQueryTarget.id)) selectedQueryTarget = undefined;
+    // The fresh copy, not the one selected earlier: a raw worksheet only gains
+    // its used-range bounds once the sheet has been prepared.
+    if (selectedQueryTarget) selectedQueryTarget = queryTargets.get(selectedQueryTarget.id);
     nextCatalogCursor = message.nextCursor;
-    refreshQueryTargets(); refreshSqlCompletion();
+    refreshQueryTargets(); refreshSqlCompletion(); refreshTableHighlight();
     return;
   }
   if (message.command === 'queryTargetDetails') {
@@ -1584,10 +1640,7 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
     if (message.target.generation !== queryGeneration) return;
     queryTargets.set(message.target.id, message.target);
     queryColumns.set(message.target.id, message.columns);
-    if (!selectedQueryTarget || selectedQueryTarget.id === message.target.id) {
-      selectedQueryTarget = message.target;
-      querySchemaEl.textContent = message.columns.map(column => `${column.name}: ${column.type}`).join(' · ');
-    }
+    if (!selectedQueryTarget || selectedQueryTarget.id === message.target.id) selectedQueryTarget = message.target;
     refreshQueryTargets(); refreshSqlCompletion();
     return;
   }
@@ -1597,14 +1650,21 @@ window.addEventListener('message', (event: MessageEvent<ExtensionMessage>) => {
     if (drafts.length >= 8) { statusEl.textContent = 'Restore a saved draft before opening another SQL draft.'; return; }
     drafts.push(editor.state.doc.toString());
     selectedQueryTarget = message.target; queryTargets.set(message.target.id, message.target);
-    setEditorText(message.sql); queryRestoreEl.hidden = false; refreshQueryTargets();
-    querySchemaEl.textContent = (queryColumns.get(message.target.id) ?? []).map(column => `${column.name}: ${column.type}`).join(' · ');
+    setEditorText(message.sql); queryRestoreEl.hidden = false; refreshQueryTargets(); refreshTableHighlight();
     editor.focus();
     return;
   }
   const { state: nextState, effects } = reduce(state, event.data);
   state = nextState;
   for (const effect of effects) applyEffect(effect);
+  const previewed = (message.command === 'queryResult' || message.command === 'liveTick') ? state.lastResult?.sheetPreview : undefined;
+  if (previewed !== undefined && previewed !== openSheet) {
+    // The picker follows the open sheet, and a choice from another sheet
+    // would outline nothing here.
+    openSheet = previewed;
+    if (selectedQueryTarget?.worksheet !== openSheet) selectedQueryTarget = undefined;
+    refreshQueryTargets(); refreshTableHighlight();
+  }
   if (message.command === 'queryResult' || message.command === 'cellUpdated' || (message.command === 'error' && wasRunning) || message.command === 'tables' || (message.command === 'liveTick' && !message.unchanged)) {
     vscode.postMessage({ command: 'queryCatalog', cursor: 0 });
   }

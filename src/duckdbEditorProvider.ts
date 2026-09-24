@@ -472,6 +472,7 @@ export class DuckDBDocument implements vscode.CustomDocument {
   // host down rather than raising something catchable.
   private lockChain: Promise<void> = Promise.resolve();
   private lockDepth = 0;
+  private readonly queuedChecks = new Set<() => boolean>();
 
   constructor(
     readonly uri: vscode.Uri,
@@ -485,25 +486,37 @@ export class DuckDBDocument implements vscode.CustomDocument {
     return this.lockDepth > 0;
   }
 
-  /** Queues `fn` behind whatever else holds the connection. Use for user-initiated work, which must never be dropped. */
-  runExclusive<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.lockDepth >= QUERY_LIMITS.queuedRequests) return Promise.reject(new QueryPolicyError('Too many queued operations. Wait or cancel the current query.'));
+  /**
+   * Queues `fn` behind whatever else holds the connection. Use for user-initiated work, which must never be dropped.
+   *
+   * `isSuperseded` marks a query a newer Run has replaced. Its result would be
+   * suppressed anyway, so it neither counts against the queue limit nor runs
+   * when its turn comes -- otherwise a burst of Runs fills the queue with dead
+   * work and refuses the one the user actually wants. A hard ceiling still
+   * bounds the chain against a flood of messages.
+   */
+  runExclusive<T>(fn: () => Promise<T>, isSuperseded?: () => boolean): Promise<T> {
+    const live = [...this.queuedChecks].filter(superseded => !superseded()).length;
+    if (live >= QUERY_LIMITS.queuedRequests || this.lockDepth >= QUERY_LIMITS.queuedRequests * 8) {
+      return Promise.reject(new QueryPolicyError('Too many queued operations. Wait or cancel the current query.'));
+    }
+    // Each queued job needs its own identity, even if callers reuse a guard.
+    const check = () => isSuperseded?.() ?? false;
+    this.queuedChecks.add(check);
     this.lockDepth++;
     const run = this.lockChain.then(() => {
       if (this.disposed) throw new QueryPolicyError('This document is closed.');
       if (vscode.workspace.isTrusted === false) throw new QueryPolicyError('Trust this workspace before opening datasets or running queries.');
+      if (check()) throw new QueryPolicyError('Superseded by a newer query.');
       return fn();
     });
     // Both arms settle the chain, so one failed job can't wedge every later
     // one behind a permanently rejected promise.
-    this.lockChain = run.then(
-      () => {
-        this.lockDepth--;
-      },
-      () => {
-        this.lockDepth--;
-      }
-    );
+    const settle = () => {
+      this.lockDepth--;
+      this.queuedChecks.delete(check);
+    };
+    this.lockChain = run.then(settle, settle);
     return run;
   }
 
@@ -741,6 +754,7 @@ async function runLiveTick(document: DuckDBDocument, webview: vscode.Webview, ge
       editable: false,
       editableTable: undefined,
       serverSorted: false,
+      sheetPreview: document.lastSheetPreview,
       sheetTables: document.lastSheetPreview
         ? document.file.getDetectedSheetTables(document.lastSheetPreview)
         : undefined,
@@ -1115,6 +1129,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
         lastRequestId = message.requestId;
       }
       if (queryCommands.includes(message.command)) owner = ++document.activeQueryRequest;
+      const superseded = () => owner !== document.activeQueryRequest;
       if (vscode.workspace.isTrusted === false) {
         webview.postMessage({ command: 'error', message: 'Trust this workspace before opening datasets or running queries.' });
         return;
@@ -1230,7 +1245,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             document.combinedQueryMap.set(built.sql, message.table);
             document.statsCache.clear();
             return { ...built, result: await document.file.runQuery(built.sql, getMaxResultRows()) };
-          });
+          }, superseded);
           // Never editable — a UNION/subquery, not a plain single-table
           // SELECT, independent of Live state (checkEditableSelect's own
           // structural gate already excludes it; this just avoids the
@@ -1366,7 +1381,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
               diffSkipped: skipped,
               editability: destructive ? { editable: false as const } : await document.file.checkEditableSelect(sql),
             };
-          });
+          }, superseded);
 
           // Raised by the query rather than by opening the file — a workbook
           // whose sheets had to be re-read tolerating uncomputable cells. Said
@@ -1397,6 +1412,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
             // Coordinates are meaningful only for the untouched preview the
             // sidebar generated. A hand-written WHERE/ORDER BY can rearrange
             // worksheet rows, so it deliberately gets an ordinary result.
+            sheetPreview: document.lastSheetPreview,
             sheetTables:
               document.lastSheetPreview
                 ? document.file.getDetectedSheetTables(document.lastSheetPreview)
@@ -1694,7 +1710,7 @@ export class DuckDBEditorProvider implements vscode.CustomReadonlyEditorProvider
               }
             }
             return { result: sorted, diffFields: fields, diffSkipped: skipped };
-          });
+          }, superseded);
 
           webview.postMessage({
             command: 'sortQueryResult',
